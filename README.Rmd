@@ -16,12 +16,16 @@ The package provides the following estimators:
 
 Internally, the package also implements basic estimators such as
 
-- `P`   : probability-only estimator
-- `NP`  : non-probability-only estimator
-- `NP_P`: combined NP ∪ P estimator
+- `P`    : probability-only estimator
+- `NP`   : non-probability-only estimator
+- `NP_P` : combined NP ∪ P estimator
 
 For each estimator, sandwich-based variance, standard error, and 95% confidence
 intervals are computed from influence-function-based contributions.
+
+All three main estimators (`Eff`, `Eff_S`, `Eff_P`) have an optional argument
+`progress` (logical, default `interactive()`), which controls whether a
+text-based progress bar is shown during cross-fitting and optimization steps.
 
 ## Installation
 
@@ -29,8 +33,6 @@ You can install the development version from GitHub:
 
     # install.packages("devtools")
     devtools::install_github("KMorikawaISU/dfSEDI")
-
-Replace `"yourname"` by your GitHub user name.
 
 ## Example: one simulated dataset
 
@@ -51,33 +53,40 @@ main estimators: `Eff`, `Eff_S`, and `Eff_P`.
     # dat must contain at least:
     #   x, y, d_np, d_p, pi_p, pi_np
 
-    # 2. Semiparametric efficient estimator Eff (DML2, K-fold)
+### Semiparametric efficient estimator Eff (DML2, K-fold)
+
     fit_eff <- Eff(
-      dat       = dat,
-      K         = 2,                      # DML2 with 2 folds
-      phi_start = c(-2.15, -0.5, -0.75),  # initial values for pi_NP
-      max_restart = 10
+      dat         = dat,
+      K           = 2,                      # DML2 with 2 folds
+      phi_start   = c(-2.15, -0.5, -0.75),  # initial values for pi_NP
+      max_restart = 10,
+      progress    = TRUE                    # show progress bars
     )
 
     fit_eff$theta  # point estimate
     fit_eff$se     # sandwich standard error
     fit_eff$ci     # 95% confidence interval
 
-    # 3. Sub-efficient estimator Eff_S (Remark 6)
+### Sub-efficient estimator Eff_S (Remark 6)
+
     fit_effS <- Eff_S(
-      dat = dat,
-      K   = 2
+      dat      = dat,
+      K        = 2,
+      progress = TRUE   # show progress bar for cross-fitted mu(x)
     )
 
     fit_effS$theta
     fit_effS$se
     fit_effS$ci
 
-    # 4. Parametric efficient estimator Eff_P (working model)
+### Parametric efficient estimator Eff_P (working model)
+
     fit_effP <- Eff_P(
       dat       = dat,
       phi_start = c(-2.15, -0.5, -0.75),
-      eta4_star = 0
+      eta4_star = 0,
+      max_iter  = 20,
+      progress  = TRUE   # show progress bar for phi iterations
     )
 
     fit_effP$theta
@@ -90,10 +99,12 @@ Each of these objects has the following structure:
 - `var`   : sandwich variance estimate
 - `se`    : sandwich standard error (sqrt of `var`)
 - `ci`    : 95% sandwich-based confidence interval (numeric vector of length 2)
-- `phi`   : estimated parameter vector for the non-probability inclusion model
-           (Eff and Eff_P only)
-- `info`  : list of meta-information (e.g., K, starting values, estimator type)
+- `phi`   : estimated parameter vector for the non-probability inclusion model  
+            (Eff and Eff_P only)
+- `info`  : list of meta-information (e.g., K, starting values, estimator type,
+            and whether progress bars were enabled)
 
 This interface allows users to call each estimator separately and obtain
 its point estimate, sandwich standard error, and confidence interval without
-running any Monte Carlo experiments.
+running any Monte Carlo experiments, while optionally monitoring the progress
+of the internal DML2 computations via simple console progress bars.

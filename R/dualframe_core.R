@@ -10,6 +10,11 @@
 ##   - P, NP, NP+P estimators (df_estimate_P, df_estimate_NP, df_estimate_NP_P)
 ##   - DML2 cross-fitting machinery
 ##   - Sandwich variance / SE / 95% CI from per-observation contributions
+##
+## NOTE:
+##   Progress bars are implemented using utils::txtProgressBar()
+##   in the main cross-fitting and restart loops, controlled by
+##   the argument `progress` (default: interactive()).
 ############################################################
 
 ############################################################
@@ -350,8 +355,15 @@ make_folds <- function(n, K) {
   split(seq_len(n), fold_id)
 }
 
-impute_pi_p_crossfit <- function(dat, folds, sigma = NULL) {
+impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE) {
   dat_cf <- dat
+
+  if (progress) {
+    pb <- utils::txtProgressBar(min = 0, max = length(folds),
+                                style = 3)
+    on.exit(close(pb), add = TRUE)
+  }
+
   for (k in seq_along(folds)) {
     idx_k     <- folds[[k]]
     dat_fold  <- dat_cf[idx_k, ]
@@ -369,6 +381,10 @@ impute_pi_p_crossfit <- function(dat, folds, sigma = NULL) {
         sigma = sigma
       )
       dat_cf$pi_p[idx_k[pi_p_mis_local]] <- tilde_pi_p
+    }
+
+    if (progress) {
+      utils::setTxtProgressBar(pb, k)
     }
   }
   dat_cf
@@ -470,13 +486,18 @@ df_estimate_NP_P <- function(dat,
 efficient_estimator_dml2 <- function(dat,
                                      phi_start   = c(-2.15, -0.5, -0.75),
                                      K           = 2,
-                                     max_restart = 10) {
+                                     max_restart = 10,
+                                     progress    = FALSE) {
 
   N_total <- nrow(dat)
 
   # K-fold & pi_P cross-fitting
   folds  <- make_folds(N_total, K)
-  dat_cf <- impute_pi_p_crossfit(dat, folds)
+  if (progress) {
+    cat("Cross-fitting pi_P ...\n")
+  }
+  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL,
+                                 progress = progress)
 
   # DML2 objective for phi
   obj_phi <- function(phi) {
@@ -498,6 +519,13 @@ efficient_estimator_dml2 <- function(dat,
   # Optimize phi with random restarts
   attempt <- 0
   res     <- list(convergence = 1)
+
+  if (progress) {
+    cat("Solving for phi (random restarts) ...\n")
+    pb_phi <- utils::txtProgressBar(min = 0, max = max_restart,
+                                    style = 3)
+  }
+
   while (attempt < max_restart && res$convergence != 0) {
     attempt <- attempt + 1
     init    <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
@@ -505,6 +533,13 @@ efficient_estimator_dml2 <- function(dat,
     if (!inherits(res_try, "try-error")) {
       res <- res_try
     }
+    if (progress) {
+      utils::setTxtProgressBar(pb_phi, attempt)
+    }
+  }
+
+  if (progress) {
+    close(pb_phi)
   }
 
   if (res$convergence != 0) {
@@ -523,6 +558,12 @@ efficient_estimator_dml2 <- function(dat,
   phi_hat <- res$par
 
   # Cross-fitted h4*(X) for all observations
+  if (progress) {
+    cat("\nCross-fitting h4*(X) ...\n")
+    pb_h4 <- utils::txtProgressBar(min = 0, max = length(folds),
+                                   style = 3)
+  }
+
   h4_star_all <- numeric(N_total)
   for (k in seq_along(folds)) {
     idx_test  <- folds[[k]]
@@ -534,6 +575,14 @@ efficient_estimator_dml2 <- function(dat,
       dat_train, phi_hat, dat_test$x
     )
     h4_star_all[idx_test] <- h4_star_k
+
+    if (progress) {
+      utils::setTxtProgressBar(pb_h4, k)
+    }
+  }
+
+  if (progress) {
+    close(pb_h4)
   }
 
   # Efficient contributions for all observations
@@ -552,7 +601,9 @@ efficient_estimator_dml2 <- function(dat,
 ## Sub-efficient estimator Eff_S (DML2, K-fold)
 ############################################################
 
-subefficient_estimator_dml2 <- function(dat, K = 2) {
+subefficient_estimator_dml2 <- function(dat,
+                                        K        = 2,
+                                        progress = FALSE) {
 
   n     <- nrow(dat)
   folds <- make_folds(n, K)
@@ -563,6 +614,12 @@ subefficient_estimator_dml2 <- function(dat, K = 2) {
     sigma_mu    <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
   } else {
     sigma_mu <- NULL
+  }
+
+  if (progress) {
+    cat("Cross-fitting mu(x) = E[Y|X] ...\n")
+    pb_mu <- utils::txtProgressBar(min = 0, max = length(folds),
+                                   style = 3)
   }
 
   mu_hat_all <- numeric(n)
@@ -578,6 +635,14 @@ subefficient_estimator_dml2 <- function(dat, K = 2) {
       dat_train, dat_test$x, sigma = sigma_mu
     )
     mu_hat_all[idx_test] <- mu_hat_k
+
+    if (progress) {
+      utils::setTxtProgressBar(pb_mu, k)
+    }
+  }
+
+  if (progress) {
+    close(pb_mu)
   }
 
   contrib   <- subefficient_contrib(dat, mu_hat_all)
@@ -595,18 +660,34 @@ subefficient_estimator_dml2 <- function(dat, K = 2) {
 
 efficient_parametric_estimator <- function(dat,
                                            phi_start = c(-2.15, -0.5, -0.75),
-                                           eta4_star = 0) {
+                                           eta4_star = 0,
+                                           max_iter  = 20,
+                                           progress  = FALSE) {
 
   phi_est_para <- rep(NA_real_, 3)
 
   phi_est_para_fit <- list(termcd = 99)
   k3 <- 0
-  while (phi_est_para_fit$termcd > 2 && k3 < 20) {
+
+  if (progress) {
+    cat("Solving for phi (parametric Eff_P) ...\n")
+    pb_phi <- utils::txtProgressBar(min = 0, max = max_iter,
+                                    style = 3)
+  }
+
+  while (phi_est_para_fit$termcd > 2 && k3 < max_iter) {
     phi_est_para_fit <- nleqslv::nleqslv(
       phi_start,
       estimating_equation_optimal_phi(dat, dat, eta4_star = eta4_star)
     )
     k3 <- k3 + 1
+    if (progress) {
+      utils::setTxtProgressBar(pb_phi, k3)
+    }
+  }
+
+  if (progress) {
+    close(pb_phi)
   }
 
   if (phi_est_para_fit$termcd > 2) {
@@ -641,7 +722,7 @@ efficient_parametric_estimator <- function(dat,
 #' Computes the semiparametric efficient estimator (Eff) using DML2 with
 #' K-fold cross-fitting. It returns the point estimate, sandwich variance,
 #' standard error and 95% confidence interval, together with the estimated
-#' phi parameter.
+#' phi parameter. A console progress bar is optionally displayed.
 #'
 #' @param dat A data.frame containing at least:
 #'   x, y, d_np, d_p, pi_p, pi_np.
@@ -649,6 +730,7 @@ efficient_parametric_estimator <- function(dat,
 #' @param phi_start Initial values for the logistic model of pi_NP.
 #' @param max_restart Maximum number of random restarts in the optimization
 #'   of the phi estimating equation.
+#' @param progress Logical; if TRUE, show console progress bars.
 #'
 #' @return A list with components:
 #'   theta, var, se, ci, phi, info.
@@ -656,20 +738,23 @@ efficient_parametric_estimator <- function(dat,
 Eff <- function(dat,
                 K           = 2,
                 phi_start   = c(-2.15, -0.5, -0.75),
-                max_restart = 10) {
+                max_restart = 10,
+                progress    = interactive()) {
 
   res <- efficient_estimator_dml2(
     dat         = dat,
     phi_start   = phi_start,
     K           = K,
-    max_restart = max_restart
+    max_restart = max_restart,
+    progress    = progress
   )
 
   res$info <- list(
     type        = "Eff",
     K           = K,
     phi_start   = phi_start,
-    max_restart = max_restart
+    max_restart = max_restart,
+    progress    = progress
   )
 
   res
@@ -679,23 +764,26 @@ Eff <- function(dat,
 #'
 #' Computes the sub-efficient estimator (Eff_S) based on Remark 6
 #' using DML2 with K-fold cross-fitting for the regression
-#' mu(x) = E[Y | X = x].
+#' mu(x) = E[Y | X = x]. A console progress bar is optionally displayed.
 #'
 #' @param dat A data.frame containing at least:
 #'   x, y, d_np, d_p, pi_p, pi_np.
 #' @param K Number of folds for cross-fitting (default 2).
+#' @param progress Logical; if TRUE, show console progress bar.
 #'
 #' @return A list with components:
 #'   theta, var, se, ci, info.
 #' @export
 Eff_S <- function(dat,
-                  K = 2) {
+                  K        = 2,
+                  progress = interactive()) {
 
-  res <- subefficient_estimator_dml2(dat, K = K)
+  res <- subefficient_estimator_dml2(dat, K = K, progress = progress)
 
   res$info <- list(
-    type = "Eff_S",
-    K    = K
+    type     = "Eff_S",
+    K        = K,
+    progress = progress
   )
 
   res
@@ -706,30 +794,40 @@ Eff_S <- function(dat,
 #' Computes the parametric efficient estimator (Eff_P) under a working
 #' parametric model for the efficient score, using the same estimating
 #' equation for phi and a linear regression model for E[Y | X].
+#' A simple progress bar is shown over the outer iteration attempts.
 #'
 #' @param dat A data.frame containing at least:
 #'   x, y, d_np, d_p, pi_p, pi_np.
 #' @param phi_start Initial values for the logistic model of pi_NP.
 #' @param eta4_star Constant (or vector) used as eta4* in the estimating
 #'   equation for phi; typically 0 for the working model.
+#' @param max_iter Maximum number of attempts (outer iterations) in solving
+#'   the phi estimating equation.
+#' @param progress Logical; if TRUE, show console progress bar.
 #'
 #' @return A list with components:
 #'   theta, var, se, ci, phi, info.
 #' @export
 Eff_P <- function(dat,
                   phi_start = c(-2.15, -0.5, -0.75),
-                  eta4_star = 0) {
+                  eta4_star = 0,
+                  max_iter  = 20,
+                  progress  = interactive()) {
 
   res <- efficient_parametric_estimator(
     dat       = dat,
     phi_start = phi_start,
-    eta4_star = eta4_star
+    eta4_star = eta4_star,
+    max_iter  = max_iter,
+    progress  = progress
   )
 
   res$info <- list(
     type      = "Eff_P",
     phi_start = phi_start,
-    eta4_star = eta4_star
+    eta4_star = eta4_star,
+    max_iter  = max_iter,
+    progress  = progress
   )
 
   res
