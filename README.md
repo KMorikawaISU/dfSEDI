@@ -28,7 +28,7 @@ contributions.
 You can install the development version from GitHub:
 
     # install.packages("devtools")
-    devtools::install_github("yourname/dualframe")
+    devtools::install_github("KMorikawaISU/dfSEDI")
 
 Replace `"yourname"` by your GitHub user name.
 
@@ -41,7 +41,7 @@ paper.
 We first generate an artificial dual-frame population and then compute
 the three main estimators: `Eff`, `Eff_S`, and `Eff_P`.
 
-    library(dualframe)
+    library(dfSEDI)
 
     set.seed(1)
 
