@@ -214,8 +214,8 @@ regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
     kernel = rbf_kernel
   )
 
-  # IMPORTANT: use generic predict() for gausspr, not stats::predict
-  as.numeric(predict(reg_model, new_X))
+  # IMPORTANT: directly call kernlab:::predict.gausspr to avoid S3 dispatch issues
+  as.numeric(kernlab:::predict.gausspr(reg_model, new_X))
 }
 
 # Nonparametric regression to impute pi_P from 1/pi_P regression.
@@ -246,8 +246,8 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
     y      = 1 / pi_p_obs,
     kernel = rbf_kernel
   )
-  # generic predict() so that predict.gausspr is found
-  reg_pred <- predict(reg_model, new_L)
+  # DIRECT call to predict.gausspr
+  reg_pred <- kernlab:::predict.gausspr(reg_model, new_L)
 
   as.numeric(1 / reg_pred)
 }
@@ -306,11 +306,10 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X,
 
   new_X <- as.matrix(new_X)
 
-  # generic predict() for gausspr
-  eta4_denom_pred <- predict(eta4_denom_model, new_X)
+  eta4_denom_pred <- kernlab:::predict.gausspr(eta4_denom_model, new_X)
   eta4_numer_pred <- sapply(
     eta4_numer_model,
-    function(m) predict(m, new_X)
+    function(m) kernlab:::predict.gausspr(m, new_X)
   )
 
   sweep(eta4_numer_pred, 1, eta4_denom_pred, "/")
@@ -357,9 +356,8 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X,
 
   new_X <- as.matrix(new_X)
 
-  # generic predict() for gausspr
-  h4_denom_pred <- predict(h4_denom_model, new_X)
-  h4_numer_pred <- predict(h4_numer_model, new_X)
+  h4_denom_pred <- kernlab:::predict.gausspr(h4_denom_model, new_X)
+  h4_numer_pred <- kernlab:::predict.gausspr(h4_numer_model, new_X)
 
   as.numeric(h4_numer_pred / h4_denom_pred)
 }
@@ -490,7 +488,6 @@ efficient_phi_contrib <- function(dat, phi, eta4_star_all) {
     (d_np1 * (1 - d_p1 / pi_p1) +
        d_p1 * (1 - d_np1 / pi_np1))
 
-  # Broadcast term2_coef (n x 1) to multiply each column of eta4_star_local
   term2 <- term2_coef * eta4_star_local
 
   term1 + term2
