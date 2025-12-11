@@ -1,19 +1,40 @@
 Package: dfSEDI
 Type: Package
-Title: What the Package Does (Title Case)
+Title: Semiparametric Efficient Data Integration for Dual-Frame Sampling
 Version: 0.1.0
 Authors@R: c(
     person(
-      "Jane", "Doe",
-      email = "jane@example.com",
-      role = c("aut", "cre")
+      given  = "Kosuke",
+      family = "Morikawa",
+      email  = "morikawa@iastate.edu",
+      role   = c("aut", "cre")
+    ),
+    person(
+      given  = "Jae Kwang",
+      family = "Kim",
+      role   = "aut"
     )
   )
-Description: More about what it does (maybe more than one line).
-    Continuation lines should be indented.
-License: What license is it under?
+Description: Implements semiparametric efficient data integration methods for 
+    dual-frame sampling as proposed by Morikawa and Kim (2026). The package 
+    provides the semiparametric efficient estimator 'Eff', the sub-efficient 
+    estimator 'Eff_S', and the parametric efficient estimator 'Eff_P', together 
+    with sandwich-based variance, standard error, and confidence interval 
+    estimates.
+License: GPL-3
 Encoding: UTF-8
 LazyData: true
 URL: https://github.com/KMorikawaISU/dfSEDI
 BugReports: https://github.com/KMorikawaISU/dfSEDI/issues
+Depends: 
+    R (>= 4.0.0)
+Imports:
+    nleqslv,
+    kernlab,
+    stats,
+    utils
+Suggests:
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
 RoxygenNote: 7.3.3

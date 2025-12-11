@@ -1,45 +1,35 @@
 ############################################################
-## dualframe_core.R  (multi-dimensional X, package-safe)
+## dualframe_core.R (multi-dimensional X, type-safe version)
 ##
 ## Core estimation functions for semiparametric efficient
 ## dual-frame data integration with general matrix-valued X.
 ##
 ## Public user-facing functions:
-##   - Eff()   : semiparametric efficient estimator (DML2, K-fold)
-##   - Eff_S() : sub-efficient estimator (Remark 6, DML2)
-##   - Eff_P() : parametric efficient estimator (working model)
+##   - Eff   : semiparametric efficient estimator (DML2, K-fold)
+##   - Eff_S : sub-efficient estimator (Remark 6, DML2)
+##   - Eff_P : parametric efficient estimator (working model)
 ##
-## Basic estimators (for comparison / diagnostics):
-##   - df_estimate_P()
-##   - df_estimate_NP()
-##   - df_estimate_NP_P()
+## Basic estimators (for simulation / comparison):
+##   - df_estimate_P    : probability-only estimator
+##   - df_estimate_NP   : NP-only estimator (Chang & Kott type)
+##   - df_estimate_NP_P : NP ∪ P estimator (Chang & Kott type)
 ##
-## Assumed structure of dat:
-##   - Either:
-##       * dat$X : numeric matrix (n x p) of covariates
+## Assumptions on dat:
+##   - either:
+##       * dat$X is a numeric matrix (n x p) of covariates
 ##     or
-##       * dat$x : numeric vector, treated as 1D X
-##   - And:
-##       * dat$y     : numeric outcome
-##       * dat$d_np  : {0,1} non-probability inclusion indicator
-##       * dat$d_p   : {0,1} probability inclusion indicator
-##       * dat$pi_p  : probability inclusion probability
-##       * dat$pi_np : non-probability inclusion probability (used in simulation)
-##
-## NOTE:
-##   - No library() or source() calls appear here.
-##   - All external functions are called with namespaces:
-##       stats::, nleqslv::, kernlab::, utils::.
+##       * dat$x is a numeric vector and we treat it as 1D X
+##   - dat$y, dat$d_np, dat$d_p, dat$pi_p, dat$pi_np exist and are numeric
 ############################################################
 
 ############################################################
 ## 0. Utility: extract X and sandwich variance
 ############################################################
 
-# Extract covariate matrix X from dat.
+# Extract covariate matrix X from dat
 # Priority:
 #   1) dat$X (matrix / AsIs-matrix / data.frame)
-#   2) dat$x (numeric vector -> 1-column matrix)
+#   2) dat$x (numeric vector -> 1D matrix)
 df_get_X <- function(dat) {
   if ("X" %in% names(dat)) {
     X <- dat$X
@@ -47,7 +37,7 @@ df_get_X <- function(dat) {
       X <- as.matrix(X)
     }
     if (is.matrix(X)) {
-      X <- apply(X, 2, as.numeric)  # enforce numeric
+      X <- apply(X, 2, as.numeric)  # ensure numeric
       return(X)
     }
   }
@@ -103,7 +93,7 @@ g4 <- function(dat) {
 }
 
 ############################################################
-## 2. Chang & Kott type estimating equation for pi_NP(phi)
+## 2. Chang & Kott type estimating eq. for pi_NP(phi)
 ############################################################
 
 pi_np.est_simple <- function(dat, h2, h3, h4, p.use = TRUE) {
@@ -122,20 +112,16 @@ pi_np.est_simple <- function(dat, h2, h3, h4, p.use = TRUE) {
 
     if (p.use) {
       denom  <- pi_p + pi_np - pi_p * pi_np
-      d_set4 <- matrix(
-        1 - (d_p + d_np - d_p * d_np) / denom,
-        nrow = nrow(dat), ncol = 1
-      )
+      d_set4 <- matrix(1 - (d_p + d_np - d_p * d_np) / denom,
+                       nrow = nrow(dat), ncol = 1)
     } else {
-      d_set4 <- matrix(
-        1 - d_np / pi_np,
-        nrow = nrow(dat), ncol = 1
-      )
+      d_set4 <- matrix(1 - d_np / pi_np,
+                       nrow = nrow(dat), ncol = 1)
     }
 
-    H4     <- h4(dat)          # n x dim(phi)
+    H4     <- h4(dat)              # n x dim(phi)
     H4     <- as.matrix(H4)
-    est_eq <- t(H4) %*% d_set4 # dim(phi) x 1
+    est_eq <- t(H4) %*% d_set4     # dim(phi) x 1
     as.numeric(est_eq)
   }
 }
@@ -163,7 +149,7 @@ eta4_prob_numer_function <- function(pi_np, pi_p, phi, l) {
 ## 4. Kernel regression: E(Y|X), pi_P, eta4*, h4* (multi-X)
 ############################################################
 
-# mu(X) = E[Y|X] using P-only data
+# mu(x) = E[Y|X=x] using P-only data
 regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
   X_all <- df_get_X(dat)
   idx   <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
@@ -186,7 +172,7 @@ regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
     kernel = rbf_kernel
   )
 
-  as.numeric(stats::predict(reg_model, as.matrix(new_X)))
+  as.numeric(kernlab::predict(reg_model, as.matrix(new_X)))
 }
 
 # E[1/pi_P(L)|L] used for imputing pi_p
@@ -214,7 +200,7 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
     y      = 1 / pi_p_obs,
     kernel = rbf_kernel
   )
-  reg_pred <- stats::predict(reg_model, as.matrix(new_L))
+  reg_pred <- kernlab::predict(reg_model, as.matrix(new_L))
 
   as.numeric(1 / reg_pred)
 }
@@ -267,10 +253,10 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X,
     )
   )
 
-  eta4_denom_pred <- stats::predict(eta4_denom_model, as.matrix(new_X))
+  eta4_denom_pred <- kernlab::predict(eta4_denom_model, as.matrix(new_X))
   eta4_numer_pred <- sapply(
     eta4_numer_model,
-    function(m) stats::predict(m, as.matrix(new_X))
+    function(m) kernlab::predict(m, as.matrix(new_X))
   )
 
   sweep(eta4_numer_pred, 1, eta4_denom_pred, "/")
@@ -313,8 +299,8 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X,
     kernel = rbf_kernel
   )
 
-  h4_denom_pred <- stats::predict(h4_denom_model, as.matrix(new_X))
-  h4_numer_pred <- stats::predict(h4_numer_model, as.matrix(new_X))
+  h4_denom_pred <- kernlab::predict(h4_denom_model, as.matrix(new_X))
+  h4_numer_pred <- kernlab::predict(h4_numer_model, as.matrix(new_X))
 
   as.numeric(h4_numer_pred / h4_denom_pred)
 }
@@ -454,8 +440,8 @@ impute_pi_p_crossfit <- function(dat,
     d_p_f  <- as.numeric(dat_fold$d_p)
     d_np_f <- as.numeric(dat_fold$d_np)
 
-    L_f <- cbind(X_f, y_f)
-    L_f <- as.matrix(L_f)
+    L_f  <- cbind(X_f, y_f)
+    L_f  <- as.matrix(L_f)
 
     pi_p_mis <- which(d_np_f == 1 & d_p_f == 0)
     if (length(pi_p_mis) > 0) {
@@ -500,11 +486,9 @@ df_estimate_NP <- function(dat,
   p <- ncol(X)
 
   if (is.null(phi_start)) {
-    phi_start <- c(
-      -log(1 / mean(dat$d_np) - 1),
-      rep(0, p),
-      0
-    )
+    phi_start <- c(-log(1 / mean(dat$d_np) - 1),
+                   rep(0, p),
+                   0)
   }
 
   phi_est <- list(termcd = 99)
@@ -546,11 +530,9 @@ df_estimate_NP_P <- function(dat,
   p <- ncol(X)
 
   if (is.null(phi_start)) {
-    phi_start <- c(
-      -log(1 / mean(dat$d_np) - 1),
-      rep(0, p),
-      0
-    )
+    phi_start <- c(-log(1 / mean(dat$d_np) - 1),
+                   rep(0, p),
+                   0)
   }
 
   phi_est <- list(termcd = 99)
