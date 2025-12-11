@@ -1,5 +1,5 @@
 ############################################################
-## dualframe_core.R (multi-dimensional X, type-safe version)
+## dualframe_core.R  (multi-dimensional X, DML2 + sandwich)
 ##
 ## Core estimation functions for semiparametric efficient
 ## dual-frame data integration with general matrix-valued X.
@@ -9,7 +9,7 @@
 ##   - Eff_S : sub-efficient estimator (Remark 6, DML2)
 ##   - Eff_P : parametric efficient estimator (working model)
 ##
-## Basic estimators (for simulation / comparison):
+## Basic estimators (mainly for simulations / comparison):
 ##   - df_estimate_P    : probability-only estimator
 ##   - df_estimate_NP   : NP-only estimator (Chang & Kott type)
 ##   - df_estimate_NP_P : NP ∪ P estimator (Chang & Kott type)
@@ -20,6 +20,13 @@
 ##     or
 ##       * dat$x is a numeric vector and we treat it as 1D X
 ##   - dat$y, dat$d_np, dat$d_p, dat$pi_p, dat$pi_np exist and are numeric
+##
+## External packages:
+##   - nleqslv
+##   - kernlab
+##   - stats   (base recommended)
+## All external functions are called with explicit namespaces
+##   (nleqslv::, kernlab::, stats::).
 ############################################################
 
 ############################################################
@@ -37,7 +44,7 @@ df_get_X <- function(dat) {
       X <- as.matrix(X)
     }
     if (is.matrix(X)) {
-      X <- apply(X, 2, as.numeric)  # ensure numeric
+      X <- apply(X, 2, as.numeric)  # ensure numeric columns
       return(X)
     }
   }
@@ -48,6 +55,7 @@ df_get_X <- function(dat) {
 }
 
 # Sandwich variance + 95% CI from per-observation contributions
+# contrib: numeric vector (psi_i), estimator theta_hat = mean(contrib)
 df_sandwich_from_contrib <- function(contrib, level = 0.95) {
   contrib <- as.numeric(contrib)
   contrib <- contrib[is.finite(contrib)]
@@ -102,6 +110,7 @@ pi_np.est_simple <- function(dat, h2, h3, h4, p.use = TRUE) {
     X    <- df_get_X(dat)
     y    <- as.numeric(dat$y)
     l    <- cbind(1, X, y)
+    l    <- as.matrix(l)
     pi_p <- as.numeric(dat$pi_p)
 
     eta   <- as.numeric(l %*% phi)
@@ -112,11 +121,15 @@ pi_np.est_simple <- function(dat, h2, h3, h4, p.use = TRUE) {
 
     if (p.use) {
       denom  <- pi_p + pi_np - pi_p * pi_np
-      d_set4 <- matrix(1 - (d_p + d_np - d_p * d_np) / denom,
-                       nrow = nrow(dat), ncol = 1)
+      d_set4 <- matrix(
+        1 - (d_p + d_np - d_p * d_np) / denom,
+        nrow = nrow(dat), ncol = 1
+      )
     } else {
-      d_set4 <- matrix(1 - d_np / pi_np,
-                       nrow = nrow(dat), ncol = 1)
+      d_set4 <- matrix(
+        1 - d_np / pi_np,
+        nrow = nrow(dat), ncol = 1
+      )
     }
 
     H4     <- h4(dat)              # n x dim(phi)
@@ -172,7 +185,7 @@ regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
     kernel = rbf_kernel
   )
 
-  as.numeric(kernlab::predict(reg_model, as.matrix(new_X)))
+  as.numeric(stats::predict(reg_model, as.matrix(new_X)))
 }
 
 # E[1/pi_P(L)|L] used for imputing pi_p
@@ -200,7 +213,7 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
     y      = 1 / pi_p_obs,
     kernel = rbf_kernel
   )
-  reg_pred <- kernlab::predict(reg_model, as.matrix(new_L))
+  reg_pred <- stats::predict(reg_model, as.matrix(new_L))
 
   as.numeric(1 / reg_pred)
 }
@@ -253,10 +266,10 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X,
     )
   )
 
-  eta4_denom_pred <- kernlab::predict(eta4_denom_model, as.matrix(new_X))
+  eta4_denom_pred <- stats::predict(eta4_denom_model, as.matrix(new_X))
   eta4_numer_pred <- sapply(
     eta4_numer_model,
-    function(m) kernlab::predict(m, as.matrix(new_X))
+    function(m) stats::predict(m, as.matrix(new_X))
   )
 
   sweep(eta4_numer_pred, 1, eta4_denom_pred, "/")
@@ -299,8 +312,8 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X,
     kernel = rbf_kernel
   )
 
-  h4_denom_pred <- kernlab::predict(h4_denom_model, as.matrix(new_X))
-  h4_numer_pred <- kernlab::predict(h4_numer_model, as.matrix(new_X))
+  h4_denom_pred <- stats::predict(h4_denom_model, as.matrix(new_X))
+  h4_numer_pred <- stats::predict(h4_numer_model, as.matrix(new_X))
 
   as.numeric(h4_numer_pred / h4_denom_pred)
 }
@@ -309,6 +322,7 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X,
 ## 5. Efficient phi estimating equation (multi-X)
 ############################################################
 
+# Average estimating equation for phi (used by optim / nleqslv)
 estimating_equation_optimal_phi <- function(dat1,
                                             dat2,
                                             eta4_star = NULL) {
@@ -321,6 +335,7 @@ estimating_equation_optimal_phi <- function(dat1,
 
   function(phi) {
     phi <- as.numeric(phi)
+
     if (is.null(eta4_star)) {
       eta4_star_local <- estimate_conditional_expectation_kernlab_phi(
         dat2, phi, new_X = X1, sigma = NULL
@@ -347,6 +362,60 @@ estimating_equation_optimal_phi <- function(dat1,
 
     colMeans(est_eq)
   }
+}
+
+# Per-observation phi score (vector) for dat1, with nuisance from dat2
+efficient_phi_contrib <- function(dat1,
+                                  dat2,
+                                  phi,
+                                  eta4_star = NULL) {
+  phi   <- as.numeric(phi)
+  X1    <- df_get_X(dat1)
+  y1    <- as.numeric(dat1$y)
+  d_p1  <- as.numeric(dat1$d_p)
+  d_np1 <- as.numeric(dat1$d_np)
+  pi_p1 <- as.numeric(dat1$pi_p)
+  l1    <- as.matrix(cbind(1, X1, y1))
+
+  n1    <- nrow(l1)
+  p_phi <- length(phi)
+
+  if (is.null(eta4_star)) {
+    eta4_star_local <- estimate_conditional_expectation_kernlab_phi(
+      dat2, phi, new_X = X1, sigma = NULL
+    )  # n1 x p_phi
+  } else {
+    # eta4_star may be scalar (e.g. 0) or matrix
+    if (is.matrix(eta4_star) && nrow(eta4_star) == n1) {
+      eta4_star_local <- eta4_star
+    } else if (length(eta4_star) == 1L) {
+      eta4_star_local <- matrix(
+        eta4_star,
+        nrow = n1,
+        ncol = p_phi
+      )
+    } else {
+      stop("efficient_phi_contrib(): eta4_star has incompatible dimensions.")
+    }
+  }
+
+  eta    <- as.numeric(l1 %*% phi)
+  pi_np1 <- 1 / (1 + exp(-eta))
+  pi_np_p1 <- pi_np1 + pi_p1 - pi_np1 * pi_p1
+
+  term1 <- l1 * pi_np1 * (1 - pi_np1) / pi_np_p1 *
+    (d_np1 / pi_np1 * (pi_p1 - d_p1) -
+       d_p1 / (1 - pi_np1) * (1 - d_np1 / pi_np1))
+
+  term2_coef <- 1 -
+    (d_p1 * d_np1) / (pi_p1 * pi_np1) -
+    1 / pi_np_p1 *
+    (d_np1 * (1 - d_p1 / pi_p1) +
+       d_p1 * (1 - d_np1 / pi_np1))
+
+  est_eq_rows <- term1 + term2_coef * eta4_star_local  # n1 x p_phi
+
+  est_eq_rows
 }
 
 ############################################################
@@ -574,6 +643,9 @@ df_estimate_NP_P <- function(dat,
 
 ############################################################
 ## 10. Efficient estimator Eff (DML2, multi-X)
+##     - DML2 for phi
+##     - theta uses cross-fitted h4*(X)
+##     - phi variance from sandwich of its estimating eq.
 ############################################################
 
 efficient_estimator_dml2 <- function(dat,
@@ -593,12 +665,14 @@ efficient_estimator_dml2 <- function(dat,
     )
   }
 
+  # K-fold + pi_p cross-fitting
   folds  <- make_folds(N_total, K)
   dat_cf <- impute_pi_p_crossfit(dat, folds,
                                  sigma    = NULL,
                                  progress = progress)
 
-  obj_phi <- function(phi) {
+  # Objective for phi (sum of squared DML2 estimating eq.)
+  phi_score_mean <- function(phi) {
     phi <- as.numeric(phi)
     eq_agg <- rep(0, length(phi))
     for (k in seq_along(folds)) {
@@ -612,6 +686,11 @@ efficient_estimator_dml2 <- function(dat,
       eq_k   <- ee_fun_k(phi)
       eq_agg <- eq_agg + length(idx_k) / N_total * eq_k
     }
+    eq_agg
+  }
+
+  obj_phi <- function(phi) {
+    eq_agg <- phi_score_mean(phi)
     sum(eq_agg ^ 2)
   }
 
@@ -620,7 +699,7 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   attempt <- 0
-  res     <- list(convergence = 1)
+  res     <- list(convergence = 1, par = phi_start)
   while (attempt < max_restart && res$convergence != 0) {
     attempt <- attempt + 1
     if (progress) {
@@ -646,10 +725,15 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   phi_hat <- as.numeric(res$par)
+  p_phi   <- length(phi_hat)
+
+  ##########################################################
+  ## (A) DML2 for theta: cross-fitted h4*(X)
+  ##########################################################
 
   if (progress) {
     cat("Step 3/3: cross-fitting h4*(X) for Eff ...\n")
-    pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
+    pb_h4 <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
   }
 
   h4_star_all <- numeric(N_total)
@@ -667,30 +751,88 @@ efficient_estimator_dml2 <- function(dat,
     h4_star_all[idx_test] <- h4_star_k
 
     if (progress) {
-      utils::setTxtProgressBar(pb, k)
+      utils::setTxtProgressBar(pb_h4, k)
     }
   }
 
   if (progress) {
-    close(pb)
+    close(pb_h4)
     cat("\n")
   }
 
-  contrib   <- efficient_theta_contrib(dat_cf, dat_cf, phi_hat)
-  theta_res <- df_sandwich_from_contrib(contrib)
+  contrib_theta <- efficient_theta_contrib(
+    dat_cf, dat_cf, phi_hat, h4_star = h4_star_all
+  )
+  theta_res <- df_sandwich_from_contrib(contrib_theta)
 
-  list(phi   = phi_hat,
-       theta = theta_res$theta,
-       var   = theta_res$var,
-       se    = theta_res$se,
-       ci    = theta_res$ci,
-       info  = list(
-         type        = "Eff",
-         K           = K,
-         phi_start   = phi_start,
-         max_restart = max_restart,
-         progress    = progress
-       ))
+  ##########################################################
+  ## (B) Sandwich variance for phi (only) from its scores
+  ##     (joint with theta is not used here; Neyman
+  ##      orthogonality mitigates the impact)
+  ##########################################################
+
+  # Collect per-observation phi scores (cross-fitted eta4*)
+  score_phi_mat <- matrix(NA_real_, nrow = N_total, ncol = p_phi)
+  for (k in seq_along(folds)) {
+    idx_test  <- folds[[k]]
+    idx_train <- setdiff(seq_len(N_total), idx_test)
+
+    dat_test  <- dat_cf[idx_test,  ]
+    dat_train <- dat_cf[idx_train, ]
+
+    X_test    <- df_get_X(dat_test)
+    eta4_star_k <- estimate_conditional_expectation_kernlab_phi(
+      dat_train, phi_hat, new_X = X_test, sigma = NULL
+    )
+
+    score_phi_mat[idx_test, ] <- efficient_phi_contrib(
+      dat_test, dat_train, phi_hat, eta4_star = eta4_star_k
+    )
+  }
+
+  # numerical Jacobian of mean score wrt phi (A_hat)
+  num_jacobian <- function(fun, x, eps = 1e-6) {
+    x <- as.numeric(x)
+    p <- length(x)
+    J <- matrix(NA_real_, nrow = p, ncol = p)
+    f0 <- fun(x)
+    for (j in seq_len(p)) {
+      e <- rep(0, p); e[j] <- eps
+      f_plus  <- fun(x + e)
+      f_minus <- fun(x - e)
+      J[, j]  <- (f_plus - f_minus) / (2 * eps)
+    }
+    J
+  }
+
+  A_hat <- num_jacobian(phi_score_mean, phi_hat)      # p_phi x p_phi
+  B_hat <- crossprod(score_phi_mat) / N_total         # p_phi x p_phi
+  A_inv <- try(solve(A_hat), silent = TRUE)
+
+  if (inherits(A_inv, "try-error")) {
+    var_phi_mat <- matrix(NA_real_, nrow = p_phi, ncol = p_phi)
+    se_phi_vec  <- rep(NA_real_, p_phi)
+  } else {
+    var_phi_mat <- A_inv %*% B_hat %*% t(A_inv) / N_total
+    se_phi_vec  <- sqrt(diag(var_phi_mat))
+  }
+
+  list(
+    phi      = phi_hat,
+    phi_var  = var_phi_mat,
+    phi_se   = se_phi_vec,
+    theta    = theta_res$theta,
+    var      = theta_res$var,
+    se       = theta_res$se,
+    ci       = theta_res$ci,
+    info     = list(
+      type        = "Eff",
+      K           = K,
+      phi_start   = phi_start,
+      max_restart = max_restart,
+      progress    = progress
+    )
+  )
 }
 
 ############################################################
@@ -714,7 +856,7 @@ subefficient_estimator_dml2 <- function(dat,
 
   if (progress) {
     cat("Cross-fitting mu(X) for Eff_S ...\n")
-    pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
+    pb_mu <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
   }
 
   mu_hat_all <- numeric(n)
@@ -732,12 +874,12 @@ subefficient_estimator_dml2 <- function(dat,
     mu_hat_all[idx_test] <- mu_hat_k
 
     if (progress) {
-      utils::setTxtProgressBar(pb, k)
+      utils::setTxtProgressBar(pb_mu, k)
     }
   }
 
   if (progress) {
-    close(pb)
+    close(pb_mu)
     cat("\n")
   }
 
@@ -757,6 +899,9 @@ subefficient_estimator_dml2 <- function(dat,
 
 ############################################################
 ## 12. Parametric efficient estimator Eff_P (multi-X)
+##     - phi from Chang & Kott-type efficient eq.
+##     - theta from efficient_theta_contrib with working model
+##     - phi variance via sandwich on its eq. (no DML2 here)
 ############################################################
 
 efficient_parametric_estimator <- function(dat,
@@ -794,12 +939,54 @@ efficient_parametric_estimator <- function(dat,
     if (progress) {
       cat("  NOTE: phi did not fully converge in Eff_P.\n")
     }
-    phi_hat   <- rep(NA_real_, length(phi_start))
+    phi_hat    <- rep(NA_real_, length(phi_start))
+    var_phi    <- matrix(NA_real_, nrow = length(phi_hat), ncol = length(phi_hat))
+    se_phi_vec <- rep(NA_real_, length(phi_hat))
+
     contrib   <- rep(NA_real_, n)
     theta_res <- df_sandwich_from_contrib(contrib)
   } else {
     phi_hat <- as.numeric(phi_est$x)
+    p_phi   <- length(phi_hat)
 
+    # phi variance: sandwich on its estimating eq. (no cross-fitting here)
+    efficient_phi_eq_mean <- function(phi) {
+      ee_fun <- estimating_equation_optimal_phi(dat, dat, eta4_star = eta4_star)
+      ee_fun(phi)
+    }
+
+    # per-observation scores with eta4_star (scalar or matrix)
+    score_phi_mat <- efficient_phi_contrib(
+      dat, dat, phi_hat, eta4_star = eta4_star
+    )
+
+    num_jacobian <- function(fun, x, eps = 1e-6) {
+      x <- as.numeric(x)
+      p <- length(x)
+      J <- matrix(NA_real_, nrow = p, ncol = p)
+      f0 <- fun(x)
+      for (j in seq_len(p)) {
+        e <- rep(0, p); e[j] <- eps
+        f_plus  <- fun(x + e)
+        f_minus <- fun(x - e)
+        J[, j]  <- (f_plus - f_minus) / (2 * eps)
+      }
+      J
+    }
+
+    A_hat <- num_jacobian(efficient_phi_eq_mean, phi_hat)
+    B_hat <- crossprod(score_phi_mat) / n
+    A_inv <- try(solve(A_hat), silent = TRUE)
+
+    if (inherits(A_inv, "try-error")) {
+      var_phi    <- matrix(NA_real_, nrow = p_phi, ncol = p_phi)
+      se_phi_vec <- rep(NA_real_, p_phi)
+    } else {
+      var_phi    <- A_inv %*% B_hat %*% t(A_inv) / n
+      se_phi_vec <- sqrt(diag(var_phi))
+    }
+
+    # theta (Eff_P): working linear model for mu(x)
     subset_idx  <- which(as.numeric(dat$d_np) == 1 | as.numeric(dat$d_p) == 1)
     subset_data <- dat[subset_idx, ]
     X_sub       <- df_get_X(subset_data)
@@ -820,18 +1007,22 @@ efficient_parametric_estimator <- function(dat,
     theta_res <- df_sandwich_from_contrib(contrib)
   }
 
-  list(phi   = phi_hat,
-       theta = theta_res$theta,
-       var   = theta_res$var,
-       se    = theta_res$se,
-       ci    = theta_res$ci,
-       info  = list(
-         type      = "Eff_P",
-         phi_start = phi_start,
-         eta4_star = eta4_star,
-         max_iter  = max_iter,
-         progress  = progress
-       ))
+  list(
+    phi      = phi_hat,
+    phi_var  = var_phi,
+    phi_se   = se_phi_vec,
+    theta    = theta_res$theta,
+    var      = theta_res$var,
+    se       = theta_res$se,
+    ci       = theta_res$ci,
+    info     = list(
+      type      = "Eff_P",
+      phi_start = phi_start,
+      eta4_star = eta4_star,
+      max_iter  = max_iter,
+      progress  = progress
+    )
+  )
 }
 
 ############################################################
