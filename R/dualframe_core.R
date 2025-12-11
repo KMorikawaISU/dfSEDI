@@ -626,9 +626,6 @@ df_estimate_NP_P <- function(dat,
 ##     Step 1: cross-fit pi_P
 ##     Step 2: solve phi (DML2, each fold recomputes eta4*(·; phi))
 ##     Step 3: cross-fit h4*(X) for theta
-##
-##  ★ phi_score_mean_core(phi, progress_eval=TRUE) の中で
-##     各 fold の nuisance 推定（eta4*）に対する progress bar を出しています。
 ############################################################
 
 efficient_estimator_dml2 <- function(dat,
@@ -659,53 +656,25 @@ efficient_estimator_dml2 <- function(dat,
                                  progress = progress)
 
   ## Step 2: solving phi (DML2) with eta4*(·;phi) recomputed per phi
-  ## We separate the core mean-score function so that we can control
-  ## whether to show per-fold progress (during optim) or stay silent
-  ## (during numerical Jacobian).
-  phi_score_mean_core <- function(phi, progress_eval = FALSE) {
+  phi_score_mean <- function(phi) {
     phi <- as.numeric(phi)
     eq_agg <- rep(0, p_phi)
-
-    if (progress_eval) {
-      cat("    [phi score] computing nuisance and scores across folds ...\n")
-      pb_f <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
-    }
-
     for (k in seq_along(folds)) {
       idx_k     <- folds[[k]]
       dat_test  <- dat_cf[idx_k, ]
       dat_train <- dat_cf[-idx_k, ]
 
-      # Within each fold we re-estimate eta4*(·;phi) on dat_train
-      # and then plug it in to the phi score evaluated on dat_test.
-      mat_k <- efficient_phi_score_matrix(
-        dat_test, dat_train, phi,
-        eta4_star = NULL
+      ee_fun_k <- estimating_equation_optimal_phi(
+        dat_test, dat_train, eta4_star = NULL
       )
-      eq_k   <- colMeans(mat_k)
+      eq_k   <- ee_fun_k(phi)
       eq_agg <- eq_agg + length(idx_k) / N_total * eq_k
-
-      if (progress_eval) {
-        utils::setTxtProgressBar(pb_f, k)
-      }
     }
-
-    if (progress_eval) {
-      close(pb_f)
-      cat("\n")
-    }
-
     eq_agg
   }
 
-  # This version is used by numerical Jacobian (no progress spam)
-  phi_score_mean <- function(phi) {
-    phi_score_mean_core(phi, progress_eval = FALSE)
-  }
-
-  # Objective for optim: squared norm of DML2 score
   obj_phi <- function(phi) {
-    eq_agg <- phi_score_mean_core(phi, progress_eval = progress)
+    eq_agg <- phi_score_mean(phi)
     sum(eq_agg ^ 2)
   }
 
@@ -719,7 +688,6 @@ efficient_estimator_dml2 <- function(dat,
   while (attempt < max_restart && res$convergence != 0) {
     attempt <- attempt + 1
     if (progress) {
-      cat(sprintf("  attempt %d / %d ...\n", attempt, max_restart))
       utils::setTxtProgressBar(pb_phi, attempt)
     }
 
