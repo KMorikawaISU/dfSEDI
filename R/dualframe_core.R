@@ -185,7 +185,7 @@ regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
     kernel = rbf_kernel
   )
 
-  as.numeric(stats::predict(reg_model, as.matrix(new_X)))
+  as.numeric(kernlab::predict(reg_model, as.matrix(new_X)))
 }
 
 # E[1/pi_P(L)|L] used for imputing pi_p
@@ -213,7 +213,7 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
     y      = 1 / pi_p_obs,
     kernel = rbf_kernel
   )
-  reg_pred <- stats::predict(reg_model, as.matrix(new_L))
+  reg_pred <- kernlab::predict(reg_model, as.matrix(new_L))
 
   as.numeric(1 / reg_pred)
 }
@@ -266,10 +266,10 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X,
     )
   )
 
-  eta4_denom_pred <- stats::predict(eta4_denom_model, as.matrix(new_X))
+  eta4_denom_pred <- kernlab::predict(eta4_denom_model, as.matrix(new_X))
   eta4_numer_pred <- sapply(
     eta4_numer_model,
-    function(m) stats::predict(m, as.matrix(new_X))
+    function(m) kernlab::predict(m, as.matrix(new_X))
   )
 
   sweep(eta4_numer_pred, 1, eta4_denom_pred, "/")
@@ -312,8 +312,8 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X,
     kernel = rbf_kernel
   )
 
-  h4_denom_pred <- stats::predict(h4_denom_model, as.matrix(new_X))
-  h4_numer_pred <- stats::predict(h4_numer_model, as.matrix(new_X))
+  h4_denom_pred <- kernlab::predict(h4_denom_model, as.matrix(new_X))
+  h4_numer_pred <- kernlab::predict(h4_numer_model, as.matrix(new_X))
 
   as.numeric(h4_numer_pred / h4_denom_pred)
 }
@@ -767,8 +767,6 @@ efficient_estimator_dml2 <- function(dat,
 
   ##########################################################
   ## (B) Sandwich variance for phi (only) from its scores
-  ##     (joint with theta is not used here; Neyman
-  ##      orthogonality mitigates the impact)
   ##########################################################
 
   # Collect per-observation phi scores (cross-fitted eta4*)
