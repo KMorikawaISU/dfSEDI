@@ -1,5 +1,5 @@
 ############################################################
-## dualframe_core.R
+## dualframe_core.R  (kernlab version with phi variance)
 ##
 ## Core estimation functions for semiparametric efficient
 ## dual-frame data integration with general matrix-valued X.
@@ -21,12 +21,13 @@
 ##       * dat$x is a numeric vector and we treat it as 1D X
 ##   - dat$y, dat$d_np, dat$d_p, dat$pi_p, dat$pi_np exist and are numeric
 ##
-## Note:
-##   - This file does NOT call library(). For interactive use:
-##       library(kernlab)
-##       library(nleqslv)
-##   - For package use, declare Imports: stats, utils, kernlab, nleqslv
-##     in DESCRIPTION and import them in NAMESPACE.
+## External packages (for package use):
+##   - Imports: stats, utils, nleqslv, kernlab
+##
+## NOTE:
+##   All kernlab calls use a safe wrapper around the S3 method
+##   predict.gausspr via getS3method() to avoid
+##   "no applicable method for 'predict'" errors.
 ############################################################
 
 ############################################################
@@ -111,11 +112,26 @@ df_numeric_jacobian <- function(fun, x0, eps = 1e-5) {
 }
 
 ############################################################
+## 0'. Safe wrapper around kernlab::gausspr prediction
+############################################################
+
+# Safe prediction for kernlab::gausspr objects, avoiding
+# "no applicable method for 'predict'" by bypassing S3 generic.
+df_gp_predict <- function(model, new_X, ...) {
+  if (!requireNamespace("kernlab", quietly = TRUE)) {
+    stop("Package 'kernlab' is required but not installed.")
+  }
+  # get S3 method from kernlab namespace
+  pred_fun <- getS3method("predict", "gausspr",
+                          envir = asNamespace("kernlab"))
+  as.numeric(pred_fun(model, newdata = as.matrix(new_X), ...))
+}
+
+############################################################
 ## 1. Basis functions for NP logistic model (multi-X)
 ############################################################
 
 # In the NP logistic model, we use l = (1, X^T, y)^T.
-# Here g2, g3, g4 share the same basis for simplicity.
 g2 <- function(dat) {
   X <- df_get_X(dat)
   cbind(1, X, as.numeric(dat$y))
@@ -183,10 +199,10 @@ eta4_prob_numer_function <- function(pi_np, pi_p, phi, l) {
 }
 
 ############################################################
-## 4. Kernel regression: E(Y|X), pi_P, eta4*, h4* (multi-X)
+## 4. Kernel regression: mu(X), pi_P, eta4*, h4*
 ############################################################
 
-# Nonparametric regression mu(x) = E[Y|X=x] using P-only data.
+# mu(x) = E[Y|X=x] using P-only data (Gaussian kernel regression)
 regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
   X_all <- df_get_X(dat)
   d_p   <- as.numeric(dat$d_p)
@@ -195,8 +211,6 @@ regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
   idx   <- which(d_p == 1 & d_np == 0)
   X_obs <- X_all[idx, , drop = FALSE]
   y_obs <- as.numeric(dat$y[idx])
-
-  new_X <- as.matrix(new_X)
 
   if (length(y_obs) < 2L) {
     return(rep(mean(y_obs), nrow(new_X)))
@@ -209,16 +223,15 @@ regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
 
   rbf_kernel <- kernlab::rbfdot(sigma = sigma)
   reg_model  <- kernlab::gausspr(
-    x      = X_obs,
+    x      = as.matrix(X_obs),
     y      = y_obs,
     kernel = rbf_kernel
   )
 
-  # IMPORTANT: directly call kernlab:::predict.gausspr to avoid S3 dispatch issues
-  as.numeric(kernlab:::predict.gausspr(reg_model, new_X))
+  df_gp_predict(reg_model, new_X)
 }
 
-# Nonparametric regression to impute pi_P from 1/pi_P regression.
+# E[1/pi_P(L)|L] with L = (X, y); used to impute pi_p
 pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   X_all <- df_get_X(dat)
   d_p   <- as.numeric(dat$d_p)
@@ -228,8 +241,6 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   y_obs    <- as.numeric(dat$y[idx])
   L_obs    <- cbind(X_obs, y_obs)
   pi_p_obs <- as.numeric(dat$pi_p[idx])
-
-  new_L <- as.matrix(new_L)
 
   if (length(pi_p_obs) < 2L) {
     return(rep(mean(pi_p_obs), nrow(new_L)))
@@ -242,17 +253,19 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
 
   rbf_kernel <- kernlab::rbfdot(sigma = sigma)
   reg_model  <- kernlab::gausspr(
-    x      = L_obs,
+    x      = as.matrix(L_obs),
     y      = 1 / pi_p_obs,
     kernel = rbf_kernel
   )
-  # DIRECT call to predict.gausspr
-  reg_pred <- kernlab:::predict.gausspr(reg_model, new_L)
+  inv_hat <- df_gp_predict(reg_model, new_L)
 
-  as.numeric(1 / reg_pred)
+  inv_hat[!is.finite(inv_hat)] <- mean(1 / pi_p_obs)
+  inv_hat[inv_hat <= 0]        <- min(inv_hat[inv_hat > 0])
+
+  as.numeric(1 / inv_hat)
 }
 
-# eta4*(L;phi) given X
+# eta4*(L;phi) given X via kernel regression on X
 estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X,
                                                          sigma = NULL) {
   phi   <- as.numeric(phi)
@@ -288,34 +301,30 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X,
 
   rbf_kernel <- kernlab::rbfdot(sigma = sigma)
 
-  eta4_denom_model <- kernlab::gausspr(
-    x      = X_obs,
+  denom_model <- kernlab::gausspr(
+    x      = as.matrix(X_obs),
     y      = as.numeric(Denom_vals),
     kernel = rbf_kernel
   )
-  eta4_numer_model <- lapply(
+  numer_models <- lapply(
     seq_len(p_dim),
-    function(j) {
-      kernlab::gausspr(
-        x      = X_obs,
-        y      = as.numeric(Numer_mat[, j]),
-        kernel = rbf_kernel
-      )
-    }
+    function(j) kernlab::gausspr(
+      x      = as.matrix(X_obs),
+      y      = as.numeric(Numer_mat[, j]),
+      kernel = rbf_kernel
+    )
   )
 
-  new_X <- as.matrix(new_X)
-
-  eta4_denom_pred <- kernlab:::predict.gausspr(eta4_denom_model, new_X)
-  eta4_numer_pred <- sapply(
-    eta4_numer_model,
-    function(m) kernlab:::predict.gausspr(m, new_X)
+  denom_pred <- df_gp_predict(denom_model, new_X)
+  numer_pred <- sapply(
+    numer_models,
+    function(m) df_gp_predict(m, new_X)
   )
 
-  sweep(eta4_numer_pred, 1, eta4_denom_pred, "/")
+  sweep(numer_pred, 1, denom_pred, "/")
 }
 
-# h4*(X;phi) given X
+# h4*(X;phi) given X via kernel regression on X
 estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X,
                                                            sigma = NULL) {
   phi   <- as.numeric(phi)
@@ -343,23 +352,21 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X,
 
   rbf_kernel <- kernlab::rbfdot(sigma = sigma)
 
-  h4_denom_model <- kernlab::gausspr(
-    x      = X_obs,
+  denom_model <- kernlab::gausspr(
+    x      = as.matrix(X_obs),
     y      = as.numeric(Denom_vals),
     kernel = rbf_kernel
   )
-  h4_numer_model <- kernlab::gausspr(
-    x      = X_obs,
+  numer_model <- kernlab::gausspr(
+    x      = as.matrix(X_obs),
     y      = as.numeric(Numer_vals),
     kernel = rbf_kernel
   )
 
-  new_X <- as.matrix(new_X)
+  denom_pred <- df_gp_predict(denom_model, new_X)
+  numer_pred <- df_gp_predict(numer_model, new_X)
 
-  h4_denom_pred <- kernlab:::predict.gausspr(h4_denom_model, new_X)
-  h4_numer_pred <- kernlab:::predict.gausspr(h4_numer_model, new_X)
-
-  as.numeric(h4_numer_pred / h4_denom_pred)
+  as.numeric(numer_pred / denom_pred)
 }
 
 ############################################################
@@ -381,7 +388,7 @@ estimating_equation_optimal_phi <- function(dat1,
     phi <- as.numeric(phi)
     if (is.null(eta4_star)) {
       eta4_star_local <- estimate_conditional_expectation_kernlab_phi(
-        dat2, phi, new_X = X1, sigma = NULL
+        dat2, phi, new_X = X1
       )
     } else {
       eta4_star_local <- eta4_star
@@ -430,7 +437,7 @@ efficient_theta_contrib <- function(dat1,
 
   if (is.null(h4_star)) {
     h4_star_local <- estimate_conditional_expectation_kernlab_theta(
-      dat2, phi, new_X = X1, sigma = NULL
+      dat2, phi, new_X = X1
     )
   } else {
     h4_star_local <- as.numeric(h4_star)
@@ -475,7 +482,6 @@ efficient_phi_contrib <- function(dat, phi, eta4_star_all) {
   pi_np1   <- 1 / (1 + exp(-eta))
   pi_np_p1 <- pi_np1 + pi_p1 - pi_np1 * pi_p1
 
-  # eta4_star_all is n x p_phi
   eta4_star_local <- as.matrix(eta4_star_all)
 
   term1 <- l1 * pi_np1 * (1 - pi_np1) / pi_np_p1 *
@@ -527,7 +533,6 @@ make_folds <- function(n, K) {
 # Cross-fitting for pi_P with progress bar (Step 1/3 in Eff)
 impute_pi_p_crossfit <- function(dat,
                                  folds,
-                                 sigma    = NULL,
                                  progress = FALSE) {
   dat_cf <- dat
   K      <- length(folds)
@@ -554,8 +559,7 @@ impute_pi_p_crossfit <- function(dat,
     if (length(pi_p_mis) > 0) {
       tilde_pi <- pi_p_estimation_kernlab(
         dat_train,
-        new_L = L_f[pi_p_mis, , drop = FALSE],
-        sigma = sigma
+        new_L = L_f[pi_p_mis, , drop = FALSE]
       )
       dat_cf$pi_p[idx_k[pi_p_mis]] <- tilde_pi
     }
@@ -709,7 +713,6 @@ efficient_estimator_dml2 <- function(dat,
 
   # Step 1: cross-fit pi_P with progress bar
   dat_cf <- impute_pi_p_crossfit(dat, folds,
-                                 sigma    = NULL,
                                  progress = progress)
 
   # DML2 objective for phi
@@ -757,7 +760,6 @@ efficient_estimator_dml2 <- function(dat,
     if (!inherits(res_try, "try-error")) {
       res <- res_try
       if (res$convergence == 0) {
-        # converged; stop early
         if (progress) {
           utils::setTxtProgressBar(pb_phi, max_restart)
         }
@@ -800,10 +802,10 @@ efficient_estimator_dml2 <- function(dat,
 
     # cross-fitted eta4*(L) and h4*(X) at phi_hat
     eta4_star_k <- estimate_conditional_expectation_kernlab_phi(
-      dat_train, phi_hat, new_X = X_test, sigma = NULL
+      dat_train, phi_hat, new_X = X_test
     )
     h4_star_k <- estimate_conditional_expectation_kernlab_theta(
-      dat_train, phi_hat, new_X = X_test, sigma = NULL
+      dat_train, phi_hat, new_X = X_test
     )
 
     eta4_star_all[idx_test, ] <- eta4_star_k
@@ -872,18 +874,6 @@ subefficient_estimator_dml2 <- function(dat,
   n     <- nrow(dat)
   folds <- make_folds(n, K)
 
-  X_all <- df_get_X(dat)
-  d_p   <- as.numeric(dat$d_p)
-  d_np  <- as.numeric(dat$d_np)
-
-  idx <- which(d_p == 1 & d_np == 0)
-  if (length(idx) >= 2L) {
-    dist_matrix <- as.matrix(stats::dist(X_all[idx, , drop = FALSE]))
-    sigma_mu    <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
-  } else {
-    sigma_mu <- NULL
-  }
-
   if (progress) {
     cat("Cross-fitting mu(X) for Eff_S ...\n")
     pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
@@ -899,7 +889,7 @@ subefficient_estimator_dml2 <- function(dat,
     X_test    <- df_get_X(dat_test)
 
     mu_hat_k <- regression_expectation_kernlab(
-      dat_train, new_X = X_test, sigma = sigma_mu
+      dat_train, new_X = X_test
     )
     mu_hat_all[idx_test] <- mu_hat_k
 
