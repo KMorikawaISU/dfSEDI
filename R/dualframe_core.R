@@ -27,9 +27,9 @@
 ##
 ## We access external functions with explicit namespaces:
 ##   - stats::var, stats::qnorm, stats::runif, stats::optim, stats::dist,
-##     stats::median, stats::rnorm, stats::rbinom, stats::lm, stats::predict
+##     stats::median, stats::lm, stats::predict
 ##   - nleqslv::nleqslv
-##   - kernlab::gausspr, kernlab::rbfdot, kernlab:::predict.gausspr
+##   - kernlab::gausspr, kernlab::rbfdot, kernlab::predict
 ############################################################
 
 ############################################################
@@ -177,12 +177,13 @@ eta4_prob_numer_function <- function(pi_np, pi_p, phi, l) {
 ############################################################
 
 # Robust wrapper for kernlab::gausspr prediction
+# NOTE: We explicitly call kernlab::predict(), which is the S4 generic
+# with a method for objects of class "gausspr". We do NOT use stats::predict.
 df_kernlab_predict_gausspr <- function(object, newdata) {
   if (!requireNamespace("kernlab", quietly = TRUE)) {
     stop("Package 'kernlab' is required but not installed.")
   }
-  # Call the S3 method directly in kernlab's namespace to avoid S3/S4 confusion
-  kernlab:::predict.gausspr(object, as.matrix(newdata))
+  kernlab::predict(object, as.matrix(newdata))
 }
 
 ############################################################
@@ -647,7 +648,7 @@ efficient_estimator_dml2 <- function(dat,
                                  sigma    = NULL,
                                  progress = progress)
 
-  # Objective for phi: squared norm of aggregated mean score
+  # Mean score for phi (aggregated across folds)
   phi_score_mean <- function(phi) {
     phi <- as.numeric(phi)
     eq_agg <- rep(0, length(phi))
@@ -662,6 +663,7 @@ efficient_estimator_dml2 <- function(dat,
     eq_agg
   }
 
+  # Objective for phi: squared norm of aggregated mean score
   obj_phi <- function(phi) {
     eq_agg <- phi_score_mean(phi)
     sum(eq_agg ^ 2)
@@ -737,7 +739,7 @@ efficient_estimator_dml2 <- function(dat,
   theta_res <- df_sandwich_from_contrib(theta_contrib)
 
   ## (c) Phi contributions (per i) and sandwich variance for phi
-  p_phi        <- length(phi_hat)
+  p_phi         <- length(phi_hat)
   phi_score_all <- matrix(NA_real_, nrow = N_total, ncol = p_phi)
 
   for (k in seq_along(folds)) {
@@ -923,8 +925,7 @@ efficient_parametric_estimator <- function(dat,
     )
     theta_res <- df_sandwich_from_contrib(contrib)
 
-    # For Eff_P we can approximate phi variance via the usual M-estimation
-    # using the "single-sample" score (no cross-fitting here)
+    # For Eff_P we approximate phi variance via usual M-estimation
     score_mat <- efficient_phi_score_matrix(dat, dat, phi_hat,
                                             eta4_star = eta4_star)
     B_hat     <- crossprod(score_mat) / n
