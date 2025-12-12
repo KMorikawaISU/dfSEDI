@@ -3,84 +3,157 @@ dfSEDI
 
 # dfSEDI
 
-The **dfSEDI** package implements semiparametric efficient data
-integration methods for dual-frame sampling as described in Morikawa &
-Kim (202x).
+dfSEDI implements semiparametric efficient data integration methods for
+dual-frame sampling (Morikawa & Kim, 202x).
 
-The package provides the following main estimators:
+Main user-facing estimators:
 
-- `Eff` : semiparametric efficient estimator (DML2, K-fold)
-- `Eff_S` : sub-efficient estimator (based on Remark 6, DML2, K-fold)
-- `Eff_P` : parametric efficient estimator (working model)
+- Eff : semiparametric efficient estimator (supports DML1 / DML2,
+  K-fold)
+- Eff_S : sub-efficient estimator (Remark 6-type, K-fold)
+- Eff_P : parametric efficient estimator (working model)
 
-Internally, the package also implements basic estimators such as
+For comparison (mainly for simulations), the package also includes:
 
-- `df_estimate_P` : probability-only estimator
-- `df_estimate_NP` : non-probability-only estimator (Chang & Kott type)
-- `df_estimate_NP_P` : combined NP ∪ P estimator (Chang & Kott type)
+- df_estimate_P : probability-only estimator (HT-type)
+- df_estimate_NP : non-probability-only estimator (Chang & Kott-type)
+- df_estimate_NP_P : NP union P estimator (Chang & Kott-type)
 
-For each estimator, sandwich-based variance, standard error, and 95%
-confidence intervals are computed from influence-function-based
+All estimators return a point estimate for theta = E(Y), and
+sandwich-type SE/CI computed from influence-function / pseudo-outcome
 contributions.
+
+------------------------------------------------------------------------
 
 ## Installation
 
-You can install the development version from GitHub:
+Install the development version from GitHub:
 
 ``` r
 # install.packages("devtools")
 devtools::install_github("KMorikawaISU/dfSEDI")
 ```
 
-## Example: one simulated dual-frame dataset
+Load the package:
 
-This section shows a minimal example using **one simulated dataset** (no
-Monte Carlo repetition). We reproduce a simple dual-frame scenario
-similar to that in the paper.
+``` r
+library(dfSEDI)
+```
 
-The data-generating mechanism is provided as an example script in
+------------------------------------------------------------------------
 
-`inst/examples/dualframe_simulation.R`
+## Data format
 
-which defines the function `generate_dualframe_population()`.
+All core functions assume a data frame dat that contains at least:
+
+- X : covariates used in the NP propensity and outcome models (either a
+  matrix stored as a single column, e.g. X = I(matrix(…)), or a data
+  frame that can be converted to a numeric matrix) Alternatively, a
+  numeric vector x can be provided (1D covariate case).
+- y : outcome variable
+- d_np : indicator for inclusion in the non-probability sample (0/1)
+- d_p : indicator for inclusion in the probability sample (0/1)
+- pi_p : design inclusion probability for the probability sample
+- pi_np : (optional; simulations only) true NP inclusion probability
+
+Internally, dfSEDI extracts the covariate matrix via a helper: - if
+dat$X exists, it is used (after coercion to numeric matrix)
+- otherwise, if dat$x exists, it is treated as a 1-column matrix
+
+------------------------------------------------------------------------
+
+## Example: one simulated dataset (no Monte Carlo)
+
+The package ships an example script in inst/examples:
+
+- inst/examples/dualframe_simulation.R
+
+It defines: - generate_dualframe_population(N)
+
+Example:
 
 ``` r
 library(dfSEDI)
 
-## Load the example script shipped with the package
-## This script defines `generate_dualframe_population()`
-example_file <- system.file("examples", "dualframe_simulation.R",
-                            package = "dfSEDI")
+# Load the bundled example script (defines generate_dualframe_population)
+example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
-set.seed(1)
-
-## 1. Generate one artificial dual-frame population
+set.seed(18)
 N <- 10000
 dat <- generate_dualframe_population(N = N)
 
-## The data frame `dat` must contain at least:
-##   - X   : matrix (or AsIs-matrix) of covariates (n x p)
-##   - y   : outcome variable
-##   - d_np: indicator of inclusion in the non-probability sample
-##   - d_p : indicator of inclusion in the probability sample
-##   - pi_p: design inclusion probability for the P-sample
-##   - pi_np: true inclusion probability for the NP-sample (for simulations)
+str(dat)
+```
 
-## 2. Semiparametric efficient estimator Eff (DML2, K-fold)
-fit_eff <- Eff(
+------------------------------------------------------------------------
+
+## Eff: DML1 (Recommend)
+
+DML1 conceptually computes fold-specific estimates and aggregates them:
+
+- split data into folds S_1, …, S_K
+- for each fold k:
+  - estimate nuisances (including pi_p) on training data (-k)
+  - compute fold-specific estimates on test fold k
+- aggregate fold-specific estimates across k
+
+DML1 example:
+
+``` r
+fit_eff_dml1 <- Eff(
   dat         = dat,
-  K           = 2,    # DML2 with 2-fold cross-fitting
-  phi_start   = NULL, # default: intercept = logit(mean(d_np)), other components = 0
+  K           = 3,
+  type        = 1,      # DML1
+  phi_start   = NULL,
   max_restart = 10,
-  progress    = TRUE  # show simple progress in the console
+  progress    = TRUE
 )
 
-fit_eff$theta  # point estimate
-fit_eff$se     # sandwich standard error
-fit_eff$ci     # 95% confidence interval
+fit_eff_dml1$phi
+fit_eff_dml1$theta
+fit_eff_dml1$se
+fit_eff_dml1$ci
+fit_eff_dml1$info
+```
 
-## 3. Sub-efficient estimator Eff_S (Remark 6)
+------------------------------------------------------------------------
+
+## Eff: DML2 (takes much more time than DML1)
+
+DML2 conceptually estimates nuisances on the full data and computes a
+single estimate.
+
+- type = 1 (or “DML1”) : DML1
+- type = 2 (or “DML2”) : DML2
+
+DML2 example:
+
+``` r
+fit_eff_dml2 <- Eff(
+  dat         = dat,
+  K           = 2,
+  type        = 2,      # DML2
+  phi_start   = NULL,
+  max_restart = 10,
+  progress    = TRUE
+)
+
+fit_eff_dml2$phi
+fit_eff_dml2$theta
+fit_eff_dml2$se
+fit_eff_dml2$ci
+fit_eff_dml2$info
+```
+
+Note: the current version focuses on inference for theta. Standard
+errors for phi are not provided (phi_se may be NULL).
+
+------------------------------------------------------------------------
+
+## Eff_S (sub-efficient)
+
+``` r
 fit_effS <- Eff_S(
   dat      = dat,
   K        = 2,
@@ -90,36 +163,40 @@ fit_effS <- Eff_S(
 fit_effS$theta
 fit_effS$se
 fit_effS$ci
+fit_effS$info
+```
 
-## 4. Parametric efficient estimator Eff_P (working model)
-##    Here we let the function choose default starting values.
+------------------------------------------------------------------------
+
+## Eff_P (parametric working model)
+
+``` r
 fit_effP <- Eff_P(
   dat       = dat,
-  phi_start = NULL,  # default starting values
+  phi_start = NULL,
   eta4_star = 0,
   max_iter  = 20,
   progress  = TRUE
 )
 
+fit_effP$phi
 fit_effP$theta
 fit_effP$se
 fit_effP$ci
+fit_effP$info
 ```
 
-Each of these objects has the following structure:
+------------------------------------------------------------------------
 
-- `theta` : point estimate of the target parameter (e.g., population
-  mean)
-- `var` : sandwich variance estimate
-- `se` : sandwich standard error (sqrt of `var`)
-- `ci` : 95% sandwich-based confidence interval (numeric vector of
-  length 2)
-- `phi` : estimated parameter vector for the non-probability inclusion
-  model (for `Eff` and `Eff_P`)
-- `info` : list of meta-information (e.g., K, starting values, estimator
-  type)
+## Returned object structure
 
-This interface allows users to call each estimator separately and obtain
-its point estimate, sandwich standard error, and confidence interval on
-a single dual-frame dataset, without running any Monte Carlo
-experiments.
+Eff / Eff_S / Eff_P return a list with (at least):
+
+- theta : point estimate of theta = E(Y)
+- var : sandwich variance estimate for theta
+- se : sandwich standard error for theta
+- ci : 95% confidence interval for theta
+- phi : estimated NP propensity parameter vector (Eff and Eff_P)
+- info : meta information (K, type, convergence, etc.)
+
+phi standard errors are not currently included (phi_se may be NULL).
