@@ -181,7 +181,7 @@ regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
     kernel = rbf_kernel
   )
 
-  as.numeric(predict(reg_model, as.matrix(new_X)))
+  as.numeric(kernlab::predict(reg_model, as.matrix(new_X)))
 }
 
 # Nonparametric regression for pi_P (inverse probability regression)
@@ -210,7 +210,7 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
     y      = 1 / pi_p_obs,
     kernel = rbf_kernel
   )
-  reg_pred <- predict(reg_model, as.matrix(new_L))
+  reg_pred <- kernlab::predict(reg_model, as.matrix(new_L))
 
   as.numeric(1 / reg_pred)
 }
@@ -263,10 +263,10 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X,
     )
   )
 
-  eta4_denom_pred <- predict(eta4_denom_model, as.matrix(new_X))
+  eta4_denom_pred <- kernlab::predict(eta4_denom_model, as.matrix(new_X))
   eta4_numer_pred <- sapply(
     eta4_numer_model,
-    function(m) predict(m, as.matrix(new_X))
+    function(m) kernlab::predict(m, as.matrix(new_X))
   )
 
   sweep(eta4_numer_pred, 1, eta4_denom_pred, "/")
@@ -309,8 +309,8 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X,
     kernel = rbf_kernel
   )
 
-  h4_denom_pred <- predict(h4_denom_model, as.matrix(new_X))
-  h4_numer_pred <- predict(h4_numer_model, as.matrix(new_X))
+  h4_denom_pred <- kernlab::predict(h4_denom_model, as.matrix(new_X))
+  h4_numer_pred <- kernlab::predict(h4_numer_model, as.matrix(new_X))
 
   as.numeric(h4_numer_pred / h4_denom_pred)
 }
@@ -993,7 +993,7 @@ Eff <- function(dat,
                 K           = 2,
                 phi_start   = NULL,
                 max_restart = 10,
-                type        = NULL,   # <- added for backward compatibility
+                type        = NULL,   # alias for dml_type
                 dml_type    = 2,
                 progress    = interactive()) {
 
