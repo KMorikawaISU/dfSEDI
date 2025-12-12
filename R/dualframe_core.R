@@ -22,15 +22,10 @@
 ##       * dat$x is a numeric vector and we treat it as 1D X
 ##   - dat$y, dat$d_np, dat$d_p, dat$pi_p, dat$pi_np exist and are numeric
 ##
-## External packages (must be available in the session):
+## External packages (must be available in the session or declared
+## in the package NAMESPACE / DESCRIPTION):
 ##   - nleqslv
 ##   - kernlab
-##
-## In a package context, add e.g.
-##   Imports: nleqslv, kernlab
-##   and roxygen tags:
-##   @importFrom nleqslv nleqslv
-##   @importFrom kernlab gausspr rbfdot
 ############################################################
 
 ############################################################
@@ -729,18 +724,6 @@ efficient_estimator_dml2 <- function(dat,
 ############################################################
 ## 11. Efficient estimator Eff (DML1, multi-X)
 ############################################################
-## DML1 spec (matching your description):
-##  - Split sample into K folds S_k
-##  - For each k:
-##      * Training T_k = complement of S_k
-##      * Estimate nuisances (pi_p^{(-k)}, eta^{(-k)}) using T_k
-##      * Using only S_k, solve estimating equation for phi^{(k)}
-##        and compute theta^{(k)} from test fold
-##  - Final estimators:
-##      * phi_hat = K^{-1} sum_k phi^{(k)}
-##      * theta_hat = mean over i of psi_i^{(k(i))} (i appears only in its own fold)
-##    and sandwich variance from all contributions psi_i.
-############################################################
 
 efficient_estimator_dml1 <- function(dat,
                                      phi_start   = NULL,
@@ -1002,16 +985,22 @@ efficient_parametric_estimator <- function(dat,
 ## 14. Public wrappers: Eff, Eff_S, Eff_P
 ############################################################
 ## Eff:
-##   dml_type = 2 (or "DML2") -> DML2 (one eq.)
-##   dml_type = 1 (or "DML1") -> DML1 (K estimators averaged)
+##   type = 1  or dml_type = 1 / "DML1" -> DML1
+##   type = 2  or dml_type = 2 / "DML2" -> DML2 (default)
 ############################################################
 
 Eff <- function(dat,
                 K           = 2,
                 phi_start   = NULL,
                 max_restart = 10,
+                type        = NULL,   # <- added for backward compatibility
                 dml_type    = 2,
                 progress    = interactive()) {
+
+  # If `type` is provided, use it as alias for dml_type
+  if (!is.null(type)) {
+    dml_type <- type
+  }
 
   # allow numeric 1/2 or character "DML1"/"DML2"
   if (is.numeric(dml_type)) {
