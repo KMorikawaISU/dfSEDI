@@ -3,10 +3,12 @@
 library(dfSEDI)
 library(parallel)
 
-
 generate_dualframe_population <- function(N) {
-  x1 <- rnorm(N, 0, 1)
-  x2 <- rbinom(N, 1, 1/2)
+  # Continuous and discrete covariates
+  x1 <- rnorm(N, 0, 1)          # continuous
+  x2 <- rbinom(N, 1, 1 / 2)     # binary (discrete)
+
+  # Full X for parametric components (logistic model, etc.)
   X  <- cbind(x1, x2)
 
   mu_y <- 0.5 * x1 - 0.4 * x2 + 0.2
@@ -22,18 +24,19 @@ generate_dualframe_population <- function(N) {
   d_p  <- rbinom(N, 1, pi_p)
 
   data.frame(
-    X     = I(X),   # X is a matrix-column (x1, x2)
-    y     = y,
-    d_np  = d_np,
-    d_p   = d_p,
-    pi_p  = pi_p,
-    pi_np = pi_np
+    X      = I(X),   # X is a matrix-column (x1, x2) for parametric part
+    x_cont = x1,     # continuous covariate for nonparametric part
+    x_disc = x2,     # discrete covariate (0/1; treated as factor in np)
+    y      = y,
+    d_np   = d_np,
+    d_p    = d_p,
+    pi_p   = pi_p,
+    pi_np  = pi_np
   )
 }
 
-
 ############################################################
-## One Monte Carlo replication (1D x)
+## One Monte Carlo replication
 ############################################################
 
 simulate_one_replication <- function(seed,
@@ -55,7 +58,6 @@ simulate_one_replication <- function(seed,
   # Main estimators: Eff, Eff_S, Eff_P
   fit_Eff <- Eff(
     dat         = dat,
-    # x_cols = NULL -> df_get_X(dat, NULL) falls back to dat$x
     K           = K,
     phi_start   = NULL,    # or c(-2.15, -0.5, -0.75)
     max_restart = 10,
@@ -101,14 +103,14 @@ main <- function(N = 10000, K = 2) {
 
   dat <- generate_dualframe_population(N)
 
-  # For debugging: true phi for this DGP
+  # For debugging: true phi for this DGP (for example)
   phi_true <- c(-2.15, -0.5, -0.75)
 
   # 1) Efficient estimator Eff
   fit_eff <- Eff(
     dat         = dat,
     K           = K,
-    phi_start   = phi_true,   # start from true value
+    phi_start   = phi_true,   # start from true value (optional)
     max_restart = 10,
     progress    = TRUE
   )
@@ -153,4 +155,3 @@ main <- function(N = 10000, K = 2) {
     Eff_P   = fit_effP
   ))
 }
-
