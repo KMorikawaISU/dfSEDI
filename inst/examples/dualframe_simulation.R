@@ -25,8 +25,6 @@ generate_dualframe_population <- function(N) {
 
   data.frame(
     X      = I(X),   # X is a matrix-column (x1, x2) for parametric part
-    x_cont = x1,     # continuous covariate for nonparametric part
-    x_disc = x2,     # discrete covariate (0/1; treated as factor in np)
     y      = y,
     d_np   = d_np,
     d_p    = d_p,
