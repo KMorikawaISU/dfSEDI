@@ -9,6 +9,13 @@
 ##  - If X is a data.frame with categorical columns, we use model.matrix(~ .)
 ##    (drop intercept) so categorical vars enter as L-1 dummies
 ##
+## Binary Y support (requested):
+##  - Eff     : unchanged (still uses Gaussian / mixed kernel regression for eta4*, h4*)
+##  - Eff_S   : if y is binary and logit=TRUE (or logit=NULL auto-detect), mu(X)=P(Y=1|X)
+##              is estimated by kernel logistic regression (RBF + ridge, IRLS)
+##  - Eff_P   : if y is binary and logit=TRUE (or logit=NULL auto-detect), mu(X) is estimated
+##              by parametric logistic regression (glm binomial)
+##
 ## Stability updates:
 ##  - RBF sigma estimation uses deterministic subsampling (reproducible)
 ##  - Probability clipping for pi_p, pi_np, pi_np_p to avoid Inf/NaN
@@ -66,6 +73,95 @@ df_floor_pos <- function(x, floor = NULL) {
   x[!is.finite(x)] <- floor
   x <- pmax(x, floor)
   x
+}
+
+# Binary Y helpers ------------------------------------------------------------
+
+df_is_binary_y <- function(y) {
+  y0 <- y
+  y0 <- y0[!is.na(y0)]
+  if (length(y0) == 0L) return(FALSE)
+
+  if (is.logical(y0)) return(TRUE)
+
+  if (is.factor(y0)) {
+    return(length(levels(y0)) == 2L)
+  }
+
+  if (is.character(y0)) {
+    # try numeric coercion; if fails, treat as factor-ish
+    tmp <- suppressWarnings(as.numeric(y0))
+    if (all(is.na(tmp))) {
+      return(length(unique(y0)) == 2L)
+    } else {
+      u <- sort(unique(tmp[is.finite(tmp)]))
+      return(length(u) == 2L)
+    }
+  }
+
+  if (is.numeric(y0) || is.integer(y0)) {
+    u <- sort(unique(as.numeric(y0[is.finite(y0)])))
+    return(length(u) == 2L)
+  }
+
+  FALSE
+}
+
+# Convert binary y to 0/1 numeric.
+# - factor: second level is treated as success (1) by default
+# - numeric: larger unique value is treated as success (1)
+df_as_binary01 <- function(y, success_level = NULL) {
+  if (is.logical(y)) {
+    y01 <- as.numeric(y)
+    return(list(y01 = y01, mapping = "logical(TRUE)=1,FALSE=0"))
+  }
+
+  if (is.factor(y)) {
+    if (length(levels(y)) != 2L) stop("df_as_binary01(): factor y must have exactly 2 levels.")
+    lev <- levels(y)
+    if (is.null(success_level)) success_level <- lev[2]
+    y01 <- as.numeric(y == success_level)
+    return(list(y01 = y01, mapping = paste0("factor(success='", success_level, "')")))
+  }
+
+  if (is.character(y)) {
+    tmp <- suppressWarnings(as.numeric(y))
+    if (all(is.na(tmp))) {
+      f <- factor(y)
+      return(df_as_binary01(f, success_level = success_level))
+    } else {
+      return(df_as_binary01(tmp, success_level = success_level))
+    }
+  }
+
+  if (is.numeric(y) || is.integer(y)) {
+    ynum <- as.numeric(y)
+    u <- sort(unique(ynum[is.finite(ynum)]))
+    if (length(u) != 2L) stop("df_as_binary01(): numeric y must have exactly 2 unique finite values.")
+    success_val <- if (is.null(success_level)) u[2] else as.numeric(success_level)
+    y01 <- as.numeric(ynum == success_val)
+    return(list(y01 = y01, mapping = paste0("numeric(success=", success_val, ", other=", u[1], ")")))
+  }
+
+  stop("df_as_binary01(): unsupported y type.")
+}
+
+df_sigmoid <- function(z) {
+  z <- as.numeric(z)
+  out <- rep(NA_real_, length(z))
+  idx1 <- which(z >= 0)
+  idx0 <- which(z < 0)
+  out[idx1] <- 1 / (1 + exp(-z[idx1]))
+  ez <- exp(z[idx0])
+  out[idx0] <- ez / (1 + ez)
+  out
+}
+
+df_infer_logit_flag <- function(logit, y) {
+  if (is.null(logit)) {
+    return(df_is_binary_y(y))
+  }
+  isTRUE(logit)
 }
 
 # Extract parametric design matrix X
@@ -481,6 +577,293 @@ df_krr_mixed_predict <- function(X_train,
 }
 
 ############################################################
+## Kernel logistic regression (binary mu) for Eff_S
+############################################################
+
+# RBF kernel matrix: exp(-sigma * ||x-x'||^2)
+df_rbf_kernel <- function(X1, X2 = NULL, sigma = 1) {
+  X1 <- as.matrix(X1)
+  if (is.null(X2)) X2 <- X1
+  X2 <- as.matrix(X2)
+  sigma <- as.numeric(sigma)[1]
+  if (!is.finite(sigma) || sigma <= 0) sigma <- 1
+
+  # squared distances: ||a-b||^2 = ||a||^2 + ||b||^2 - 2 a'b
+  a2 <- rowSums(X1^2)
+  b2 <- rowSums(X2^2)
+  G  <- X1 %*% t(X2)
+  D2 <- outer(a2, b2, "+") - 2 * G
+  D2[D2 < 0] <- 0
+  exp(-sigma * D2)
+}
+
+df_solve_ridge <- function(A, b, ridge_seq = NULL) {
+  A <- as.matrix(A)
+  b <- as.matrix(b)
+
+  if (is.null(ridge_seq)) {
+    ridge_seq <- getOption("dfSEDI.solve_ridge_seq", c(0, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2))
+  }
+  ridge_seq <- as.numeric(ridge_seq)
+  ridge_seq <- ridge_seq[is.finite(ridge_seq) & ridge_seq >= 0]
+  if (length(ridge_seq) == 0L) ridge_seq <- c(0, 1e-8, 1e-6, 1e-4, 1e-2)
+
+  for (lam in ridge_seq) {
+    A_try <- A
+    if (lam > 0) A_try <- A_try + diag(lam, nrow(A_try))
+    sol <- tryCatch(solve(A_try, b), error = function(e) NULL)
+    if (!is.null(sol) && all(is.finite(sol))) return(sol)
+  }
+  NULL
+}
+
+# Kernel logistic regression fit (IRLS) with intercept:
+# minimize -loglik(y | f) + (lambda/2) * alpha' K alpha,  f = K alpha + b
+df_klogit_fit <- function(X, y01, sigma = NULL, lambda = NULL, max_iter = NULL, tol = NULL) {
+  X <- as.matrix(X)
+  y01 <- as.numeric(y01)
+
+  n <- nrow(X)
+  if (n < 2L) return(list(ok = FALSE))
+
+  if (is.null(sigma)) sigma <- df_estimate_rbf_sigma(X, max_n = min(2000L, n))
+  if (is.null(sigma)) sigma <- 1
+
+  if (is.null(lambda)) lambda <- getOption("dfSEDI.klr_lambda", 1e-2)
+  lambda <- as.numeric(lambda)[1]
+  if (!is.finite(lambda) || lambda <= 0) lambda <- 1e-2
+
+  if (is.null(max_iter)) max_iter <- getOption("dfSEDI.klr_max_iter", 50L)
+  max_iter <- as.integer(max_iter)
+  if (!is.finite(max_iter) || max_iter < 1L) max_iter <- 50L
+
+  if (is.null(tol)) tol <- getOption("dfSEDI.klr_tol", 1e-6)
+  tol <- as.numeric(tol)[1]
+  if (!is.finite(tol) || tol <= 0) tol <- 1e-6
+
+  # If only one class present, return constant prob
+  u <- sort(unique(y01[is.finite(y01)]))
+  if (length(u) < 2L) {
+    p0 <- df_clip_prob(mean(y01), eps = getOption("dfSEDI.prob_clip", 1e-8))
+    return(list(ok = TRUE, type = "constant", p = p0, X = X, sigma = sigma))
+  }
+
+  # deterministic subsample if too large (optional)
+  max_n <- getOption("dfSEDI.klr_max_n", 2000L)
+  max_n <- as.integer(max_n)
+  if (!is.finite(max_n) || max_n < 2L) max_n <- n
+  if (n > max_n) {
+    idx <- unique(pmax(1L, pmin(n, as.integer(round(seq.int(1, n, length.out = max_n))))))
+    X <- X[idx, , drop = FALSE]
+    y01 <- y01[idx]
+    n <- nrow(X)
+  }
+
+  K <- df_rbf_kernel(X, X, sigma = sigma)
+  jitter <- getOption("dfSEDI.klr_jitter", 1e-10)
+  jitter <- as.numeric(jitter)[1]
+  if (!is.finite(jitter) || jitter < 0) jitter <- 0
+  if (jitter > 0) K <- K + diag(jitter, n)
+
+  # init
+  pbar <- mean(y01)
+  pbar <- df_clip_prob(pbar)
+  b <- as.numeric(stats::qlogis(pbar))
+  alpha <- rep(0, n)
+
+  eps_w <- getOption("dfSEDI.klr_w_floor", 1e-6)
+  eps_w <- as.numeric(eps_w)[1]
+  if (!is.finite(eps_w) || eps_w <= 0) eps_w <- 1e-6
+
+  for (it in seq_len(max_iter)) {
+    f <- as.numeric(K %*% alpha + b)
+    p <- df_sigmoid(f)
+    p <- df_clip_prob(p)
+
+    w <- p * (1 - p)
+    w <- pmax(w, eps_w)
+
+    z <- f + (y01 - p) / w
+
+    WK <- sweep(K, 1, w, "*")              # diag(w) K
+    KWK <- K %*% WK                        # K diag(w) K
+    Kw1 <- as.numeric(K %*% w)             # K diag(w) 1
+    K_wz <- as.numeric(K %*% (w * z))      # K diag(w) z
+
+    one_W_K <- colSums(WK)                 # 1' diag(w) K
+    one_W_1 <- sum(w)
+    one_W_z <- sum(w * z)
+
+    A11 <- KWK + lambda * K
+    A12 <- matrix(Kw1, nrow = n, ncol = 1)
+    A21 <- matrix(one_W_K, nrow = 1, ncol = n)
+    A22 <- matrix(one_W_1, nrow = 1, ncol = 1)
+
+    A <- rbind(cbind(A11, A12),
+               cbind(A21, A22))
+    rhs <- c(K_wz, one_W_z)
+
+    sol <- df_solve_ridge(A, rhs)
+    if (is.null(sol)) {
+      return(list(ok = FALSE))
+    }
+
+    alpha_new <- as.numeric(sol[1:n])
+    b_new     <- as.numeric(sol[n + 1])
+
+    diff <- max(abs(alpha_new - alpha), abs(b_new - b))
+    alpha <- alpha_new
+    b <- b_new
+    if (is.finite(diff) && diff < tol) break
+  }
+
+  list(ok = TRUE, type = "klogit", alpha = alpha, b = b, X = X, sigma = sigma)
+}
+
+df_klogit_predict <- function(fit, X_new) {
+  X_new <- as.matrix(X_new)
+  if (is.null(fit) || !isTRUE(fit$ok)) return(rep(NA_real_, nrow(X_new)))
+
+  if (isTRUE(fit$type == "constant")) {
+    p0 <- df_clip_prob(fit$p)
+    return(rep(p0, nrow(X_new)))
+  }
+
+  K_new <- df_rbf_kernel(fit$X, X_new, sigma = fit$sigma)
+  f_new <- as.numeric(t(K_new) %*% fit$alpha + fit$b)
+  p_new <- df_sigmoid(f_new)
+  df_clip_prob(p_new)
+}
+
+# Mixed-type kernel logistic (delta on categorical, RBF on continuous).
+df_klogit_mixed_predict <- function(X_train,
+                                    y01_train,
+                                    X_test,
+                                    sigma,
+                                    cat_cols,
+                                    cont_cols,
+                                    sigma_max_n = 2000L) {
+  X_train <- as.matrix(X_train)
+  X_test  <- as.matrix(X_test)
+  y01_train <- as.numeric(y01_train)
+
+  ntr <- nrow(X_train)
+  nte <- nrow(X_test)
+  if (nte == 0L) return(numeric(0))
+  if (ntr == 0L) return(rep(NA_real_, nte))
+
+  # global fallback
+  global_mean <- df_clip_prob(mean(y01_train))
+  global_fit <- NULL
+  if (length(cont_cols) > 0L) {
+    Xc <- X_train[, cont_cols, drop = FALSE]
+    if (is.null(sigma)) sigma <- df_estimate_rbf_sigma(Xc, max_n = sigma_max_n)
+    if (is.null(sigma)) sigma <- 1
+    global_fit <- df_klogit_fit(Xc, y01_train, sigma = sigma)
+    if (!isTRUE(global_fit$ok)) global_fit <- NULL
+  }
+
+  if (length(cat_cols) == 0L) {
+    if (is.null(global_fit)) return(rep(global_mean, nte))
+    return(df_klogit_predict(global_fit, X_test[, cont_cols, drop = FALSE]))
+  }
+
+  key_train <- df_make_cat_key(X_train[, cat_cols, drop = FALSE])
+  key_test  <- df_make_cat_key(X_test[,  cat_cols, drop = FALSE])
+  uniq_keys <- unique(key_train)
+
+  cell_fit <- vector("list", length(uniq_keys))
+  names(cell_fit) <- uniq_keys
+  cell_mean <- setNames(rep(NA_real_, length(uniq_keys)), uniq_keys)
+
+  for (k in uniq_keys) {
+    idx <- which(key_train == k)
+    yk <- y01_train[idx]
+    cell_mean[k] <- df_clip_prob(mean(yk))
+
+    if (length(cont_cols) == 0L) {
+      cell_fit[[k]] <- NULL
+      next
+    }
+
+    # if only one class present or too small, skip fitting
+    uk <- unique(yk[is.finite(yk)])
+    if (length(uk) < 2L || length(yk) < 3L) {
+      cell_fit[[k]] <- NULL
+      next
+    }
+
+    Xk <- X_train[idx, cont_cols, drop = FALSE]
+    sig_k <- sigma
+    if (is.null(sig_k)) sig_k <- df_estimate_rbf_sigma(Xk, max_n = sigma_max_n)
+    if (is.null(sig_k)) sig_k <- 1
+
+    fitk <- df_klogit_fit(Xk, yk, sigma = sig_k)
+    if (!isTRUE(fitk$ok)) fitk <- NULL
+    cell_fit[[k]] <- fitk
+  }
+
+  pred <- rep(global_mean, nte)
+
+  for (k in unique(key_test)) {
+    idx <- which(key_test == k)
+
+    if (k %in% uniq_keys) {
+      if (is.null(cell_fit[[k]]) || length(cont_cols) == 0L) {
+        pred[idx] <- cell_mean[[k]]
+      } else {
+        Xt <- X_test[idx, cont_cols, drop = FALSE]
+        pred[idx] <- df_klogit_predict(cell_fit[[k]], Xt)
+      }
+    } else {
+      if (!is.null(global_fit) && length(cont_cols) > 0L) {
+        Xt <- X_test[idx, cont_cols, drop = FALSE]
+        pred[idx] <- df_klogit_predict(global_fit, Xt)
+      } else {
+        pred[idx] <- global_mean
+      }
+    }
+  }
+
+  df_clip_prob(pred)
+}
+
+# mu(x) = P(Y=1 | X=x) via mixed-type kernel logistic regression
+regression_expectation_klogit <- function(dat, new_X, sigma = NULL, success_level = NULL) {
+  X_all <- df_get_X(dat)
+  idx   <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
+  X_obs <- X_all[idx, , drop = FALSE]
+  y_obs <- dat$y[idx]
+
+  if (length(y_obs) < 1L) return(rep(NA_real_, nrow(new_X)))
+
+  bin <- df_as_binary01(y_obs, success_level = success_level)
+  y01 <- as.numeric(bin$y01)
+
+  # if only one class, return constant
+  u <- unique(y01[is.finite(y01)])
+  if (length(u) < 2L) {
+    p0 <- df_clip_prob(mean(y01))
+    return(rep(p0, nrow(new_X)))
+  }
+
+  prep <- df_krr_mixed_prepare(
+    X_train = X_obs,
+    sigma   = sigma,
+    context = "mu(X) = P(Y=1 | X) kernel logistic regression"
+  )
+
+  df_klogit_mixed_predict(
+    X_train  = X_obs,
+    y01_train= y01,
+    X_test   = as.matrix(new_X),
+    sigma    = prep$sigma,
+    cat_cols = prep$cat_cols,
+    cont_cols= prep$cont_cols
+  )
+}
+
+############################################################
 ## Numeric Jacobian + sandwich
 ############################################################
 
@@ -640,7 +1023,7 @@ eta4_prob_numer_function <- function(pi_np, pi_p, phi, l) {
 }
 
 ############################################################
-## 4. Mixed-type KRR nuisance regressions
+## 4. Mixed-type KRR nuisance regressions (Eff)
 ############################################################
 
 regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
@@ -1239,7 +1622,6 @@ efficient_estimator_dml1 <- function(dat,
   var_k_list  <- vector("list", K)
   w_k         <- rep(NA_real_, K)
 
-  # store per-observation theta contributions for a stable fallback variance
   contrib_all <- rep(NA_real_, n)
 
   big_penalty <- 1e100
@@ -1329,7 +1711,6 @@ efficient_estimator_dml1 <- function(dat,
     s_phi_k   <- df_score_phi_contrib(dat_test, phi_k, eta4_k)
     contrib_k <- efficient_theta_contrib(dat_test, phi_k, h4_k)
 
-    # store per-observation contributions for fallback
     contrib_all[idx_test] <- contrib_k
 
     theta_k[k] <- mean(contrib_k, na.rm = TRUE)
@@ -1351,10 +1732,7 @@ efficient_estimator_dml1 <- function(dat,
     js_k <- df_joint_sandwich(score_k, A_k)
     var_k_list[[k]] <- js_k$var
 
-    if (progress && !used_fallback) {
-      cat(sprintf("  fold %d/%d done.\n", k, K))
-      flush.console()
-    } else if (progress && used_fallback) {
+    if (progress) {
       cat(sprintf("  fold %d/%d done.\n", k, K))
       flush.console()
     }
@@ -1376,17 +1754,12 @@ efficient_estimator_dml1 <- function(dat,
     ))
   }
 
-  # weighted average of fold estimates (weights by fold size)
   w_use <- w_k[valid]
   w_use <- w_use / sum(w_use)
 
   phi_hat   <- as.numeric(t(w_use) %*% phi_k_mat[valid, , drop = FALSE])
-
-  # theta_hat: use mean of per-observation contributions (more stable when some contrib are NA)
   theta_hat <- mean(contrib_all, na.rm = TRUE)
 
-  # Combine variances of fold estimators: Var(sum w_k beta_k) ~ sum w_k^2 Var(beta_k)
-  # Use only folds with finite variance matrices
   valid_var <- valid[sapply(valid, function(kk) {
     Vkk <- var_k_list[[kk]]
     !is.null(Vkk) && all(is.finite(Vkk))
@@ -1446,7 +1819,7 @@ efficient_estimator_dml1 <- function(dat,
 }
 
 ############################################################
-## 10. Sub-efficient estimator Eff_S
+## 10. Sub-efficient estimator Eff_S (now supports binary via kernel logistic)
 ############################################################
 
 subefficient_contrib <- function(dat, mu_hat) {
@@ -1460,9 +1833,14 @@ subefficient_contrib <- function(dat, mu_hat) {
     (1 - d_np) * (d_p / pi_p * y + (1 - d_p / pi_p) * mu)
 }
 
-subefficient_estimator_dml2 <- function(dat, K = 2, progress = FALSE) {
+subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, progress = FALSE) {
   n <- nrow(dat)
   folds <- make_folds(n, K)
+
+  use_logit <- df_infer_logit_flag(logit, dat$y)
+  if (isTRUE(use_logit) && !df_is_binary_y(dat$y)) {
+    stop("Eff_S: logit=TRUE requires binary y (0/1 numeric, logical, or 2-level factor).", call. = FALSE)
+  }
 
   X_all <- df_get_X(dat)
   idx_mu <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
@@ -1491,7 +1869,12 @@ subefficient_estimator_dml2 <- function(dat, K = 2, progress = FALSE) {
     dat_test  <- dat[idx_test,  ]
     X_test    <- df_get_X(dat_test)
 
-    mu_k <- regression_expectation_kernlab(dat_train, new_X = X_test, sigma = sigma_mu)
+    mu_k <- if (isTRUE(use_logit)) {
+      regression_expectation_klogit(dat_train, new_X = X_test, sigma = sigma_mu)
+    } else {
+      regression_expectation_kernlab(dat_train, new_X = X_test, sigma = sigma_mu)
+    }
+
     mu_hat_all[idx_test] <- mu_k
 
     if (progress) utils::setTxtProgressBar(pb, k)
@@ -1509,22 +1892,30 @@ subefficient_estimator_dml2 <- function(dat, K = 2, progress = FALSE) {
        var   = theta_res$var,
        se    = theta_res$se,
        ci    = theta_res$ci,
-       info  = list(type = "Eff_S", K = K, progress = progress))
+       info  = list(type = "Eff_S", K = K, progress = progress,
+                    logit = use_logit,
+                    mu_model = if (isTRUE(use_logit)) "kernel_logistic" else "kernel_ridge"))
 }
 
 ############################################################
-## 11. Parametric efficient estimator Eff_P
+## 11. Parametric efficient estimator Eff_P (now supports binary via logistic glm)
 ############################################################
 
 efficient_parametric_estimator <- function(dat,
                                            phi_start = NULL,
                                            eta4_star = 0,
                                            max_iter  = 20,
+                                           logit     = NULL,
                                            progress  = FALSE) {
   X_all <- df_get_X(dat)
   p_x <- ncol(X_all)
   p_phi <- 1 + p_x + 1
   n <- nrow(dat)
+
+  use_logit <- df_infer_logit_flag(logit, dat$y)
+  if (isTRUE(use_logit) && !df_is_binary_y(dat$y)) {
+    stop("Eff_P: logit=TRUE requires binary y (0/1 numeric, logical, or 2-level factor).", call. = FALSE)
+  }
 
   if (is.null(phi_start)) {
     phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
@@ -1572,21 +1963,41 @@ efficient_parametric_estimator <- function(dat,
   if (sol$termcd > 2) {
     phi_hat <- rep(NA_real_, p_phi)
     theta_res <- df_sandwich_from_contrib(rep(NA_real_, n))
+    mu_model <- NA_character_
   } else {
     phi_hat <- as.numeric(sol$x)
 
     subset_idx <- which(as.numeric(dat$d_np) == 1 | as.numeric(dat$d_p) == 1)
     dat_sub <- dat[subset_idx, ]
     X_sub <- df_get_X(dat_sub)
-    df_sub <- data.frame(y = as.numeric(dat_sub$y), X_sub)
-    colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
-
-    lm_fit <- stats::lm(y ~ ., data = df_sub)
 
     X_full <- df_get_X(dat)
-    df_full <- data.frame(X_full)
-    colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
-    mu_hat <- stats::predict(lm_fit, newdata = df_full)
+
+    if (isTRUE(use_logit)) {
+      y01_sub <- df_as_binary01(dat_sub$y)$y01
+      df_sub <- data.frame(y = y01_sub, X_sub)
+      colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
+
+      glm_fit <- stats::glm(y ~ ., data = df_sub, family = stats::binomial())
+
+      df_full <- data.frame(X_full)
+      colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
+      mu_hat <- as.numeric(stats::predict(glm_fit, newdata = df_full, type = "response"))
+      mu_hat <- df_clip_prob(mu_hat)
+
+      mu_model <- "parametric_logistic"
+    } else {
+      df_sub <- data.frame(y = as.numeric(dat_sub$y), X_sub)
+      colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
+
+      lm_fit <- stats::lm(y ~ ., data = df_sub)
+
+      df_full <- data.frame(X_full)
+      colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
+      mu_hat <- as.numeric(stats::predict(lm_fit, newdata = df_full))
+
+      mu_model <- "parametric_linear"
+    }
 
     contrib <- efficient_theta_contrib(dat, phi_hat, h4_star_local = mu_hat)
     theta_res <- df_sandwich_from_contrib(contrib)
@@ -1601,7 +2012,13 @@ efficient_parametric_estimator <- function(dat,
     var    = theta_res$var,
     se     = theta_res$se,
     ci     = theta_res$ci,
-    info   = list(type = "Eff_P", phi_start = phi_start, eta4_star = eta4_star, max_iter = max_iter, progress = progress)
+    info   = list(type = "Eff_P",
+                  phi_start = phi_start,
+                  eta4_star = eta4_star,
+                  max_iter  = max_iter,
+                  progress  = progress,
+                  logit     = use_logit,
+                  mu_model  = mu_model)
   )
 }
 
@@ -1630,14 +2047,16 @@ Eff <- function(dat,
   }
 }
 
-Eff_S <- function(dat, K = 2, progress = interactive()) {
-  subefficient_estimator_dml2(dat, K = K, progress = progress)
+Eff_S <- function(dat, K = 2, logit = NULL, progress = interactive()) {
+  subefficient_estimator_dml2(dat, K = K, logit = logit, progress = progress)
 }
 
 Eff_P <- function(dat,
                   phi_start = NULL,
                   eta4_star = 0,
                   max_iter  = 20,
+                  logit     = NULL,
                   progress  = interactive()) {
-  efficient_parametric_estimator(dat, phi_start = phi_start, eta4_star = eta4_star, max_iter = max_iter, progress = progress)
+  efficient_parametric_estimator(dat, phi_start = phi_start, eta4_star = eta4_star,
+                                 max_iter = max_iter, logit = logit, progress = progress)
 }
