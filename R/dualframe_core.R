@@ -14,11 +14,13 @@
 ##  - Probability clipping for pi_p, pi_np, pi_np_p to avoid Inf/NaN
 ##  - Denominator floor for ratio nuisances eta4*/h4* to avoid division by ~0
 ##  - DML1: safe fallback and fold skipping if estimating equations are non-finite
+##  - Sandwich variance: drop non-finite score rows; robust inversion with ridge;
+##    theta variance fallback to contrib-based sandwich when needed
 ##
 ## IMPORTANT (Median heuristic):
-##  - Default sigma rule is the standard median heuristic for RBF:
-##      h = median(||x_i - x_j||),  sigma = 1/(2*h^2)
-##  - You can revert to the old behavior via:
+##  - Default sigma rule (for kernlab::rbfdot) is:
+##      h = median(||x_i-x_j||),  sigma = 1/(2*h^2)
+##  - Revert to legacy behavior via:
 ##      options(dfSEDI.sigma_rule = "legacy")  # sigma = 1/median(||x_i-x_j||)
 ############################################################
 
@@ -241,11 +243,8 @@ df_estimate_rbf_sigma <- function(X_cont, max_n = 2000L) {
   if (!rule %in% c("median", "median_heuristic", "legacy")) rule <- "median"
 
   if (rule %in% c("median", "median_heuristic")) {
-    # kernlab RBF: exp(-sigma * ||x-x'||^2)
-    # median heuristic: h = median(||x-x'||) => sigma = 1/(2*h^2)
     return(1 / (2 * med^2))
   } else {
-    # legacy behavior (older prototypes)
     return(1 / med)
   }
 }
@@ -508,27 +507,67 @@ df_numeric_jacobian <- function(fun, x0, eps = NULL) {
   J
 }
 
+# Robust joint sandwich:
+#  - drop rows with any non-finite score entries
+#  - robust inversion (solve with ridge; qr.solve; MASS::ginv)
 df_joint_sandwich <- function(score_mat, A_hat) {
   score_mat <- as.matrix(score_mat)
-  n <- nrow(score_mat)
+  A_hat <- as.matrix(A_hat)
   q <- ncol(score_mat)
 
-  if (n <= q) {
-    return(list(var = matrix(NA_real_, q, q)))
+  if (ncol(A_hat) != q || nrow(A_hat) != q) {
+    return(list(var = matrix(NA_real_, q, q), A = A_hat, B = matrix(NA_real_, q, q), n_eff = 0L))
   }
 
-  sbar <- colMeans(score_mat)
-  S    <- sweep(score_mat, 2, sbar, "-")
+  keep <- apply(score_mat, 1, function(r) all(is.finite(r)))
+  score_use <- score_mat[keep, , drop = FALSE]
+  n <- nrow(score_use)
+
+  if (n <= q) {
+    return(list(var = matrix(NA_real_, q, q), A = A_hat, B = matrix(NA_real_, q, q), n_eff = n))
+  }
+
+  if (any(!is.finite(A_hat))) {
+    return(list(var = matrix(NA_real_, q, q), A = A_hat, B = matrix(NA_real_, q, q), n_eff = n))
+  }
+
+  sbar <- colMeans(score_use)
+  S <- sweep(score_use, 2, sbar, "-")
   B_hat <- crossprod(S) / n
 
-  V <- tryCatch({
-    A_inv <- solve(A_hat)
-    A_inv %*% B_hat %*% t(A_inv) / n
-  }, error = function(e) {
-    matrix(NA_real_, q, q)
-  })
+  A_inv <- NULL
+  ridge_seq <- getOption("dfSEDI.sandwich_ridge_seq", c(0, 1e-10, 1e-8, 1e-6, 1e-4, 1e-2))
+  ridge_seq <- as.numeric(ridge_seq)
+  ridge_seq <- ridge_seq[is.finite(ridge_seq) & ridge_seq >= 0]
+  if (length(ridge_seq) == 0L) ridge_seq <- c(0, 1e-8, 1e-6, 1e-4, 1e-2)
 
-  list(var = V, A = A_hat, B = B_hat)
+  for (lam in ridge_seq) {
+    A_try <- A_hat
+    if (lam > 0) A_try <- A_try + diag(lam, nrow(A_try))
+    A_inv_try <- tryCatch(solve(A_try), error = function(e) NULL)
+    if (!is.null(A_inv_try) && all(is.finite(A_inv_try))) {
+      A_inv <- A_inv_try
+      break
+    }
+  }
+
+  if (is.null(A_inv)) {
+    A_inv <- tryCatch(qr.solve(A_hat), error = function(e) NULL)
+    if (!is.null(A_inv) && !all(is.finite(A_inv))) A_inv <- NULL
+  }
+
+  if (is.null(A_inv) && requireNamespace("MASS", quietly = TRUE)) {
+    A_inv <- MASS::ginv(A_hat)
+    if (!all(is.finite(A_inv))) A_inv <- NULL
+  }
+
+  V <- if (is.null(A_inv)) {
+    matrix(NA_real_, q, q)
+  } else {
+    A_inv %*% B_hat %*% t(A_inv) / n
+  }
+
+  list(var = V, A = A_hat, B = B_hat, n_eff = n)
 }
 
 ############################################################
@@ -716,7 +755,6 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma 
     cat_cols = prep$cat_cols,
     cont_cols= prep$cont_cols
   )
-
   denom_pred <- df_floor_pos(denom_pred)
 
   numer_pred <- sapply(
@@ -796,7 +834,6 @@ df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
   y1    <- as.numeric(dat1$y)
   d_p1  <- as.numeric(dat1$d_p)
   d_np1 <- as.numeric(dat1$d_np)
-
   pi_p1 <- df_clip_prob(as.numeric(dat1$pi_p))
 
   l1 <- as.matrix(cbind(1, X1, y1))
@@ -832,7 +869,6 @@ efficient_theta_contrib <- function(dat1, phi, h4_star_local) {
   y1    <- as.numeric(dat1$y)
   d_p1  <- as.numeric(dat1$d_p)
   d_np1 <- as.numeric(dat1$d_np)
-
   pi_p1 <- df_clip_prob(as.numeric(dat1$pi_p))
 
   l1 <- as.matrix(cbind(1, X1, y1))
@@ -929,7 +965,7 @@ df_sandwich_from_contrib <- function(contrib, level = 0.95) {
   z  <- stats::qnorm(1 - (1 - level) / 2)
   ci <- c(theta_hat - z * se_hat, theta_hat + z * se_hat)
 
-  list(theta = theta_hat, var = var_hat, se = se_hat, ci = ci)
+  list(theta = theta_hat, var = var_hat, se = se_hat, ci = ci, n_eff = n)
 }
 
 df_estimate_P <- function(dat) {
@@ -1145,6 +1181,15 @@ efficient_estimator_dml2 <- function(dat,
   rownames(phi_ci) <- c("lower", "upper")
   theta_ci <- c(theta_hat - z * th_se, theta_hat + z * th_se)
 
+  theta_var_method <- "joint_sandwich"
+  if (!is.finite(th_se) || !is.finite(th_var)) {
+    fb <- df_sandwich_from_contrib(contrib_theta)
+    th_var <- fb$var
+    th_se  <- fb$se
+    theta_ci <- fb$ci
+    theta_var_method <- "contrib_sandwich_fallback"
+  }
+
   list(
     phi    = phi_hat,
     phi_var= phi_var,
@@ -1161,7 +1206,9 @@ efficient_estimator_dml2 <- function(dat,
       phi_start   = phi_start,
       max_restart = max_restart,
       progress    = progress,
-      convergence = res$convergence
+      convergence = res$convergence,
+      theta_var_method = theta_var_method,
+      sandwich_n_eff = js$n_eff
     )
   )
 }
@@ -1191,6 +1238,9 @@ efficient_estimator_dml1 <- function(dat,
   theta_k     <- rep(NA_real_, K)
   var_k_list  <- vector("list", K)
   w_k         <- rep(NA_real_, K)
+
+  # store per-observation theta contributions for a stable fallback variance
+  contrib_all <- rep(NA_real_, n)
 
   big_penalty <- 1e100
 
@@ -1279,6 +1329,9 @@ efficient_estimator_dml1 <- function(dat,
     s_phi_k   <- df_score_phi_contrib(dat_test, phi_k, eta4_k)
     contrib_k <- efficient_theta_contrib(dat_test, phi_k, h4_k)
 
+    # store per-observation contributions for fallback
+    contrib_all[idx_test] <- contrib_k
+
     theta_k[k] <- mean(contrib_k, na.rm = TRUE)
     s_theta_k <- as.numeric(contrib_k - theta_k[k])
 
@@ -1301,6 +1354,9 @@ efficient_estimator_dml1 <- function(dat,
     if (progress && !used_fallback) {
       cat(sprintf("  fold %d/%d done.\n", k, K))
       flush.console()
+    } else if (progress && used_fallback) {
+      cat(sprintf("  fold %d/%d done.\n", k, K))
+      flush.console()
     }
   }
 
@@ -1320,16 +1376,31 @@ efficient_estimator_dml1 <- function(dat,
     ))
   }
 
+  # weighted average of fold estimates (weights by fold size)
   w_use <- w_k[valid]
   w_use <- w_use / sum(w_use)
 
   phi_hat   <- as.numeric(t(w_use) %*% phi_k_mat[valid, , drop = FALSE])
-  theta_hat <- as.numeric(sum(w_use * theta_k[valid]))
 
-  V_hat <- matrix(0, nrow = p_phi + 1, ncol = p_phi + 1)
-  for (j in seq_along(valid)) {
-    kk <- valid[j]
-    V_hat <- V_hat + (w_use[j]^2) * var_k_list[[kk]]
+  # theta_hat: use mean of per-observation contributions (more stable when some contrib are NA)
+  theta_hat <- mean(contrib_all, na.rm = TRUE)
+
+  # Combine variances of fold estimators: Var(sum w_k beta_k) ~ sum w_k^2 Var(beta_k)
+  # Use only folds with finite variance matrices
+  valid_var <- valid[sapply(valid, function(kk) {
+    Vkk <- var_k_list[[kk]]
+    !is.null(Vkk) && all(is.finite(Vkk))
+  })]
+
+  V_hat <- matrix(NA_real_, nrow = p_phi + 1, ncol = p_phi + 1)
+  if (length(valid_var) > 0) {
+    w_var <- w_k[valid_var]
+    w_var <- w_var / sum(w_var)
+    V_hat <- matrix(0, nrow = p_phi + 1, ncol = p_phi + 1)
+    for (j in seq_along(valid_var)) {
+      kk <- valid_var[j]
+      V_hat <- V_hat + (w_var[j]^2) * var_k_list[[kk]]
+    }
   }
 
   phi_var <- V_hat[1:p_phi, 1:p_phi, drop = FALSE]
@@ -1342,6 +1413,15 @@ efficient_estimator_dml1 <- function(dat,
   phi_ci <- rbind(phi_hat - z * phi_se, phi_hat + z * phi_se)
   rownames(phi_ci) <- c("lower", "upper")
   theta_ci <- c(theta_hat - z * th_se, theta_hat + z * th_se)
+
+  theta_var_method <- "fold_joint_sandwich"
+  if (!is.finite(th_se) || !is.finite(th_var)) {
+    fb <- df_sandwich_from_contrib(contrib_all)
+    th_var <- fb$var
+    th_se  <- fb$se
+    theta_ci <- fb$ci
+    theta_var_method <- "contrib_sandwich_fallback"
+  }
 
   list(
     phi    = phi_hat,
@@ -1358,7 +1438,9 @@ efficient_estimator_dml1 <- function(dat,
       K           = K,
       phi_start   = phi_start,
       max_restart = max_restart,
-      progress    = progress
+      progress    = progress,
+      theta_var_method = theta_var_method,
+      n_contrib_eff = sum(is.finite(contrib_all))
     )
   )
 }
