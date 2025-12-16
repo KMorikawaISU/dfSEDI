@@ -1,44 +1,28 @@
 ############################################################
 ## dualframe_core.R  (multi-dimensional X, DML1 & DML2, JOINT sandwich)
 ##
-## Core estimation functions for semiparametric efficient
-## dual-frame data integration with general matrix-valued X.
+## Mixed continuous/discrete covariates:
+##  - Nonparametric nuisances use delta x RBF (mixed-type KRR)
+##  - Small categorical cell warning / ask-to-continue (English)
 ##
-## Public user-facing functions:
-##   - Eff   : semiparametric efficient estimator (DML2 default, DML1 optional)
-##   - Eff_S : sub-efficient estimator (Remark 6, DML2-style)
-##   - Eff_P : parametric efficient estimator (working model)
+## Parametric part for phi:
+##  - If X is a data.frame with categorical columns, we use model.matrix(~ .)
+##    (drop intercept) so categorical vars enter as L-1 dummies
 ##
-## Basic estimators (for simulation / comparison):
-##   - df_estimate_P    : probability-only estimator
-##   - df_estimate_NP   : NP-only estimator (Chang & Kott type)
-##   - df_estimate_NP_P : NP ∪ P estimator (Chang & Kott type)
-##
-## Key updates in this version:
-##   - Mixed continuous/discrete covariates are handled automatically in
-##     kernel ridge regression (nuisance) via delta x RBF product kernels.
-##   - Small-cell warning / ask-to-continue prompt (English).
-##   - For data.frame X with categorical columns, we use model.matrix(~ .)
-##     (drop intercept) so categorical vars enter the parametric part via
-##     L-1 dummies (avoids imposing ordinal structure from 1,2,3 codes).
-##
-## External packages used via namespaces:
-##   - nleqslv::nleqslv
-##   - kernlab::gausspr, kernlab::rbfdot
-##   - stats::*, utils::*
+## IMPORTANT FIX (convergence):
+##  - sigma estimation for RBF is now DETERMINISTIC (no random subsampling)
+##    to avoid noisy estimating equations inside nleqslv/optim.
+##  - DML1: if nleqslv fails on a fold, fallback to optim minimizing ||eq||^2.
 ############################################################
 
 ############################################################
-## 0. Utilities: extract X, robust kernlab prediction,
-##               mixed-type KRR (delta x RBF), small-cell checks, numerics
+## 0. Utilities
 ############################################################
 
-# Internal session state to avoid repeated prompts
 .dfSEDI_state <- new.env(parent = emptyenv())
 .dfSEDI_state$allow_small_cells   <- FALSE
 .dfSEDI_state$seen_smallcell_keys <- character(0)
 
-# Ask a yes/no question (English). Uses utils::askYesNo when available.
 df_ask_yes_no <- function(question, default = FALSE) {
   if (requireNamespace("utils", quietly = TRUE) &&
       exists("askYesNo", envir = asNamespace("utils"), inherits = FALSE)) {
@@ -54,30 +38,16 @@ df_ask_yes_no <- function(question, default = FALSE) {
   ans %in% c("y", "yes")
 }
 
-# Extract covariate matrix X from dat
-# Priority:
-#   1) dat$X (matrix / AsIs-matrix / data.frame)
-#   2) dat$x (numeric vector -> 1D matrix)
-#
-# IMPORTANT:
-# - If dat$X is a data.frame and contains factor/character/logical columns,
-#   we build a *proper parametric design matrix* using stats::model.matrix(~ .),
-#   then DROP the intercept column (since the rest of the code uses cbind(1, X, y)).
-#   This yields L-1 dummy columns for a factor with L levels.
-# - We attach an attribute "dfSEDI_categorical_cols" indicating which columns
-#   (in the returned matrix) correspond to categorical original variables
-#   (best-effort).
+# Extract parametric design matrix X
 df_get_X <- function(dat) {
   if ("X" %in% names(dat)) {
     X <- dat$X
 
+    # If X is a data.frame: build proper parametric design matrix by model.matrix
     if (is.data.frame(X)) {
       X_df <- X
 
-      # Normalize columns:
-      # - character: numeric if possible, else factor
-      # - logical: factor
-      # - factor with numeric-looking levels: reorder levels numerically (stabilize baseline)
+      # normalize columns
       for (nm in names(X_df)) {
         col <- X_df[[nm]]
 
@@ -91,6 +61,7 @@ df_get_X <- function(dat) {
         } else if (is.logical(col)) {
           X_df[[nm]] <- factor(col)
         } else if (is.factor(col)) {
+          # reorder numeric-looking levels to stabilize baseline
           lev <- levels(col)
           lev_num <- suppressWarnings(as.numeric(lev))
           if (length(lev_num) == length(lev) && all(is.finite(lev_num))) {
@@ -100,10 +71,9 @@ df_get_X <- function(dat) {
         }
       }
 
-      mm <- stats::model.matrix(~ ., data = X_df)  # includes intercept by default
+      mm <- stats::model.matrix(~ ., data = X_df)  # includes intercept
       assign_vec <- attr(mm, "assign")
 
-      # drop intercept column (we add intercept elsewhere)
       if ("(Intercept)" %in% colnames(mm)) {
         keep <- colnames(mm) != "(Intercept)"
         mm <- mm[, keep, drop = FALSE]
@@ -113,10 +83,10 @@ df_get_X <- function(dat) {
       mm <- as.matrix(mm)
       storage.mode(mm) <- "numeric"
 
-      # Identify categorical variables (in the original data.frame)
-      # and mark the corresponding columns in the model matrix.
+      # mark categorical-derived columns in mm
       term_labels <- attr(stats::terms(~ ., data = X_df), "term.labels")
-      is_cat_term <- term_labels %in% names(X_df)[sapply(X_df, function(z) is.factor(z))]
+      fac_names <- names(X_df)[sapply(X_df, is.factor)]
+      is_cat_term <- term_labels %in% fac_names
       cat_term_idx <- which(is_cat_term)
       cat_cols_mm <- which(assign_vec %in% cat_term_idx)
 
@@ -124,14 +94,13 @@ df_get_X <- function(dat) {
       return(mm)
     }
 
+    # matrix path
     if (is.data.frame(X)) X <- as.matrix(X)
     if (!is.matrix(X)) stop("df_get_X(): `X` must be a matrix or convertible to matrix.")
 
     X_num <- apply(X, 2, function(col) suppressWarnings(as.numeric(col)))
     X_num <- as.matrix(X_num)
     storage.mode(X_num) <- "numeric"
-
-    # No explicit categorical tags for pure matrix input
     attr(X_num, "dfSEDI_categorical_cols") <- integer(0)
     return(X_num)
   }
@@ -142,10 +111,9 @@ df_get_X <- function(dat) {
     return(X_num)
   }
 
-  stop("df_get_X(): cannot extract X. Provide either a column `X` or a numeric column `x`.")
+  stop("df_get_X(): cannot extract X. Provide either `X` or `x`.")
 }
 
-# Robust prediction wrapper for kernlab::gausspr objects.
 df_kernlab_predict <- function(model, newdata) {
   newdata <- as.matrix(newdata)
 
@@ -175,10 +143,6 @@ df_kernlab_predict <- function(model, newdata) {
 ## Mixed-type KRR helpers
 ############################################################
 
-# Heuristic detection of categorical-like numeric columns.
-# Rule:
-#  - ALWAYS treat columns with <= always_categorical_levels unique values as categorical
-#  - else treat as categorical if (u <= max_levels) AND (u/n <= max_unique_frac)
 df_detect_categorical_cols_heuristic <- function(X,
                                                  max_levels = 20L,
                                                  max_unique_frac = 0.2,
@@ -189,7 +153,6 @@ df_detect_categorical_cols_heuristic <- function(X,
   if (p == 0L || n <= 1L) return(integer(0))
 
   out <- logical(p)
-
   for (j in seq_len(p)) {
     x <- X[, j]
     x <- x[is.finite(x)]
@@ -205,9 +168,6 @@ df_detect_categorical_cols_heuristic <- function(X,
   which(out)
 }
 
-# Infer categorical columns:
-#  1) columns tagged by df_get_X() (from factors in data.frame X)
-#  2) plus heuristic detection for numeric discrete columns
 df_infer_categorical_cols <- function(X,
                                       max_levels = 20L,
                                       max_unique_frac = 0.2,
@@ -227,7 +187,7 @@ df_infer_categorical_cols <- function(X,
   sort(unique(c(cat_attr, cat_heur)))
 }
 
-# Estimate RBF sigma using median pairwise distance with subsampling to avoid O(n^2).
+# IMPORTANT: deterministic subsampling (no random sampling)
 df_estimate_rbf_sigma <- function(X_cont, max_n = 2000L) {
   X_cont <- as.matrix(X_cont)
   n <- nrow(X_cont)
@@ -237,7 +197,8 @@ df_estimate_rbf_sigma <- function(X_cont, max_n = 2000L) {
   if (is.na(max_n) || max_n < 2L) max_n <- n
 
   if (n > max_n) {
-    idx <- sample.int(n, max_n)
+    # deterministic evenly-spaced subsample
+    idx <- unique(pmax(1L, pmin(n, as.integer(round(seq.int(1, n, length.out = max_n))))))
     X_use <- X_cont[idx, , drop = FALSE]
   } else {
     X_use <- X_cont
@@ -246,7 +207,6 @@ df_estimate_rbf_sigma <- function(X_cont, max_n = 2000L) {
   d <- stats::dist(X_use)
   dv <- as.numeric(d)
   dv <- dv[is.finite(dv) & dv > 0]
-
   if (length(dv) == 0L) return(1)
 
   med <- stats::median(dv)
@@ -255,24 +215,15 @@ df_estimate_rbf_sigma <- function(X_cont, max_n = 2000L) {
   1 / med
 }
 
-# Create a row-wise key for categorical columns (used to define "cells").
 df_make_cat_key <- function(X_cat) {
   X_cat <- as.matrix(X_cat)
   n <- nrow(X_cat)
   if (n == 0L) return(character(0))
   if (ncol(X_cat) == 0L) return(rep("ALL", n))
-
   dfc <- as.data.frame(X_cat, stringsAsFactors = FALSE)
   do.call(paste, c(dfc, sep = "\r"))
 }
 
-# Warn / ask / stop when categorical cell sizes are too small.
-#
-# Options:
-#   - dfSEDI.min_cell_size      (default 30)
-#   - dfSEDI.small_cell_action  "ask" / "warn" / "stop" / "none"
-#       default: "ask" if interactive(), else "warn"
-#   - dfSEDI.allow_small_cells  TRUE/FALSE (bypass)
 df_check_small_categorical_cells <- function(X_train,
                                              cat_cols,
                                              context = "mixed-type kernel regression") {
@@ -305,7 +256,6 @@ df_check_small_categorical_cells <- function(X_train,
   n_small <- sum(tab < min_cell)
   if (min_n >= min_cell) return(invisible(TRUE))
 
-  # Deduplicate messages (same context + same summary)
   id <- paste0(context, "|n=", nrow(X_train),
                "|cats=", paste(cat_cols, collapse = ","),
                "|thr=", min_cell,
@@ -339,14 +289,12 @@ df_check_small_categorical_cells <- function(X_train,
     warning(msg, call. = FALSE)
     return(invisible(TRUE))
   }
-
   if (action == "stop") {
     stop(msg, call. = FALSE)
   }
 
-  # action == "ask"
+  # ask
   warning(msg, call. = FALSE)
-
   if (!interactive()) {
     stop(
       paste0(
@@ -364,7 +312,6 @@ df_check_small_categorical_cells <- function(X_train,
   invisible(TRUE)
 }
 
-# Prepare mixed-KRR settings (categorical columns + sigma)
 df_krr_mixed_prepare <- function(X_train,
                                  sigma = NULL,
                                  cat_cols = NULL,
@@ -403,9 +350,6 @@ df_krr_mixed_prepare <- function(X_train,
   list(cat_cols = cat_cols, cont_cols = cont_cols, sigma = sigma_use)
 }
 
-# Mixed-type KRR prediction:
-# - categorical part: delta kernel (split by categorical key)
-# - continuous part: RBF kernel ridge (kernlab::gausspr)
 df_krr_mixed_predict <- function(X_train,
                                  y_train,
                                  X_test,
@@ -422,7 +366,6 @@ df_krr_mixed_predict <- function(X_train,
   if (nte == 0L) return(numeric(0))
   if (ntr == 0L) return(rep(NA_real_, nte))
 
-  # If no categorical columns, fall back to standard RBF KRR on all columns.
   if (length(cat_cols) == 0L) {
     if (length(y_train) < 2L) return(rep(mean(y_train), nte))
     if (is.null(sigma)) {
@@ -436,10 +379,8 @@ df_krr_mixed_predict <- function(X_train,
 
   key_train <- df_make_cat_key(X_train[, cat_cols, drop = FALSE])
   key_test  <- df_make_cat_key(X_test[,  cat_cols, drop = FALSE])
-
   uniq_keys <- unique(key_train)
 
-  # Fallback model for unseen keys:
   global_mean <- mean(y_train)
   global_model <- NULL
   if (length(cont_cols) > 0L && length(y_train) >= 2L) {
@@ -455,7 +396,6 @@ df_krr_mixed_predict <- function(X_train,
     )
   }
 
-  # Fit per-cell models
   models <- vector("list", length(uniq_keys))
   names(models) <- uniq_keys
   means  <- setNames(rep(NA_real_, length(uniq_keys)), uniq_keys)
@@ -475,7 +415,6 @@ df_krr_mixed_predict <- function(X_train,
         if (is.null(sig_k)) sig_k <- 1
       }
       ker_k <- kernlab::rbfdot(sigma = sig_k)
-
       models[[k]] <- tryCatch(
         kernlab::gausspr(x = X_g, y = y_g, kernel = ker_k),
         error = function(e) NULL
@@ -496,7 +435,6 @@ df_krr_mixed_predict <- function(X_train,
         pred[idx] <- df_kernlab_predict(models[[k]], X_t)
       }
     } else {
-      # unseen key
       if (!is.null(global_model) && length(cont_cols) > 0L) {
         X_t <- X_test[idx, cont_cols, drop = FALSE]
         pred[idx] <- df_kernlab_predict(global_model, X_t)
@@ -510,7 +448,7 @@ df_krr_mixed_predict <- function(X_train,
 }
 
 ############################################################
-## Numeric Jacobian + joint sandwich utilities
+## Numeric Jacobian + sandwich
 ############################################################
 
 df_numeric_jacobian <- function(fun, x0, eps = NULL) {
@@ -560,7 +498,7 @@ df_joint_sandwich <- function(score_mat, A_hat) {
 }
 
 ############################################################
-## 1. Basis functions for NP logistic model (multi-X)
+## 1. Basis functions
 ############################################################
 
 g2 <- function(dat) {
@@ -571,7 +509,7 @@ g3 <- g2
 g4 <- g2
 
 ############################################################
-## 2. Chang & Kott type estimating eq. for pi_NP(phi)
+## 2. Chang & Kott estimating eq.
 ############################################################
 
 pi_np.est_simple <- function(dat, h2, h3, h4, p.use = TRUE) {
@@ -604,7 +542,7 @@ pi_np.est_simple <- function(dat, h2, h3, h4, p.use = TRUE) {
 }
 
 ############################################################
-## 3. Efficient score helper functions
+## 3. Helper functions
 ############################################################
 
 h4_prob_denom_function <- function(pi_np, pi_p, phi) {
@@ -623,10 +561,9 @@ eta4_prob_numer_function <- function(pi_np, pi_p, phi, l) {
 }
 
 ############################################################
-## 4. Kernel regression (mixed-type): mu(X), pi_P(L), eta4*(X;phi), h4*(X;phi)
+## 4. Mixed-type KRR nuisance regressions
 ############################################################
 
-# mu(x) = E[Y|X=x] using (d_p==1 & d_np==0) data
 regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
   X_all <- df_get_X(dat)
   idx   <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
@@ -643,16 +580,15 @@ regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
   )
 
   df_krr_mixed_predict(
-    X_train = X_obs,
-    y_train = y_obs,
-    X_test  = as.matrix(new_X),
-    sigma   = prep$sigma,
-    cat_cols  = prep$cat_cols,
-    cont_cols = prep$cont_cols
+    X_train  = X_obs,
+    y_train  = y_obs,
+    X_test   = as.matrix(new_X),
+    sigma    = prep$sigma,
+    cat_cols = prep$cat_cols,
+    cont_cols= prep$cont_cols
   )
 }
 
-# Estimate pi_P(L) via regression of 1/pi_P on L=(X,y) using d_p==1 units
 pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   X_all <- df_get_X(dat)
   idx   <- which(as.numeric(dat$d_p) == 1 & is.finite(as.numeric(dat$pi_p)))
@@ -665,7 +601,6 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   if (length(pi_p_obs) < 1L) return(rep(NA_real_, nrow(new_L)))
   if (length(pi_p_obs) < 2L) return(rep(mean(pi_p_obs), nrow(new_L)))
 
-  # Treat only the X-part categorically; y is continuous.
   cat_cols_X <- df_infer_categorical_cols(X_obs)
   cat_cols_L <- cat_cols_X
 
@@ -677,18 +612,17 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   )
 
   reg_pred <- df_krr_mixed_predict(
-    X_train = L_obs,
-    y_train = 1 / pi_p_obs,
-    X_test  = as.matrix(new_L),
-    sigma   = prep$sigma,
-    cat_cols  = prep$cat_cols,
-    cont_cols = prep$cont_cols
+    X_train  = L_obs,
+    y_train  = 1 / pi_p_obs,
+    X_test   = as.matrix(new_L),
+    sigma    = prep$sigma,
+    cat_cols = prep$cat_cols,
+    cont_cols= prep$cont_cols
   )
 
   as.numeric(1 / reg_pred)
 }
 
-# eta4*(X;phi): E[eta4_numer(L;phi) | X] / E[h4_denom(L;phi) | X]
 estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma = NULL) {
   phi   <- as.numeric(phi)
   X_all <- df_get_X(dat)
@@ -727,30 +661,29 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma 
   )
 
   denom_pred <- df_krr_mixed_predict(
-    X_train = X_obs,
-    y_train = as.numeric(Denom_vals),
-    X_test  = as.matrix(new_X),
-    sigma   = prep$sigma,
-    cat_cols  = prep$cat_cols,
-    cont_cols = prep$cont_cols
+    X_train  = X_obs,
+    y_train  = as.numeric(Denom_vals),
+    X_test   = as.matrix(new_X),
+    sigma    = prep$sigma,
+    cat_cols = prep$cat_cols,
+    cont_cols= prep$cont_cols
   )
 
   numer_pred <- sapply(
     seq_len(p_dim),
     function(j) df_krr_mixed_predict(
-      X_train = X_obs,
-      y_train = as.numeric(Numer_mat[, j]),
-      X_test  = as.matrix(new_X),
-      sigma   = prep$sigma,
-      cat_cols  = prep$cat_cols,
-      cont_cols = prep$cont_cols
+      X_train  = X_obs,
+      y_train  = as.numeric(Numer_mat[, j]),
+      X_test   = as.matrix(new_X),
+      sigma    = prep$sigma,
+      cat_cols = prep$cat_cols,
+      cont_cols= prep$cont_cols
     )
   )
 
   sweep(numer_pred, 1, denom_pred, "/")
 }
 
-# h4*(X;phi): E[h4_numer(L;phi) | X] / E[h4_denom(L;phi) | X]
 estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigma = NULL) {
   phi   <- as.numeric(phi)
   X_all <- df_get_X(dat)
@@ -780,27 +713,27 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigm
   )
 
   denom_pred <- df_krr_mixed_predict(
-    X_train = X_obs,
-    y_train = as.numeric(Denom_vals),
-    X_test  = as.matrix(new_X),
-    sigma   = prep$sigma,
-    cat_cols  = prep$cat_cols,
-    cont_cols = prep$cont_cols
+    X_train  = X_obs,
+    y_train  = as.numeric(Denom_vals),
+    X_test   = as.matrix(new_X),
+    sigma    = prep$sigma,
+    cat_cols = prep$cat_cols,
+    cont_cols= prep$cont_cols
   )
   numer_pred <- df_krr_mixed_predict(
-    X_train = X_obs,
-    y_train = as.numeric(Numer_vals),
-    X_test  = as.matrix(new_X),
-    sigma   = prep$sigma,
-    cat_cols  = prep$cat_cols,
-    cont_cols = prep$cont_cols
+    X_train  = X_obs,
+    y_train  = as.numeric(Numer_vals),
+    X_test   = as.matrix(new_X),
+    sigma    = prep$sigma,
+    cat_cols = prep$cat_cols,
+    cont_cols= prep$cont_cols
   )
 
   as.numeric(numer_pred / denom_pred)
 }
 
 ############################################################
-## 5. Efficient scores: per-observation contributions for phi and theta
+## 5. Scores
 ############################################################
 
 df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
@@ -867,7 +800,7 @@ efficient_theta_contrib <- function(dat1, phi, h4_star_local) {
 }
 
 ############################################################
-## 6. DML helpers: folds and pi_P cross-fitting
+## 6. DML helpers
 ############################################################
 
 make_folds <- function(n, K) {
@@ -875,7 +808,6 @@ make_folds <- function(n, K) {
   split(seq_len(n), fold_id)
 }
 
-# Cross-fit imputation of pi_p for units with (d_np==1 & d_p==0) where pi_p may be NA.
 impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE) {
   dat_cf <- dat
 
@@ -918,7 +850,7 @@ impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE) {
 }
 
 ############################################################
-## 7. Basic estimators: P, NP, NP+P (for comparison)
+## 7. Basic estimators
 ############################################################
 
 df_sandwich_from_contrib <- function(contrib, level = 0.95) {
@@ -1014,7 +946,7 @@ df_estimate_NP_P <- function(dat, phi_start = NULL, max_iter = 20) {
 }
 
 ############################################################
-## 8. Efficient estimator Eff (DML2): JOINT (phi, theta) sandwich
+## 8. Efficient estimator Eff (DML2)
 ############################################################
 
 efficient_estimator_dml2 <- function(dat,
@@ -1025,18 +957,15 @@ efficient_estimator_dml2 <- function(dat,
   n <- nrow(dat)
   X <- df_get_X(dat)
   p_x <- ncol(X)
-  p_phi <- 1 + p_x + 1  # (1, X, y)
+  p_phi <- 1 + p_x + 1
 
   if (is.null(phi_start)) {
     phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
   }
 
   folds <- make_folds(n, K)
-
-  # Step 1: cross-fit pi_p
   dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress)
 
-  # Objective for phi: squared norm of aggregated mean score
   obj_phi <- function(phi) {
     phi <- as.numeric(phi)
     eq_agg <- rep(0, length(phi))
@@ -1058,6 +987,7 @@ efficient_estimator_dml2 <- function(dat,
       eq_agg <- eq_agg + w_k * eq_k
     }
 
+    if (any(!is.finite(eq_agg))) return(1e100)
     sum(eq_agg^2)
   }
 
@@ -1073,10 +1003,8 @@ efficient_estimator_dml2 <- function(dat,
     attempt <- attempt + 1
     init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
 
-    res_try <- try(
-      stats::optim(par = init, fn = obj_phi, method = "Nelder-Mead"),
-      silent = TRUE
-    )
+    res_try <- try(stats::optim(par = init, fn = obj_phi, method = "Nelder-Mead"),
+                   silent = TRUE)
     if (!inherits(res_try, "try-error")) {
       res <- res_try
       if (progress) {
@@ -1089,7 +1017,6 @@ efficient_estimator_dml2 <- function(dat,
 
   phi_hat <- as.numeric(res$par)
 
-  # Step 3: cross-fit nuisances at phi_hat, then compute theta_hat
   if (progress) {
     cat("Step 3/3: cross-fitting nuisances for joint scores ...\n")
     pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
@@ -1124,19 +1051,15 @@ efficient_estimator_dml2 <- function(dat,
   contrib_theta <- efficient_theta_contrib(dat_cf, phi_hat, h4_all)
   theta_hat     <- mean(contrib_theta)
 
-  # Build stacked scores s_i(beta_hat) with nuisance fixed at phi_hat
   s_phi   <- df_score_phi_contrib(dat_cf, phi_hat, eta4_all)
   s_theta <- as.numeric(contrib_theta - theta_hat)
   score_mat <- cbind(s_phi, s_theta)
 
-  # Build Jacobian A_hat (holding eta4_all and h4_all fixed)
   g_phi_mean <- function(phi) colMeans(df_score_phi_contrib(dat_cf, phi, eta4_all))
   A11 <- df_numeric_jacobian(g_phi_mean, phi_hat)
 
-  g_theta_mean <- function(phi) {
-    mean(efficient_theta_contrib(dat_cf, phi, h4_all) - theta_hat)
-  }
-  A21 <- df_numeric_jacobian(g_theta_mean, phi_hat)  # 1 x p_phi
+  g_theta_mean <- function(phi) mean(efficient_theta_contrib(dat_cf, phi, h4_all) - theta_hat)
+  A21 <- df_numeric_jacobian(g_theta_mean, phi_hat)
 
   A_hat <- rbind(
     cbind(A11, rep(0, p_phi)),
@@ -1179,7 +1102,7 @@ efficient_estimator_dml2 <- function(dat,
 }
 
 ############################################################
-## 9. Efficient estimator Eff (DML1): per-fold + JOINT sandwich combine
+## 9. Efficient estimator Eff (DML1) with fallback optim
 ############################################################
 
 efficient_estimator_dml1 <- function(dat,
@@ -1223,6 +1146,7 @@ efficient_estimator_dml1 <- function(dat,
       colMeans(df_score_phi_contrib(dat_test, phi, eta4_k))
     }
 
+    # 1) Try nleqslv
     attempt <- 0
     sol <- list(termcd = 99)
     while (attempt < max_restart && sol$termcd > 2) {
@@ -1232,21 +1156,57 @@ efficient_estimator_dml1 <- function(dat,
       if (!inherits(sol_try, "try-error")) sol <- sol_try
     }
 
-    if (sol$termcd > 2) {
-      if (progress) cat(sprintf("  fold %d/%d: phi did not converge.\n", k, K))
-      next
+    phi_k <- NULL
+    used_fallback <- FALSE
+
+    if (sol$termcd <= 2) {
+      phi_k <- as.numeric(sol$x)
+    } else {
+      # 2) Fallback: optim minimize ||eq||^2
+      used_fallback <- TRUE
+
+      obj_k <- function(phi) {
+        eq <- ee_fun_k(phi)
+        if (any(!is.finite(eq))) return(1e100)
+        sum(eq^2)
+      }
+
+      best <- list(value = Inf, par = phi_start, convergence = 1)
+      for (a in seq_len(max_restart)) {
+        init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
+        res_try <- try(stats::optim(par = init, fn = obj_k, method = "Nelder-Mead"),
+                       silent = TRUE)
+        if (!inherits(res_try, "try-error") && is.finite(res_try$value) && res_try$value < best$value) {
+          best <- res_try
+        }
+        if (is.finite(best$value) && best$value < 1e-8) break
+      }
+
+      if (!is.finite(best$value)) {
+        if (progress) cat(sprintf("  fold %d/%d: phi did not converge (nleqslv + optim failed).\n", k, K))
+        next
+      }
+
+      phi_k <- as.numeric(best$par)
+
+      if (progress) {
+        cat(sprintf("  fold %d/%d: nleqslv failed; used optim fallback (obj=%.3e).\n", k, K, best$value))
+        flush.console()
+      } else {
+        warning(sprintf("dfSEDI: fold %d/%d: nleqslv failed; used optim fallback for phi.", k, K),
+                call. = FALSE)
+      }
     }
 
-    phi_k <- as.numeric(sol$x)
     phi_k_mat[k, ] <- phi_k
 
+    # nuisances on test fold at phi_k
     X_test <- df_get_X(dat_test)
     eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_k, new_X = X_test)
     h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_k, new_X = X_test)
 
     s_phi_k   <- df_score_phi_contrib(dat_test, phi_k, eta4_k)
     contrib_k <- efficient_theta_contrib(dat_test, phi_k, h4_k)
-
     theta_k[k] <- mean(contrib_k)
     s_theta_k <- as.numeric(contrib_k - theta_k[k])
 
@@ -1255,9 +1215,7 @@ efficient_estimator_dml1 <- function(dat,
     g_phi_mean_k <- function(phi) colMeans(df_score_phi_contrib(dat_test, phi, eta4_k))
     A11_k <- df_numeric_jacobian(g_phi_mean_k, phi_k)
 
-    g_theta_mean_k <- function(phi) {
-      mean(efficient_theta_contrib(dat_test, phi, h4_k) - theta_k[k])
-    }
+    g_theta_mean_k <- function(phi) mean(efficient_theta_contrib(dat_test, phi, h4_k) - theta_k[k])
     A21_k <- df_numeric_jacobian(g_theta_mean_k, phi_k)
 
     A_k <- rbind(
@@ -1268,7 +1226,7 @@ efficient_estimator_dml1 <- function(dat,
     js_k <- df_joint_sandwich(score_k, A_k)
     var_k_list[[k]] <- js_k$var
 
-    if (progress) {
+    if (progress && !used_fallback) {
       cat(sprintf("  fold %d/%d done.\n", k, K))
       flush.console()
     }
@@ -1334,7 +1292,7 @@ efficient_estimator_dml1 <- function(dat,
 }
 
 ############################################################
-## 10. Sub-efficient estimator Eff_S (DML2-style): theta only
+## 10. Sub-efficient estimator Eff_S
 ############################################################
 
 subefficient_contrib <- function(dat, mu_hat) {
@@ -1355,18 +1313,13 @@ subefficient_estimator_dml2 <- function(dat, K = 2, progress = FALSE) {
   X_all <- df_get_X(dat)
   idx_mu <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
 
-  # crude sigma warm-start for mu (optional)
+  sigma_mu <- NULL
   if (length(idx_mu) >= 2L) {
-    # estimate sigma on continuous cols only
     cat_cols <- df_infer_categorical_cols(X_all)
     cont_cols <- setdiff(seq_len(ncol(X_all)), cat_cols)
     if (length(cont_cols) > 0L) {
       sigma_mu <- df_estimate_rbf_sigma(X_all[idx_mu, cont_cols, drop = FALSE], max_n = 2000L)
-    } else {
-      sigma_mu <- NULL
     }
-  } else {
-    sigma_mu <- NULL
   }
 
   if (progress) {
@@ -1406,7 +1359,7 @@ subefficient_estimator_dml2 <- function(dat, K = 2, progress = FALSE) {
 }
 
 ############################################################
-## 11. Parametric efficient estimator Eff_P (working model)
+## 11. Parametric efficient estimator Eff_P
 ############################################################
 
 efficient_parametric_estimator <- function(dat,
@@ -1499,7 +1452,7 @@ efficient_parametric_estimator <- function(dat,
 }
 
 ############################################################
-## 12. Public wrappers: Eff, Eff_S, Eff_P
+## 12. Public wrappers
 ############################################################
 
 Eff <- function(dat,
