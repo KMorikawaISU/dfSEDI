@@ -14,190 +14,50 @@
 ##   - df_estimate_NP   : NP-only estimator (Chang & Kott type)
 ##   - df_estimate_NP_P : NP ∪ P estimator (Chang & Kott type)
 ##
-## Key update in this version:
-##   - (phi, theta) are handled JOINTLY in the sandwich variance
-##     for BOTH DML1 and DML2 (phi_var/phi_se/phi_ci are returned).
-##   - Optional split of covariates into continuous (x_cont) and
-##     discrete (x_disc) parts for nonparametric estimation.
-##     When x_disc is present, Li & Racine–type mixed kernels are
-##     used via the `np` package; otherwise Gaussian kernels via
-##     `kernlab` are used (continuous-only case).
+## This version assumes:
+##   - X is treated as continuous (kernlab RBF kernel) in all NP regressions.
+##   - Mixed continuous/discrete covariates (Li & Racine) are NOT used here.
 ##
 ## Assumptions on dat:
-##   - Either:
-##       * dat$X is a numeric matrix (n x p) of covariates, or
-##       * dat$x is a numeric vector (1D X), or
-##       * dat$x_cont / dat$x_disc are provided:
-##           - x_cont: continuous covariates (vector/matrix/data.frame)
-##           - x_disc: discrete covariates (vector/matrix/data.frame)
-##     In all cases, df_get_X(dat) returns a numeric matrix used
-##     in the parametric logistic model.
-##   - For nonparametric nuisance estimation, if dat$x_disc is
-##     present, mixed continuous/discrete regression is performed
-##     using Li & Racine's approach (np::npreg); otherwise only
-##     Gaussian kernels are used (kernlab::gausspr).
-##   - dat$y, dat$d_np, dat$d_p, dat$pi_p exist and are numeric.
-##   - dat$pi_p may contain NA for NP-only units; it will be
-##     imputed via nonparametric regression.
+##   - either:
+##       * dat$X is a numeric matrix (n x p) of covariates
+##     or
+##       * dat$x is a numeric vector and we treat it as 1D X
+##   - dat$y, dat$d_np, dat$d_p, dat$pi_p exist and are numeric
+##   - dat$pi_p may contain NA for NP-only units; it will be imputed via kernel regression
 ##
 ## External packages used via namespaces:
 ##   - nleqslv::nleqslv
 ##   - kernlab::gausspr, kernlab::rbfdot
-##   - np::npregbw, np::npreg  (only when x_disc is provided)
 ##   - stats::*, utils::*
 ############################################################
 
 ############################################################
-## 0. Utilities: extract X, nonparam design, kernlab prediction, numerics
+## 0. Utilities: extract X, robust kernlab prediction, numerics
 ############################################################
 
-# TRUE if dat provides a split x_cont/x_disc
-df_has_split_x <- function(dat) {
-  ("x_cont" %in% names(dat)) || ("x_disc" %in% names(dat))
-}
-
-# TRUE if dat includes a discrete part for nonparametric regression
-df_has_disc_x <- function(dat) {
-  "x_disc" %in% names(dat)
-}
-
-# Extract covariate matrix X from dat for parametric components.
+# Extract covariate matrix X from dat
 # Priority:
 #   1) dat$X (matrix / AsIs-matrix / data.frame)
 #   2) dat$x (numeric vector -> 1D matrix)
-#   3) (x_cont, x_disc) combined into a numeric matrix
 df_get_X <- function(dat) {
   if ("X" %in% names(dat)) {
     X <- dat$X
     if (is.data.frame(X)) X <- as.matrix(X)
     if (!is.matrix(X)) stop("df_get_X(): `X` must be a matrix or convertible to matrix.")
-    X <- apply(X, 2, as.numeric)
+    X <- apply(X, 2, as.numeric)  # enforce numeric
     return(X)
   }
-
   if ("x" %in% names(dat)) {
     return(matrix(as.numeric(dat$x), ncol = 1))
   }
-
-  if (df_has_split_x(dat)) {
-    mats <- list()
-
-    if ("x_cont" %in% names(dat)) {
-      Xc <- dat$x_cont
-      if (is.vector(Xc)) {
-        Xc <- matrix(Xc, ncol = 1)
-      } else if (is.data.frame(Xc)) {
-        Xc <- as.matrix(Xc)
-      } else if (!is.matrix(Xc)) {
-        stop("df_get_X(): `x_cont` must be a vector, matrix, or data.frame.")
-      }
-      Xc <- apply(Xc, 2, as.numeric)
-      mats[[length(mats) + 1L]] <- Xc
-    }
-
-    if ("x_disc" %in% names(dat)) {
-      Xd <- dat$x_disc
-      if (is.vector(Xd)) {
-        Xd <- matrix(Xd, ncol = 1)
-      } else if (is.data.frame(Xd)) {
-        Xd <- as.matrix(Xd)
-      } else if (!is.matrix(Xd)) {
-        stop("df_get_X(): `x_disc` must be a vector, matrix, or data.frame.")
-      }
-      # Encode discrete variables numerically (e.g., factor levels)
-      Xd_num <- apply(Xd, 2, function(col) {
-        if (is.factor(col) || is.character(col)) {
-          as.numeric(as.factor(col))
-        } else {
-          as.numeric(col)
-        }
-      })
-      mats[[length(mats) + 1L]] <- Xd_num
-    }
-
-    if (length(mats) == 0L) {
-      stop("df_get_X(): could not construct X from x_cont/x_disc.")
-    }
-
-    X <- do.call(cbind, mats)
-    return(X)
-  }
-
-  stop("df_get_X(): cannot extract X. Provide either `X`, `x`, or (`x_cont`, `x_disc`).")
-}
-
-# Build a data.frame of covariates for nonparametric regression.
-# If x_disc is present, discrete variables are converted to factors
-# and Li & Racine mixed-type regression can be used via `np`.
-# If no x_cont/x_disc are present, this falls back to df_get_X(dat).
-df_get_np_design <- function(dat, include_y = FALSE) {
-  has_split <- df_has_split_x(dat)
-
-  if (!has_split) {
-    X <- df_get_X(dat)
-    df <- as.data.frame(X)
-    if (is.null(colnames(df))) {
-      colnames(df) <- paste0("x", seq_len(ncol(df)))
-    }
-    if (include_y) {
-      df$y <- as.numeric(dat$y)
-    }
-    return(df)
-  }
-
-  df <- data.frame()
-
-  if ("x_cont" %in% names(dat)) {
-    Xc <- dat$x_cont
-    if (is.vector(Xc)) {
-      Xc <- matrix(Xc, ncol = 1)
-    } else if (is.data.frame(Xc)) {
-      Xc <- as.matrix(Xc)
-    } else if (!is.matrix(Xc)) {
-      stop("df_get_np_design(): `x_cont` must be a vector, matrix, or data.frame.")
-    }
-    Xc_df <- as.data.frame(Xc)
-    if (is.null(colnames(Xc_df))) {
-      colnames(Xc_df) <- paste0("xc", seq_len(ncol(Xc_df)))
-    }
-    df <- cbind(df, Xc_df)
-  }
-
-  if ("x_disc" %in% names(dat)) {
-    Xd <- dat$x_disc
-    if (is.vector(Xd)) {
-      Xd_df <- data.frame(xd1 = Xd)
-    } else if (is.matrix(Xd)) {
-      Xd_df <- as.data.frame(Xd)
-    } else if (is.data.frame(Xd)) {
-      Xd_df <- Xd
-    } else {
-      stop("df_get_np_design(): `x_disc` must be a vector, matrix, or data.frame.")
-    }
-    if (is.null(colnames(Xd_df))) {
-      colnames(Xd_df) <- paste0("xd", seq_len(ncol(Xd_df)))
-    }
-    for (j in seq_len(ncol(Xd_df))) {
-      if (!is.factor(Xd_df[[j]]) && !is.ordered(Xd_df[[j]])) {
-        Xd_df[[j]] <- as.factor(Xd_df[[j]])
-      }
-    }
-    df <- cbind(df, Xd_df)
-  }
-
-  if (include_y) {
-    df$y <- as.numeric(dat$y)
-  }
-
-  df
+  stop("df_get_X(): cannot extract X. Provide either a matrix column `X` or a numeric column `x`.")
 }
 
 # Robust prediction wrapper for kernlab::gausspr objects.
-# This avoids common failures where stats::predict() cannot dispatch on gausspr objects.
 df_kernlab_predict <- function(model, newdata) {
   newdata <- as.matrix(newdata)
 
-  # Try kernlab's predict (S4) first via namespace lookup
   pred <- tryCatch({
     if (requireNamespace("kernlab", quietly = TRUE) &&
         exists("predict", envir = asNamespace("kernlab"), inherits = FALSE)) {
@@ -206,7 +66,6 @@ df_kernlab_predict <- function(model, newdata) {
       stats::predict(model, newdata)
     }
   }, error = function(e1) {
-    # Fallback: base/stats predict
     tryCatch({
       stats::predict(model, newdata)
     }, error = function(e2) {
@@ -231,7 +90,6 @@ df_numeric_jacobian <- function(fun, x0, eps = NULL) {
   m  <- length(f0)
 
   if (is.null(eps)) {
-    # Scale-aware step size
     eps <- sqrt(.Machine$double.eps) * pmax(1, abs(x0))
   } else {
     eps <- rep_len(eps, p)
@@ -315,8 +173,8 @@ pi_np.est_simple <- function(dat, h2, h3, h4, p.use = TRUE) {
                        nrow = nrow(dat), ncol = 1)
     }
 
-    H4     <- as.matrix(h4(dat))   # n x dim(phi)
-    est_eq <- t(H4) %*% d_set4     # dim(phi) x 1
+    H4     <- as.matrix(h4(dat))
+    est_eq <- t(H4) %*% d_set4
     as.numeric(est_eq)
   }
 }
@@ -341,131 +199,82 @@ eta4_prob_numer_function <- function(pi_np, pi_p, phi, l) {
 }
 
 ############################################################
-## 4. Kernel regression: E(Y|X), pi_P, eta4*, h4* (multi-X)
-##    - continuous-only: kernlab::gausspr (Gaussian kernel)
-##    - mixed X (x_disc present): np::npreg (Li & Racine)
+## 4. Kernel regression: E(Y|X), pi_P, eta4*, h4*  (continuous X via kernlab)
 ############################################################
 
 # mu(x) = E[Y|X=x] using (d_p==1 & d_np==0) data
-regression_expectation_kernlab <- function(dat_train, dat_new, sigma = NULL) {
-  use_np <- df_has_disc_x(dat_train)
+regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
+  X_all <- df_get_X(dat)
+  idx   <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
+  X_obs <- X_all[idx, , drop = FALSE]
+  y_obs <- as.numeric(dat$y[idx])
 
-  d_p  <- as.numeric(dat_train$d_p)
-  d_np <- as.numeric(dat_train$d_np)
-  idx  <- which(d_p == 1 & d_np == 0)
-
-  if (length(idx) < 2L) {
-    y_obs <- as.numeric(dat_train$y[idx])
-    mu_const <- if (length(y_obs) > 0L) mean(y_obs) else mean(as.numeric(dat_train$y))
-    return(rep(mu_const, nrow(dat_new)))
+  if (length(y_obs) < 2L) {
+    return(rep(mean(y_obs), nrow(new_X)))
   }
 
-  if (!use_np) {
-    X_all <- df_get_X(dat_train)
-    X_obs <- X_all[idx, , drop = FALSE]
-    y_obs <- as.numeric(dat_train$y[idx])
-
-    X_new <- df_get_X(dat_new)
-
-    if (is.null(sigma)) {
-      dist_matrix <- as.matrix(stats::dist(X_obs))
-      sigma <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
-    }
-
-    rbf_kernel <- kernlab::rbfdot(sigma = sigma)
-    reg_model  <- kernlab::gausspr(
-      x      = as.matrix(X_obs),
-      y      = y_obs,
-      kernel = rbf_kernel
-    )
-
-    return(df_kernlab_predict(reg_model, as.matrix(X_new)))
+  if (is.null(sigma)) {
+    dist_matrix <- as.matrix(stats::dist(X_obs))
+    sigma <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
   }
 
-  # Li & Racine mixed-type regression using `np`
-  if (!requireNamespace("np", quietly = TRUE)) {
-    stop("dfSEDI: `x_disc` detected but package 'np' is not available. Please install it via install.packages('np').")
+  if (!requireNamespace("kernlab", quietly = TRUE)) {
+    stop("regression_expectation_kernlab(): package 'kernlab' is required.")
   }
 
-  dat_obs <- dat_train[idx, , drop = FALSE]
-  x_train <- df_get_np_design(dat_obs, include_y = FALSE)
-  x_new   <- df_get_np_design(dat_new, include_y = FALSE)
-  y_obs   <- as.numeric(dat_obs$y)
+  rbf_kernel <- kernlab::rbfdot(sigma = sigma)
+  reg_model  <- kernlab::gausspr(
+    x      = as.matrix(X_obs),
+    y      = y_obs,
+    kernel = rbf_kernel
+  )
 
-  bw  <- np::npregbw(ydat = y_obs, xdat = x_train)
-  mod <- np::npreg(bws = bw)
-  as.numeric(stats::predict(mod, newdata = x_new))
+  df_kernlab_predict(reg_model, as.matrix(new_X))
 }
 
-# Estimate pi_P(L) via regression of 1/pi_P on L=(X,y)
-pi_p_estimation_kernlab <- function(dat_train, dat_new, sigma = NULL) {
-  use_np <- df_has_disc_x(dat_train)
+# Estimate pi_P(L) via regression of 1/pi_P on L=(X,y) using d_p==1 units
+pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
+  X_all <- df_get_X(dat)
+  idx   <- which(as.numeric(dat$d_p) == 1 & is.finite(as.numeric(dat$pi_p)))
 
-  d_p_all  <- as.numeric(dat_train$d_p)
-  pi_p_all <- as.numeric(dat_train$pi_p)
-  idx <- which(d_p_all == 1 & is.finite(pi_p_all))
+  X_obs    <- X_all[idx, , drop = FALSE]
+  y_obs    <- as.numeric(dat$y[idx])
+  L_obs    <- cbind(X_obs, y_obs)
+  pi_p_obs <- as.numeric(dat$pi_p[idx])
 
-  if (length(idx) < 2L) {
-    pi_p_obs <- pi_p_all[idx]
-    pi_const <- if (length(pi_p_obs) > 0L) mean(pi_p_obs) else mean(pi_p_all, na.rm = TRUE)
-    return(rep(pi_const, nrow(dat_new)))
+  if (length(pi_p_obs) < 2L) {
+    return(rep(mean(pi_p_obs), nrow(new_L)))
   }
 
-  if (!use_np) {
-    X_all <- df_get_X(dat_train)
-    X_obs <- X_all[idx, , drop = FALSE]
-    y_obs <- as.numeric(dat_train$y[idx])
-    L_obs <- cbind(X_obs, y_obs)
-    pi_p_obs <- pi_p_all[idx]
-
-    X_new <- df_get_X(dat_new)
-    y_new <- as.numeric(dat_new$y)
-    L_new <- cbind(X_new, y_new)
-
-    if (is.null(sigma)) {
-      dist_matrix <- as.matrix(stats::dist(L_obs))
-      sigma <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
-    }
-
-    rbf_kernel <- kernlab::rbfdot(sigma = sigma)
-    reg_model  <- kernlab::gausspr(
-      x      = as.matrix(L_obs),
-      y      = 1 / pi_p_obs,
-      kernel = rbf_kernel
-    )
-
-    reg_pred <- df_kernlab_predict(reg_model, as.matrix(L_new))
-    return(as.numeric(1 / reg_pred))
+  if (is.null(sigma)) {
+    dist_matrix <- as.matrix(stats::dist(L_obs))
+    sigma <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
   }
 
-  # Li & Racine path
-  if (!requireNamespace("np", quietly = TRUE)) {
-    stop("dfSEDI: `x_disc` detected but package 'np' is not available. Please install it via install.packages('np').")
+  if (!requireNamespace("kernlab", quietly = TRUE)) {
+    stop("pi_p_estimation_kernlab(): package 'kernlab' is required.")
   }
 
-  dat_obs <- dat_train[idx, , drop = FALSE]
-  x_train <- df_get_np_design(dat_obs, include_y = TRUE)  # include y as covariate
-  x_new   <- df_get_np_design(dat_new,  include_y = TRUE)
-  pi_p_obs <- as.numeric(dat_obs$pi_p)
+  rbf_kernel <- kernlab::rbfdot(sigma = sigma)
+  reg_model  <- kernlab::gausspr(
+    x      = as.matrix(L_obs),
+    y      = 1 / pi_p_obs,
+    kernel = rbf_kernel
+  )
 
-  bw  <- np::npregbw(ydat = 1 / pi_p_obs, xdat = x_train)
-  mod <- np::npreg(bws = bw)
-  pred_inv <- stats::predict(mod, newdata = x_new)
-
-  as.numeric(1 / pred_inv)
+  reg_pred <- df_kernlab_predict(reg_model, as.matrix(new_L))
+  as.numeric(1 / reg_pred)
 }
 
 # eta4*(X;phi): E[eta4_numer(L;phi) | X] / E[h4_denom(L;phi) | X]
-estimate_conditional_expectation_kernlab_phi <- function(dat_train, phi, dat_new, sigma = NULL) {
-  phi <- as.numeric(phi)
-  use_np <- df_has_disc_x(dat_train)
-
-  X_all <- df_get_X(dat_train)
-  idx   <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma = NULL) {
+  phi   <- as.numeric(phi)
+  X_all <- df_get_X(dat)
+  idx   <- which(as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1)
 
   X_obs    <- X_all[idx, , drop = FALSE]
-  y_obs    <- as.numeric(dat_train$y[idx])
-  pi_p_obs <- as.numeric(dat_train$pi_p[idx])
+  y_obs    <- as.numeric(dat$y[idx])
+  pi_p_obs <- as.numeric(dat$pi_p[idx])
 
   l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
   eta    <- as.numeric(l_obs %*% phi)
@@ -482,71 +291,46 @@ estimate_conditional_expectation_kernlab_phi <- function(dat_train, phi, dat_new
     )
   }
 
-  if (!use_np) {
-    X_new <- df_get_X(dat_new)
+  if (is.null(sigma)) {
+    dist_matrix <- as.matrix(stats::dist(X_obs))
+    sigma <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
+  }
 
-    if (is.null(sigma)) {
-      dist_matrix <- as.matrix(stats::dist(X_obs))
-      sigma <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
-    }
-    rbf_kernel <- kernlab::rbfdot(sigma = sigma)
+  if (!requireNamespace("kernlab", quietly = TRUE)) {
+    stop("estimate_conditional_expectation_kernlab_phi(): package 'kernlab' is required.")
+  }
 
-    denom_model <- kernlab::gausspr(
+  rbf_kernel <- kernlab::rbfdot(sigma = sigma)
+
+  denom_model <- kernlab::gausspr(
+    x      = as.matrix(X_obs),
+    y      = as.numeric(Denom_vals),
+    kernel = rbf_kernel
+  )
+  numer_models <- lapply(
+    seq_len(p_dim),
+    function(j) kernlab::gausspr(
       x      = as.matrix(X_obs),
-      y      = as.numeric(Denom_vals),
+      y      = as.numeric(Numer_mat[, j]),
       kernel = rbf_kernel
     )
-    numer_models <- lapply(
-      seq_len(p_dim),
-      function(j) kernlab::gausspr(
-        x      = as.matrix(X_obs),
-        y      = as.numeric(Numer_mat[, j]),
-        kernel = rbf_kernel
-      )
-    )
+  )
 
-    denom_pred <- df_kernlab_predict(denom_model, as.matrix(X_new))
-    numer_pred <- sapply(numer_models, function(m) df_kernlab_predict(m, as.matrix(X_new)))
-
-    return(sweep(numer_pred, 1, denom_pred, "/"))
-  }
-
-  # Li & Racine path
-  if (!requireNamespace("np", quietly = TRUE)) {
-    stop("dfSEDI: `x_disc` detected but package 'np' is not available. Please install it via install.packages('np').")
-  }
-
-  dat_obs <- dat_train[idx, , drop = FALSE]
-  x_train <- df_get_np_design(dat_obs, include_y = FALSE)
-  x_new   <- df_get_np_design(dat_new,  include_y = FALSE)
-
-  # Denominator
-  bw_den  <- np::npregbw(ydat = as.numeric(Denom_vals), xdat = x_train)
-  mod_den <- np::npreg(bws = bw_den)
-  denom_pred <- as.numeric(stats::predict(mod_den, newdata = x_new))
-
-  # Numerator (vector-valued) – fit one npreg per component
-  numer_pred <- matrix(NA_real_, nrow = nrow(x_new), ncol = p_dim)
-  for (j in seq_len(p_dim)) {
-    bw_num  <- np::npregbw(ydat = as.numeric(Numer_mat[, j]), xdat = x_train)
-    mod_num <- np::npreg(bws = bw_num)
-    numer_pred[, j] <- as.numeric(stats::predict(mod_num, newdata = x_new))
-  }
+  denom_pred <- df_kernlab_predict(denom_model, as.matrix(new_X))
+  numer_pred <- sapply(numer_models, function(m) df_kernlab_predict(m, as.matrix(new_X)))
 
   sweep(numer_pred, 1, denom_pred, "/")
 }
 
 # h4*(X;phi): E[h4_numer(L;phi) | X] / E[h4_denom(L;phi) | X]
-estimate_conditional_expectation_kernlab_theta <- function(dat_train, phi, dat_new, sigma = NULL) {
-  phi <- as.numeric(phi)
-  use_np <- df_has_disc_x(dat_train)
-
-  X_all <- df_get_X(dat_train)
-  idx   <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigma = NULL) {
+  phi   <- as.numeric(phi)
+  X_all <- df_get_X(dat)
+  idx   <- which(as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1)
 
   X_obs    <- X_all[idx, , drop = FALSE]
-  y_obs    <- as.numeric(dat_train$y[idx])
-  pi_p_obs <- as.numeric(dat_train$pi_p[idx])
+  y_obs    <- as.numeric(dat$y[idx])
+  pi_p_obs <- as.numeric(dat$pi_p[idx])
 
   l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
   eta    <- as.numeric(l_obs %*% phi)
@@ -555,48 +339,30 @@ estimate_conditional_expectation_kernlab_theta <- function(dat_train, phi, dat_n
   Denom_vals <- h4_prob_denom_function(pi_np, pi_p_obs, phi)
   Numer_vals <- h4_prob_numer_function(pi_np, pi_p_obs, phi, y_obs)
 
-  if (!use_np) {
-    X_new <- df_get_X(dat_new)
-
-    if (is.null(sigma)) {
-      dist_matrix <- as.matrix(stats::dist(X_obs))
-      sigma <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
-    }
-    rbf_kernel <- kernlab::rbfdot(sigma = sigma)
-
-    denom_model <- kernlab::gausspr(
-      x      = as.matrix(X_obs),
-      y      = as.numeric(Denom_vals),
-      kernel = rbf_kernel
-    )
-    numer_model <- kernlab::gausspr(
-      x      = as.matrix(X_obs),
-      y      = as.numeric(Numer_vals),
-      kernel = rbf_kernel
-    )
-
-    denom_pred <- df_kernlab_predict(denom_model, as.matrix(X_new))
-    numer_pred <- df_kernlab_predict(numer_model, as.matrix(X_new))
-
-    return(as.numeric(numer_pred / denom_pred))
+  if (is.null(sigma)) {
+    dist_matrix <- as.matrix(stats::dist(X_obs))
+    sigma <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
   }
 
-  # Li & Racine path
-  if (!requireNamespace("np", quietly = TRUE)) {
-    stop("dfSEDI: `x_disc` detected but package 'np' is not available. Please install it via install.packages('np').")
+  if (!requireNamespace("kernlab", quietly = TRUE)) {
+    stop("estimate_conditional_expectation_kernlab_theta(): package 'kernlab' is required.")
   }
 
-  dat_obs <- dat_train[idx, , drop = FALSE]
-  x_train <- df_get_np_design(dat_obs, include_y = FALSE)
-  x_new   <- df_get_np_design(dat_new,  include_y = FALSE)
+  rbf_kernel <- kernlab::rbfdot(sigma = sigma)
 
-  bw_den  <- np::npregbw(ydat = as.numeric(Denom_vals), xdat = x_train)
-  mod_den <- np::npreg(bws = bw_den)
-  denom_pred <- as.numeric(stats::predict(mod_den, newdata = x_new))
+  denom_model <- kernlab::gausspr(
+    x      = as.matrix(X_obs),
+    y      = as.numeric(Denom_vals),
+    kernel = rbf_kernel
+  )
+  numer_model <- kernlab::gausspr(
+    x      = as.matrix(X_obs),
+    y      = as.numeric(Numer_vals),
+    kernel = rbf_kernel
+  )
 
-  bw_num  <- np::npregbw(ydat = as.numeric(Numer_vals), xdat = x_train)
-  mod_num <- np::npreg(bws = bw_num)
-  numer_pred <- as.numeric(stats::predict(mod_num, newdata = x_new))
+  denom_pred <- df_kernlab_predict(denom_model, as.matrix(new_X))
+  numer_pred <- df_kernlab_predict(numer_model, as.matrix(new_X))
 
   as.numeric(numer_pred / denom_pred)
 }
@@ -605,8 +371,6 @@ estimate_conditional_expectation_kernlab_theta <- function(dat_train, phi, dat_n
 ## 5. Efficient scores: per-observation contributions for phi and theta
 ############################################################
 
-# Per-observation score contributions for phi (n x p_phi)
-# This is the "est_eq" matrix inside estimating_equation_optimal_phi().
 df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
   phi <- as.numeric(phi)
 
@@ -640,7 +404,6 @@ df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
   term1 + term2_coef * eta4_star_local
 }
 
-# Per-observation contribution for theta (n-vector), given phi and h4_star
 efficient_theta_contrib <- function(dat1, phi, h4_star_local) {
   phi <- as.numeric(phi)
 
@@ -672,7 +435,7 @@ efficient_theta_contrib <- function(dat1, phi, h4_star_local) {
 }
 
 ############################################################
-## 6. DML helpers: folds and pi_P cross-fitting (used for both DML1/DML2)
+## 6. DML helpers: folds and pi_P cross-fitting
 ############################################################
 
 make_folds <- function(n, K) {
@@ -681,7 +444,6 @@ make_folds <- function(n, K) {
 }
 
 # Cross-fit imputation of pi_p for units with (d_np==1 & d_p==0) where pi_p may be NA.
-# Note: We impute only for the fold's held-out units (standard cross-fitting).
 impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE) {
   dat_cf <- dat
 
@@ -692,19 +454,22 @@ impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE) {
 
   for (k in seq_along(folds)) {
     idx_k     <- folds[[k]]
-    dat_fold  <- dat_cf[idx_k, , drop = FALSE]
-    dat_train <- dat_cf[-idx_k, , drop = FALSE]
+    dat_fold  <- dat_cf[idx_k, ]
+    dat_train <- dat_cf[-idx_k, ]
 
+    X_f   <- df_get_X(dat_fold)
+    y_f   <- as.numeric(dat_fold$y)
     d_p_f  <- as.numeric(dat_fold$d_p)
     d_np_f <- as.numeric(dat_fold$d_np)
 
+    L_f  <- as.matrix(cbind(X_f, y_f))
+
     pi_p_mis <- which(d_np_f == 1 & d_p_f == 0 & !is.finite(as.numeric(dat_fold$pi_p)))
-    if (length(pi_p_mis) > 0L) {
-      dat_new <- dat_fold[pi_p_mis, , drop = FALSE]
+    if (length(pi_p_mis) > 0) {
       tilde_pi <- pi_p_estimation_kernlab(
         dat_train,
-        dat_new = dat_new,
-        sigma   = sigma
+        new_L = L_f[pi_p_mis, , drop = FALSE],
+        sigma = sigma
       )
       dat_cf$pi_p[idx_k[pi_p_mis]] <- tilde_pi
     }
@@ -848,10 +613,11 @@ efficient_estimator_dml2 <- function(dat,
       idx_test  <- folds[[k]]
       idx_train <- setdiff(seq_len(n), idx_test)
 
-      dat_test  <- dat_cf[idx_test,  , drop = FALSE]
-      dat_train <- dat_cf[idx_train, , drop = FALSE]
+      dat_test  <- dat_cf[idx_test,  ]
+      dat_train <- dat_cf[idx_train, ]
 
-      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi, dat_test)
+      X_test <- df_get_X(dat_test)
+      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi, new_X = X_test)
 
       sphi_k <- df_score_phi_contrib(dat_test, phi, eta4_k)
       eq_k   <- colMeans(sphi_k)
@@ -904,11 +670,13 @@ efficient_estimator_dml2 <- function(dat,
     idx_test  <- folds[[k]]
     idx_train <- setdiff(seq_len(n), idx_test)
 
-    dat_test  <- dat_cf[idx_test,  , drop = FALSE]
-    dat_train <- dat_cf[idx_train, , drop = FALSE]
+    dat_test  <- dat_cf[idx_test,  ]
+    dat_train <- dat_cf[idx_train, ]
 
-    eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_hat, dat_test)
-    h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_hat, dat_test)
+    X_test <- df_get_X(dat_test)
+
+    eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_hat, new_X = X_test)
+    h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_hat, new_X = X_test)
 
     eta4_all[idx_test, ] <- eta4_k
     h4_all[idx_test]     <- h4_k
@@ -980,7 +748,7 @@ efficient_estimator_dml2 <- function(dat,
 }
 
 ############################################################
-## 9. Efficient estimator Eff (DML1): per-fold (phi_k, theta_k) + JOINT sandwich combine
+## 9. Efficient estimator Eff (DML1): revised per-fold optimizer + JOINT sandwich
 ############################################################
 
 efficient_estimator_dml1 <- function(dat,
@@ -988,27 +756,31 @@ efficient_estimator_dml1 <- function(dat,
                                      K           = 2,
                                      max_restart = 10,
                                      progress    = FALSE) {
-  n <- nrow(dat)
-  X <- df_get_X(dat)
-  p_x <- ncol(X)
-  p_phi <- 1 + p_x + 1
+  n    <- nrow(dat)
+  X    <- df_get_X(dat)
+  p_x  <- ncol(X)
+  p_phi <- 1 + p_x + 1  # (intercept, X, y)
 
   if (is.null(phi_start)) {
-    phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
+    phi_start <- c(
+      -log(1 / mean(dat$d_np) - 1),  # intercept
+      rep(0, p_x),                   # coefficients for X
+      0                              # coefficient for y
+    )
   }
 
   folds <- make_folds(n, K)
 
-  # Cross-fit pi_p once (impute for each held-out fold if needed)
+  # Cross-fit pi_p once
   dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = FALSE)
 
-  phi_k_mat   <- matrix(NA_real_, nrow = K, ncol = p_phi)
-  theta_k     <- rep(NA_real_, K)
-  var_k_list  <- vector("list", K)
-  w_k         <- rep(NA_real_, K)  # weights = n_k / n
+  phi_k_mat  <- matrix(NA_real_, nrow = K, ncol = p_phi)
+  theta_k    <- rep(NA_real_, K)
+  var_k_list <- vector("list", K)
+  w_k        <- rep(NA_real_, K)
 
   if (progress) {
-    cat("DML1: per-fold estimation for (phi, theta) and joint sandwich ...\n")
+    cat("DML1 (revised): per-fold optimization for (phi, theta) with joint sandwich ...\n")
     flush.console()
   }
 
@@ -1017,46 +789,78 @@ efficient_estimator_dml1 <- function(dat,
     idx_train <- setdiff(seq_len(n), idx_test)
     w_k[k]    <- length(idx_test) / n
 
-    dat_test  <- dat_cf[idx_test,  , drop = FALSE]
-    dat_train <- dat_cf[idx_train, , drop = FALSE]
+    dat_test  <- dat_cf[idx_test,  ]
+    dat_train <- dat_cf[idx_train, ]
 
-    # Solve phi_k on the test fold score with nuisance trained on training fold
-    ee_fun_k <- function(phi) {
-      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi, dat_test)
-      colMeans(df_score_phi_contrib(dat_test, phi, eta4_k))
+    # Step 1: solve for phi_k on fold k by minimizing ||mean score||^2
+    obj_phi_k <- function(phi) {
+      phi <- as.numeric(phi)
+      X_test <- df_get_X(dat_test)
+
+      eta4_k <- estimate_conditional_expectation_kernlab_phi(
+        dat_train, phi, new_X = X_test
+      )
+
+      sphi_k <- df_score_phi_contrib(dat_test, phi, eta4_k)
+      eq_k   <- colMeans(sphi_k)
+
+      sum(eq_k^2)
     }
 
-    attempt <- 0
-    sol <- list(termcd = 99)
-    while (attempt < max_restart && sol$termcd > 2) {
-      attempt <- attempt + 1
+    best_val <- Inf
+    best_res <- NULL
+
+    for (attempt in seq_len(max_restart)) {
       init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
-      sol_try <- try(nleqslv::nleqslv(init, ee_fun_k), silent = TRUE)
-      if (!inherits(sol_try, "try-error")) sol <- sol_try
+
+      res <- try(
+        stats::optim(par = init, fn = obj_phi_k, method = "Nelder-Mead"),
+        silent = TRUE
+      )
+
+      if (!inherits(res, "try-error") &&
+          is.finite(res$value) &&
+          res$value < best_val) {
+        best_val <- res$value
+        best_res <- res
+      }
     }
 
-    if (sol$termcd > 2) {
-      if (progress) cat(sprintf("  fold %d/%d: phi did not converge.\n", k, K))
+    if (is.null(best_res) || !is.finite(best_val)) {
+      if (progress) cat(sprintf("  fold %d/%d: phi optimization failed.\n", k, K))
       next
     }
 
-    phi_k <- as.numeric(sol$x)
+    phi_k <- as.numeric(best_res$par)
     phi_k_mat[k, ] <- phi_k
 
-    # Nuisance on test fold at phi_k (trained on training fold)
-    eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_k, dat_test)
-    h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_k, dat_test)
+    if (progress) {
+      cat(sprintf("  fold %d/%d: phi optimized (obj = %.3e)\n", k, K, best_val))
+      flush.console()
+    }
 
-    # Scores on test fold
-    s_phi_k   <- df_score_phi_contrib(dat_test, phi_k, eta4_k)
-    contrib_k <- efficient_theta_contrib(dat_test, phi_k, h4_k)
+    # Step 2: nuisance functions on test fold at phi_k (trained on training fold)
+    X_test <- df_get_X(dat_test)
+
+    eta4_k <- estimate_conditional_expectation_kernlab_phi(
+      dat_train, phi_k, new_X = X_test
+    )
+    h4_k <- estimate_conditional_expectation_kernlab_theta(
+      dat_train, phi_k, new_X = X_test
+    )
+
+    # Step 3: per-fold theta_k and joint score / Jacobian for sandwich
+    s_phi_k    <- df_score_phi_contrib(dat_test, phi_k, eta4_k)
+    contrib_k  <- efficient_theta_contrib(dat_test, phi_k, h4_k)
     theta_k[k] <- mean(contrib_k)
-    s_theta_k <- as.numeric(contrib_k - theta_k[k])
+    s_theta_k  <- as.numeric(contrib_k - theta_k[k])
 
     score_k <- cbind(s_phi_k, s_theta_k)
 
-    # Jacobian on fold k (holding eta4_k and h4_k fixed)
-    g_phi_mean_k <- function(phi) colMeans(df_score_phi_contrib(dat_test, phi, eta4_k))
+    # Jacobian A_k at (phi_k, theta_k) treating eta4_k, h4_k as fixed
+    g_phi_mean_k <- function(phi) {
+      colMeans(df_score_phi_contrib(dat_test, phi, eta4_k))
+    }
     A11_k <- df_numeric_jacobian(g_phi_mean_k, phi_k)
 
     g_theta_mean_k <- function(phi) {
@@ -1073,35 +877,48 @@ efficient_estimator_dml1 <- function(dat,
     var_k_list[[k]] <- js_k$var
 
     if (progress) {
-      cat(sprintf("  fold %d/%d done.\n", k, K))
+      cat(sprintf("    fold %d/%d: theta_k = %.4f\n", k, K, theta_k[k]))
       flush.console()
     }
   }
 
-  valid <- which(is.finite(theta_k) & apply(is.finite(phi_k_mat), 1, all))
+  valid <- which(
+    is.finite(theta_k) &
+      apply(is.finite(phi_k_mat), 1, all) &
+      vapply(var_k_list, function(v) is.matrix(v) && all(is.finite(v)), logical(1))
+  )
+
   if (length(valid) == 0) {
     return(list(
-      phi = rep(NA_real_, p_phi),
+      phi     = rep(NA_real_, p_phi),
       phi_var = matrix(NA_real_, p_phi, p_phi),
-      phi_se = rep(NA_real_, p_phi),
-      phi_ci = matrix(NA_real_, nrow = 2, ncol = p_phi,
-                      dimnames = list(c("lower","upper"), NULL)),
+      phi_se  = rep(NA_real_, p_phi),
+      phi_ci  = matrix(
+        NA_real_, nrow = 2, ncol = p_phi,
+        dimnames = list(c("lower", "upper"), NULL)
+      ),
       theta = NA_real_,
-      var = NA_real_,
-      se = NA_real_,
-      ci = c(NA_real_, NA_real_),
-      info = list(type = "Eff", dml_type = "DML1", K = K, progress = progress)
+      var   = NA_real_,
+      se    = NA_real_,
+      ci    = c(NA_real_, NA_real_),
+      info  = list(
+        type        = "Eff",
+        dml_type    = "DML1",
+        K           = K,
+        phi_start   = phi_start,
+        max_restart = max_restart,
+        progress    = progress,
+        note        = "DML1 with per-fold phi optimized by Nelder-Mead"
+      )
     ))
   }
 
-  # Weighted average of fold estimates (weights by fold size)
   w_use <- w_k[valid]
   w_use <- w_use / sum(w_use)
 
   phi_hat   <- as.numeric(t(w_use) %*% phi_k_mat[valid, , drop = FALSE])
   theta_hat <- as.numeric(sum(w_use * theta_k[valid]))
 
-  # Combine variances of fold estimators: Var(sum w_k beta_k) ~ sum w_k^2 Var(beta_k)
   V_hat <- matrix(0, nrow = p_phi + 1, ncol = p_phi + 1)
   for (j in seq_along(valid)) {
     kk <- valid[j]
@@ -1120,21 +937,22 @@ efficient_estimator_dml1 <- function(dat,
   theta_ci <- c(theta_hat - z * th_se, theta_hat + z * th_se)
 
   list(
-    phi    = phi_hat,
-    phi_var= phi_var,
-    phi_se = phi_se,
-    phi_ci = phi_ci,
-    theta  = theta_hat,
-    var    = th_var,
-    se     = th_se,
-    ci     = theta_ci,
-    info   = list(
+    phi     = phi_hat,
+    phi_var = phi_var,
+    phi_se  = phi_se,
+    phi_ci  = phi_ci,
+    theta   = theta_hat,
+    var     = th_var,
+    se      = th_se,
+    ci      = theta_ci,
+    info    = list(
       type        = "Eff",
       dml_type    = "DML1",
       K           = K,
       phi_start   = phi_start,
       max_restart = max_restart,
-      progress    = progress
+      progress    = progress,
+      note        = "DML1 with per-fold phi optimized by Nelder-Mead"
     )
   )
 }
@@ -1158,19 +976,13 @@ subefficient_estimator_dml2 <- function(dat, K = 2, progress = FALSE) {
   n <- nrow(dat)
   folds <- make_folds(n, K)
 
-  # For mixed X (x_disc present), sigma is unused; for continuous-only we
-  # pre-compute a global sigma.
-  if (df_has_disc_x(dat)) {
-    sigma_mu <- NULL
+  X_all <- df_get_X(dat)
+  idx_mu <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
+  if (length(idx_mu) >= 2L) {
+    dist_matrix <- as.matrix(stats::dist(X_all[idx_mu, , drop = FALSE]))
+    sigma_mu <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
   } else {
-    X_all <- df_get_X(dat)
-    idx_mu <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
-    if (length(idx_mu) >= 2L) {
-      dist_matrix <- as.matrix(stats::dist(X_all[idx_mu, , drop = FALSE]))
-      sigma_mu <- 1 / stats::median(dist_matrix[upper.tri(dist_matrix)])
-    } else {
-      sigma_mu <- NULL
-    }
+    sigma_mu <- NULL
   }
 
   if (progress) {
@@ -1184,10 +996,11 @@ subefficient_estimator_dml2 <- function(dat, K = 2, progress = FALSE) {
     idx_test  <- folds[[k]]
     idx_train <- setdiff(seq_len(n), idx_test)
 
-    dat_train <- dat[idx_train, , drop = FALSE]
-    dat_test  <- dat[idx_test,  , drop = FALSE]
+    dat_train <- dat[idx_train, ]
+    dat_test  <- dat[idx_test,  ]
+    X_test    <- df_get_X(dat_test)
 
-    mu_k <- regression_expectation_kernlab(dat_train, dat_test, sigma = sigma_mu)
+    mu_k <- regression_expectation_kernlab(dat_train, new_X = X_test, sigma = sigma_mu)
     mu_hat_all[idx_test] <- mu_k
 
     if (progress) utils::setTxtProgressBar(pb, k)
@@ -1209,8 +1022,7 @@ subefficient_estimator_dml2 <- function(dat, K = 2, progress = FALSE) {
 }
 
 ############################################################
-## 11. Parametric efficient estimator Eff_P: theta + phi (phi via nleqslv), joint variance NOT implemented
-##     (theta variance is computed from contributions as before)
+## 11. Parametric efficient estimator Eff_P (working model)
 ############################################################
 
 efficient_parametric_estimator <- function(dat,
@@ -1227,7 +1039,6 @@ efficient_parametric_estimator <- function(dat,
     phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
   }
 
-  # Solve phi with estimating equation using eta4_star fixed (working model)
   ee_para <- function(phi) {
     X1    <- df_get_X(dat)
     y1    <- as.numeric(dat$y)
@@ -1273,7 +1084,6 @@ efficient_parametric_estimator <- function(dat,
   } else {
     phi_hat <- as.numeric(sol$x)
 
-    # Working outcome regression: linear model y ~ X on (d_np==1 | d_p==1)
     subset_idx <- which(as.numeric(dat$d_np) == 1 | as.numeric(dat$d_p) == 1)
     dat_sub <- dat[subset_idx, ]
     X_sub <- df_get_X(dat_sub)
@@ -1293,7 +1103,7 @@ efficient_parametric_estimator <- function(dat,
 
   list(
     phi    = phi_hat,
-    phi_var= NULL,  # joint variance for Eff_P not implemented in this file
+    phi_var= NULL,
     phi_se = NULL,
     phi_ci = NULL,
     theta  = theta_res$theta,
@@ -1308,7 +1118,6 @@ efficient_parametric_estimator <- function(dat,
 ## 12. Public wrappers: Eff, Eff_S, Eff_P
 ############################################################
 
-# Eff: choose DML1 or DML2 via dml_type (or alias `type`)
 Eff <- function(dat,
                 K           = 2,
                 phi_start   = NULL,
