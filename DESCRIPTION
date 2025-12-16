@@ -33,7 +33,8 @@ Imports:
     kernlab,
     np,
     stats,
-    utils
+    utils,
+    parallel
 Suggests:
     knitr,
     rmarkdown

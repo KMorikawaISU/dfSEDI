@@ -1,7 +1,7 @@
 ## inst/examples/dualframe_simulation.R
 
 library(dfSEDI)
-library(parallel)
+
 
 generate_dualframe_population <- function(N) {
   # Continuous and discrete covariates
