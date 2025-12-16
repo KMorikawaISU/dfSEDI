@@ -46,9 +46,9 @@ All core functions assume a data frame `dat` that contains at least:
 
 - `X`      : covariates used in the *parametric* NP inclusion model and also as inputs to nuisance models  
              - can be a **numeric matrix** stored as a single column, e.g. `X = I(matrix(...))`, or  
-             - a **data.frame** (recommended if you have categorical variables), which will be converted internally  
+             - a **data.frame** (recommended if you have categorical variables)  
              - alternatively, a numeric vector `x` can be provided (1D covariate case)
-- `y`      : outcome variable
+- `y`      : outcome variable (continuous or binary)
 - `d_np`   : indicator for inclusion in the non-probability sample (0/1)
 - `d_p`    : indicator for inclusion in the probability sample (0/1)
 - `pi_p`   : design inclusion probability for the probability sample
@@ -56,14 +56,14 @@ All core functions assume a data frame `dat` that contains at least:
 
 ### Mixed continuous/discrete covariates (automatic)
 
-dfSEDI estimates nuisance functions (e.g., \(\mu(X)=E[Y\mid X]\), \(\pi_P\), \(\eta_4^*(X)\), \(h_4^*(X)\)) using kernel ridge regression via `kernlab::gausspr`.
+dfSEDI estimates nuisance functions (e.g., \(\mu(X)=E[Y\mid X]\), \(\pi_P\), \(\eta_4^*(X)\), \(h_4^*(X)\)) using kernel methods.
 
-If `X` contains **categorical/discrete** columns, dfSEDI automatically uses a **product kernel**:
+- If `X` is continuous-only, dfSEDI uses Gaussian/RBF kernels (via `kernlab::gausspr`).
+- If `X` contains **categorical/discrete** columns, dfSEDI automatically uses a **product kernel**:
+  - RBF (Gaussian) kernel on continuous columns
+  - Delta (Kronecker) kernel on categorical columns (only same-category pairs interact)
 
-- RBF (Gaussian) kernel on continuous columns
-- Delta (Kronecker) kernel on categorical columns (only same-category pairs interact)
-
-This is equivalent to fitting separate KRR models *within each category combination*, and it often yields **large speedups** because the kernel matrix becomes effectively block-diagonal.
+This is equivalent to fitting separate kernel models *within each category combination*, and it often yields **large speedups** because the kernel matrix becomes effectively block-diagonal.
 
 #### How categorical columns are detected
 
@@ -72,8 +72,17 @@ This is equivalent to fitting separate KRR models *within each category combinat
 
 **Recommended practice:** supply `X` as a `data.frame` and explicitly mark categorical variables as `factor`.
 
-> Note (parametric part): In the NP inclusion model for \(\phi\), `X` enters linearly as numeric columns.  
-> If you have multi-level categorical variables and want a proper parametric specification, dummy-encode them yourself (e.g., with `model.matrix`) before passing them as `X`.
+> Note (parametric part for \(\phi\)): If `X` is a `data.frame` with factor columns, dfSEDI internally uses dummy encoding (`model.matrix`) for the NP inclusion model so multi-level categorical variables enter as dummies automatically.
+
+#### Small-cell warning (categorical cells)
+
+With a delta kernel, very small categorical cells can make nuisance estimates unstable. dfSEDI can warn (or ask interactively) when cell sizes are too small. You can control this behavior via options, e.g.:
+
+```r
+options(dfSEDI.min_cell_size = 30)                 # threshold
+options(dfSEDI.small_cell_action = "ask")          # "ask" / "warn" / "stop" / "none"
+options(dfSEDI.allow_small_cells = FALSE)          # bypass flag
+```
 
 ---
 
@@ -168,6 +177,8 @@ fit_eff_dml2$info
 Eff returns joint sandwich-based standard errors for both \(\theta\) and \(\phi\)
 (`phi_se`, `phi_ci`).
 
+> Tip: DML2 can be substantially slower than DML1, especially with mixed (continuous/categorical) covariates, because the objective for \(\phi\) may refit nuisance regressions many times.
+
 ---
 
 ## Eff_S (sub-efficient)
@@ -186,7 +197,7 @@ fit_effS$info
 ```
 
 `Eff_S` is based on a sub-efficient influence function that only involves the outcome
-regression \(E(Y \mid X)\).
+regression \(\mu(X)=E(Y \mid X)\).
 
 ---
 
@@ -211,6 +222,49 @@ fit_effP$info
 `Eff_P` assumes parametric working models for both the sampling mechanism and the
 outcome regression. It returns point estimates and standard errors for \(\theta\);
 standard errors for \(\phi\) are not currently implemented in `Eff_P`.
+
+---
+
+## Binary outcomes (Y is 0/1): logistic models for Eff_S and Eff_P
+
+If the outcome `y` is binary (0/1), dfSEDI can use logistic models for the outcome regression \(\mu(X)=P(Y=1\mid X)\):
+
+- **Eff_S**: \(\mu(X)\) is estimated by **kernel logistic regression** (RBF / mixed kernel + ridge regularization).
+- **Eff_P**: \(\mu(X)\) is estimated by **parametric logistic regression** (`glm(..., family=binomial())`).
+
+### How dfSEDI decides whether `y` is binary
+
+`y` is treated as binary if it is one of:
+
+- numeric/integer with exactly two unique finite values (e.g. 0/1),
+- `logical`,
+- a 2-level `factor` (or `character`, which will be treated like a 2-level factor).
+
+By default, both `Eff_S()` and `Eff_P()` have `logit = NULL`, which means:
+
+- If `y` is binary, dfSEDI **automatically uses logistic models** for \(\mu(X)\).
+- If `y` is not binary, dfSEDI uses the original models:
+  - Eff_S: kernel ridge regression for \(\mu(X)\)
+  - Eff_P: linear regression for \(\mu(X)\)
+
+You can override this behavior explicitly:
+
+```r
+# Force logistic (errors if y is not binary)
+fit_effS_bin <- Eff_S(dat, K = 2, logit = TRUE)
+fit_effP_bin <- Eff_P(dat, logit = TRUE)
+
+# Force non-logistic (even if y is binary)
+fit_effS_lin <- Eff_S(dat, K = 2, logit = FALSE)
+fit_effP_lin <- Eff_P(dat, logit = FALSE)
+```
+
+### Note on coding of success (=1)
+
+- If `y` is a 2-level factor, dfSEDI treats the **second level** as the success category (=1).
+- If `y` is numeric with two unique values, dfSEDI treats the **larger value** as success (=1).
+
+To avoid ambiguity, you can always recode explicitly to `0/1` (or reorder factor levels) before calling dfSEDI.
 
 ---
 
