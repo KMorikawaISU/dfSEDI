@@ -35,6 +35,13 @@
 ##      h = median(||x_i-x_j||),  sigma = 1/(2*h^2)
 ##  - Revert to legacy behavior via:
 ##      options(dfSEDI.sigma_rule = "legacy")  # sigma = 1/median(||x_i-x_j||)
+##
+## Output-preserving speed updates (this revision):
+##  - Cache df_krr_mixed_prepare() per fold for eta4*/h4*
+##  - Vectorize Numer_mat construction in eta4*(X;phi)
+##  - Faster mixed prediction: pre-split indices; fit global model only if needed
+##  - df_get_X fast-path for numeric matrices
+##  - Internal fast score evaluators for DML objectives/jacobians (avoid repeated df_get_X)
 ############################################################
 
 ############################################################
@@ -248,6 +255,16 @@ df_get_X <- function(dat) {
     if (is.data.frame(X)) X <- as.matrix(X)
     if (!is.matrix(X)) stop("df_get_X(): `X` must be a matrix or convertible to matrix.")
 
+    # speed: if already numeric matrix, return as-is (just enforce numeric storage + attr)
+    if (is.matrix(X) && (is.double(X) || is.integer(X))) {
+      X_num <- X
+      storage.mode(X_num) <- "numeric"
+      if (is.null(attr(X_num, "dfSEDI_categorical_cols"))) {
+        attr(X_num, "dfSEDI_categorical_cols") <- integer(0)
+      }
+      return(X_num)
+    }
+
     X_num <- apply(X, 2, function(col) suppressWarnings(as.numeric(col)))
     X_num <- as.matrix(X_num)
     storage.mode(X_num) <- "numeric"
@@ -262,6 +279,15 @@ df_get_X <- function(dat) {
   }
 
   stop("df_get_X(): cannot extract X. Provide either `X` or `x`.")
+}
+
+# Build l = [1, X, y] as numeric matrix (used in fast score paths)
+df_make_l_matrix <- function(X, y) {
+  X <- as.matrix(X)
+  y <- as.numeric(y)
+  l <- as.matrix(cbind(1, X, y))
+  storage.mode(l) <- "numeric"
+  l
 }
 
 df_kernlab_predict <- function(model, newdata) {
@@ -537,11 +563,18 @@ df_krr_mixed_predict <- function(X_train,
 
   key_train <- df_make_cat_key(X_train[, cat_cols, drop = FALSE])
   key_test  <- df_make_cat_key(X_test[,  cat_cols, drop = FALSE])
-  uniq_keys <- unique(key_train)
+
+  split_train <- split(seq_len(ntr), key_train)
+  split_test  <- split(seq_len(nte), key_test)
+  uniq_keys <- names(split_train)
 
   global_mean <- mean(y_train)
+
+  # Fit global model only if needed (i.e., test contains keys not in train)
+  need_global <- length(setdiff(names(split_test), uniq_keys)) > 0L
+
   global_model <- NULL
-  if (length(cont_cols) > 0L && length(y_train) >= 2L) {
+  if (isTRUE(need_global) && length(cont_cols) > 0L && length(y_train) >= 2L) {
     sig_g <- sigma
     if (is.null(sig_g)) {
       sig_g <- df_estimate_rbf_sigma(X_train[, cont_cols, drop = FALSE], max_n = sigma_max_n)
@@ -554,14 +587,12 @@ df_krr_mixed_predict <- function(X_train,
     )
   }
 
-  models <- vector("list", length(uniq_keys))
-  names(models) <- uniq_keys
-  means  <- setNames(rep(NA_real_, length(uniq_keys)), uniq_keys)
+  means <- vapply(split_train, function(idx) mean(y_train[idx]), numeric(1))
+  models <- setNames(vector("list", length(uniq_keys)), uniq_keys)
 
   for (k in uniq_keys) {
-    idx <- which(key_train == k)
+    idx <- split_train[[k]]
     y_g <- y_train[idx]
-    means[k] <- mean(y_g)
 
     if (length(cont_cols) == 0L || length(y_g) < 2L) {
       models[[k]] <- NULL
@@ -582,8 +613,8 @@ df_krr_mixed_predict <- function(X_train,
 
   pred <- rep(global_mean, nte)
 
-  for (k in unique(key_test)) {
-    idx <- which(key_test == k)
+  for (k in names(split_test)) {
+    idx <- split_test[[k]]
 
     if (k %in% uniq_keys) {
       if (length(cont_cols) == 0L || is.null(models[[k]])) {
@@ -781,10 +812,20 @@ df_klogit_mixed_predict <- function(X_train,
   if (nte == 0L) return(numeric(0))
   if (ntr == 0L) return(rep(NA_real_, nte))
 
-  # global fallback
+  # global fallback (fit only if needed)
   global_mean <- df_clip_prob(mean(y01_train))
+
+  key_train <- if (length(cat_cols) > 0L) df_make_cat_key(X_train[, cat_cols, drop = FALSE]) else rep("ALL", ntr)
+  key_test  <- if (length(cat_cols) > 0L) df_make_cat_key(X_test[,  cat_cols, drop = FALSE]) else rep("ALL", nte)
+
+  split_train <- split(seq_len(ntr), key_train)
+  split_test  <- split(seq_len(nte), key_test)
+  uniq_keys <- names(split_train)
+
+  need_global <- length(setdiff(names(split_test), uniq_keys)) > 0L
+
   global_fit <- NULL
-  if (length(cont_cols) > 0L) {
+  if (isTRUE(need_global) && length(cont_cols) > 0L) {
     Xc <- X_train[, cont_cols, drop = FALSE]
     if (is.null(sigma)) sigma <- df_estimate_rbf_sigma(Xc, max_n = sigma_max_n)
     if (is.null(sigma)) sigma <- 1
@@ -797,25 +838,18 @@ df_klogit_mixed_predict <- function(X_train,
     return(df_klogit_predict(global_fit, X_test[, cont_cols, drop = FALSE]))
   }
 
-  key_train <- df_make_cat_key(X_train[, cat_cols, drop = FALSE])
-  key_test  <- df_make_cat_key(X_test[,  cat_cols, drop = FALSE])
-  uniq_keys <- unique(key_train)
-
-  cell_fit <- vector("list", length(uniq_keys))
-  names(cell_fit) <- uniq_keys
-  cell_mean <- setNames(rep(NA_real_, length(uniq_keys)), uniq_keys)
+  cell_fit <- setNames(vector("list", length(uniq_keys)), uniq_keys)
+  cell_mean <- vapply(split_train, function(idx) df_clip_prob(mean(y01_train[idx])), numeric(1))
 
   for (k in uniq_keys) {
-    idx <- which(key_train == k)
+    idx <- split_train[[k]]
     yk <- y01_train[idx]
-    cell_mean[k] <- df_clip_prob(mean(yk))
 
     if (length(cont_cols) == 0L) {
       cell_fit[[k]] <- NULL
       next
     }
 
-    # if only one class present or too small, skip fitting
     uk <- unique(yk[is.finite(yk)])
     if (length(uk) < 2L || length(yk) < 3L) {
       cell_fit[[k]] <- NULL
@@ -834,8 +868,8 @@ df_klogit_mixed_predict <- function(X_train,
 
   pred <- rep(global_mean, nte)
 
-  for (k in unique(key_test)) {
-    idx <- which(key_test == k)
+  for (k in names(split_test)) {
+    idx <- split_test[[k]]
 
     if (k %in% uniq_keys) {
       if (is.null(cell_fit[[k]]) || length(cont_cols) == 0L) {
@@ -1121,29 +1155,29 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   df_clip_prob(pi_hat)
 }
 
-estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma = NULL) {
-  phi   <- as.numeric(phi)
-  X_all <- df_get_X(dat)
-  idx   <- which(as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1)
+# --- NEW: core evaluators that accept pre-extracted (X_obs, l_obs, pi_p_obs, prep) ---
+estimate_conditional_expectation_kernlab_phi_core <- function(phi,
+                                                              new_X,
+                                                              X_obs,
+                                                              l_obs,
+                                                              pi_p_obs,
+                                                              prep) {
+  phi <- as.numeric(phi)
+  new_X <- as.matrix(new_X)
+  X_obs <- as.matrix(X_obs)
+  l_obs <- as.matrix(l_obs)
+  pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
 
-  X_obs    <- X_all[idx, , drop = FALSE]
-  y_obs    <- as.numeric(dat$y[idx])
-  pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
-
-  l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
-  eta    <- as.numeric(l_obs %*% phi)
-  pi_np  <- df_clip_prob(1 / (1 + exp(-eta)))
+  eta   <- as.numeric(l_obs %*% phi)
+  pi_np <- df_clip_prob(1 / (1 + exp(-eta)))
 
   Denom_vals <- h4_prob_denom_function(pi_np, pi_p_obs, phi)
 
-  p_dim     <- length(phi)
-  n_obs     <- nrow(l_obs)
-  Numer_mat <- matrix(NA_real_, nrow = n_obs, ncol = p_dim)
-  for (i in seq_len(n_obs)) {
-    Numer_mat[i, ] <- eta4_prob_numer_function(
-      pi_np[i], pi_p_obs[i], phi = phi, l = l_obs[i, ]
-    )
-  }
+  # vectorized Numer_mat: Numer_mat[i,] = -pi_np[i] * Denom_vals[i] * l_obs[i,]
+  coef <- -pi_np * as.numeric(Denom_vals)
+  Numer_mat <- l_obs * coef
+
+  p_dim <- length(phi)
 
   if (nrow(X_obs) < 2L) {
     denom_pred <- rep(mean(Denom_vals), nrow(new_X))
@@ -1153,16 +1187,10 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma 
     return(sweep(numer_pred, 1, denom_pred, "/"))
   }
 
-  prep <- df_krr_mixed_prepare(
-    X_train = X_obs,
-    sigma   = sigma,
-    context = "eta4*(X;phi) nuisance regression"
-  )
-
   denom_pred <- df_krr_mixed_predict(
     X_train  = X_obs,
     y_train  = as.numeric(Denom_vals),
-    X_test   = as.matrix(new_X),
+    X_test   = new_X,
     sigma    = prep$sigma,
     cat_cols = prep$cat_cols,
     cont_cols= prep$cont_cols
@@ -1174,7 +1202,7 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma 
     function(j) df_krr_mixed_predict(
       X_train  = X_obs,
       y_train  = as.numeric(Numer_mat[, j]),
-      X_test   = as.matrix(new_X),
+      X_test   = new_X,
       sigma    = prep$sigma,
       cat_cols = prep$cat_cols,
       cont_cols= prep$cont_cols
@@ -1184,21 +1212,26 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma 
   sweep(numer_pred, 1, denom_pred, "/")
 }
 
-estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigma = NULL) {
-  phi   <- as.numeric(phi)
-  X_all <- df_get_X(dat)
-  idx   <- which(as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1)
+estimate_conditional_expectation_kernlab_theta_core <- function(phi,
+                                                                new_X,
+                                                                X_obs,
+                                                                y_obs,
+                                                                l_obs,
+                                                                pi_p_obs,
+                                                                prep) {
+  phi <- as.numeric(phi)
+  new_X <- as.matrix(new_X)
+  X_obs <- as.matrix(X_obs)
+  y_obs <- as.numeric(y_obs)
+  l_obs <- as.matrix(l_obs)
+  pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
 
-  X_obs    <- X_all[idx, , drop = FALSE]
-  y_obs    <- as.numeric(dat$y[idx])
-  pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
-
-  l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
-  eta    <- as.numeric(l_obs %*% phi)
-  pi_np  <- df_clip_prob(1 / (1 + exp(-eta)))
+  eta   <- as.numeric(l_obs %*% phi)
+  pi_np <- df_clip_prob(1 / (1 + exp(-eta)))
 
   Denom_vals <- h4_prob_denom_function(pi_np, pi_p_obs, phi)
-  Numer_vals <- h4_prob_numer_function(pi_np, pi_p_obs, phi, y_obs)
+  # vectorized Numer_vals: -y * Denom_vals
+  Numer_vals <- -y_obs * as.numeric(Denom_vals)
 
   if (nrow(X_obs) < 2L) {
     denom_pred <- rep(mean(Denom_vals), nrow(new_X))
@@ -1207,16 +1240,10 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigm
     return(as.numeric(numer_pred / denom_pred))
   }
 
-  prep <- df_krr_mixed_prepare(
-    X_train = X_obs,
-    sigma   = sigma,
-    context = "h4*(X;phi) nuisance regression"
-  )
-
   denom_pred <- df_krr_mixed_predict(
     X_train  = X_obs,
     y_train  = as.numeric(Denom_vals),
-    X_test   = as.matrix(new_X),
+    X_test   = new_X,
     sigma    = prep$sigma,
     cat_cols = prep$cat_cols,
     cont_cols= prep$cont_cols
@@ -1226,7 +1253,7 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigm
   numer_pred <- df_krr_mixed_predict(
     X_train  = X_obs,
     y_train  = as.numeric(Numer_vals),
-    X_test   = as.matrix(new_X),
+    X_test   = new_X,
     sigma    = prep$sigma,
     cat_cols = prep$cat_cols,
     cont_cols= prep$cont_cols
@@ -1235,10 +1262,78 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigm
   as.numeric(numer_pred / denom_pred)
 }
 
+# Backward-compatible wrappers (same outputs as before)
+estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma = NULL, prep = NULL) {
+  phi <- as.numeric(phi)
+  X_all <- df_get_X(dat)
+  idx   <- which(as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1)
+
+  X_obs    <- X_all[idx, , drop = FALSE]
+  y_obs    <- as.numeric(dat$y[idx])
+  pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
+
+  l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
+  storage.mode(l_obs) <- "numeric"
+
+  if (is.null(prep)) {
+    prep <- df_krr_mixed_prepare(
+      X_train = X_obs,
+      sigma   = sigma,
+      context = "eta4*(X;phi) nuisance regression"
+    )
+  } else {
+    # keep cat/cont from prep; override sigma if explicitly provided
+    if (!is.null(sigma)) prep$sigma <- sigma
+  }
+
+  estimate_conditional_expectation_kernlab_phi_core(
+    phi     = phi,
+    new_X   = as.matrix(new_X),
+    X_obs   = X_obs,
+    l_obs   = l_obs,
+    pi_p_obs= pi_p_obs,
+    prep    = prep
+  )
+}
+
+estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigma = NULL, prep = NULL) {
+  phi <- as.numeric(phi)
+  X_all <- df_get_X(dat)
+  idx   <- which(as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1)
+
+  X_obs    <- X_all[idx, , drop = FALSE]
+  y_obs    <- as.numeric(dat$y[idx])
+  pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
+
+  l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
+  storage.mode(l_obs) <- "numeric"
+
+  if (is.null(prep)) {
+    prep <- df_krr_mixed_prepare(
+      X_train = X_obs,
+      sigma   = sigma,
+      context = "h4*(X;phi) nuisance regression"
+    )
+  } else {
+    if (!is.null(sigma)) prep$sigma <- sigma
+  }
+
+  estimate_conditional_expectation_kernlab_theta_core(
+    phi     = phi,
+    new_X   = as.matrix(new_X),
+    X_obs   = X_obs,
+    y_obs   = y_obs,
+    l_obs   = l_obs,
+    pi_p_obs= pi_p_obs,
+    prep    = prep
+  )
+}
+
 ############################################################
 ## 5. Scores
 ############################################################
 
+# Original versions (kept for compatibility)
 df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
   phi <- as.numeric(phi)
 
@@ -1290,6 +1385,62 @@ efficient_theta_contrib <- function(dat1, phi, h4_star_local) {
   pi_np_p1 <- df_clip_prob(pi_np1 + pi_p1 - pi_np1 * pi_p1)
 
   h4_star_local <- as.numeric(h4_star_local)
+
+  term1 <- y1 * (d_p1 / pi_p1 +
+                   (1 - d_p1 / pi_p1) / pi_np_p1 *
+                   (d_np1 - d_p1 * (d_np1 - pi_np1)))
+
+  term2_coef <- 1 -
+    (d_p1 * d_np1) / (pi_p1 * pi_np1) -
+    1 / pi_np_p1 *
+    (d_np1 * (1 - d_p1 / pi_p1) +
+       d_p1 * (1 - d_np1 / pi_np1))
+
+  out <- as.numeric(term1 - term2_coef * h4_star_local)
+  out[!is.finite(out)] <- NA_real_
+  out
+}
+
+# Fast versions (output-identical) used internally for DML objective/jacobians
+df_score_phi_contrib_fast <- function(l1, d_p1, d_np1, pi_p1, phi, eta4_star_local) {
+  phi <- as.numeric(phi)
+  l1 <- as.matrix(l1)
+  d_p1 <- as.numeric(d_p1)
+  d_np1 <- as.numeric(d_np1)
+  pi_p1 <- df_clip_prob(as.numeric(pi_p1))
+
+  eta      <- as.numeric(l1 %*% phi)
+  pi_np1   <- df_clip_prob(1 / (1 + exp(-eta)))
+  pi_np_p1 <- df_clip_prob(pi_np1 + pi_p1 - pi_np1 * pi_p1)
+
+  term1 <- l1 * pi_np1 * (1 - pi_np1) / pi_np_p1 *
+    (d_np1 / pi_np1 * (pi_p1 - d_p1) -
+       d_p1 / (1 - pi_np1) * (1 - d_np1 / pi_np1))
+
+  term2_coef <- 1 -
+    (d_p1 * d_np1) / (pi_p1 * pi_np1) -
+    1 / pi_np_p1 *
+    (d_np1 * (1 - d_p1 / pi_p1) +
+       d_p1 * (1 - d_np1 / pi_np1))
+
+  eta4_star_local <- as.matrix(eta4_star_local)
+  out <- term1 + term2_coef * eta4_star_local
+  out[!is.finite(out)] <- NA_real_
+  out
+}
+
+efficient_theta_contrib_fast <- function(l1, y1, d_p1, d_np1, pi_p1, phi, h4_star_local) {
+  phi <- as.numeric(phi)
+  l1 <- as.matrix(l1)
+  y1 <- as.numeric(y1)
+  d_p1 <- as.numeric(d_p1)
+  d_np1 <- as.numeric(d_np1)
+  pi_p1 <- df_clip_prob(as.numeric(pi_p1))
+  h4_star_local <- as.numeric(h4_star_local)
+
+  eta      <- as.numeric(l1 %*% phi)
+  pi_np1   <- df_clip_prob(1 / (1 + exp(-eta)))
+  pi_np_p1 <- df_clip_prob(pi_np1 + pi_p1 - pi_np1 * pi_p1)
 
   term1 <- y1 * (d_p1 / pi_p1 +
                    (1 - d_p1 / pi_p1) / pi_np_p1 *
@@ -1477,34 +1628,114 @@ efficient_estimator_dml2 <- function(dat,
   folds <- make_folds(n, K)
   dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress)
 
+  # Build fold caches (output-preserving): precompute X_test/l_test and train prep for eta4*/h4*
+  make_fold_cache <- function(idx_test, idx_train) {
+    dat_test  <- dat_cf[idx_test,  , drop = FALSE]
+    dat_train <- dat_cf[idx_train, , drop = FALSE]
+
+    # test side (for fast scores)
+    X_test <- df_get_X(dat_test)
+    y_test <- as.numeric(dat_test$y)
+    l_test <- df_make_l_matrix(X_test, y_test)
+
+    test <- list(
+      l    = l_test,
+      y    = y_test,
+      d_p  = as.numeric(dat_test$d_p),
+      d_np = as.numeric(dat_test$d_np),
+      pi_p = df_clip_prob(as.numeric(dat_test$pi_p))
+    )
+
+    if (!isTRUE(x_info)) {
+      return(list(
+        idx_test = idx_test,
+        w = length(idx_test) / n,
+        X_test = X_test,
+        test = test,
+        train = NULL
+      ))
+    }
+
+    # train side for nuisances
+    X_all_tr <- df_get_X(dat_train)
+    idx_obs  <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+
+    X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
+    y_obs    <- as.numeric(dat_train$y[idx_obs])
+    pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
+    l_obs    <- df_make_l_matrix(X_obs, y_obs)
+
+    prep_eta4 <- df_krr_mixed_prepare(
+      X_train = X_obs,
+      sigma   = NULL,
+      context = "eta4*(X;phi) nuisance regression"
+    )
+    prep_h4 <- df_krr_mixed_prepare(
+      X_train = X_obs,
+      sigma   = NULL,
+      context = "h4*(X;phi) nuisance regression"
+    )
+
+    train <- list(
+      X_obs     = X_obs,
+      y_obs     = y_obs,
+      pi_p_obs  = pi_p_obs,
+      l_obs     = l_obs,
+      prep_eta4 = prep_eta4,
+      prep_h4   = prep_h4
+    )
+
+    list(
+      idx_test = idx_test,
+      w = length(idx_test) / n,
+      X_test = X_test,
+      test = test,
+      train = train
+    )
+  }
+
+  fold_cache <- vector("list", length(folds))
+  for (k in seq_along(folds)) {
+    idx_test  <- folds[[k]]
+    idx_train <- setdiff(seq_len(n), idx_test)
+    fold_cache[[k]] <- make_fold_cache(idx_test, idx_train)
+  }
+
   big_penalty <- 1e100
 
   obj_phi <- function(phi) {
     phi <- as.numeric(phi)
     eq_agg <- rep(0, length(phi))
 
-    for (k in seq_along(folds)) {
-      idx_test  <- folds[[k]]
-      idx_train <- setdiff(seq_len(n), idx_test)
-
-      dat_test  <- dat_cf[idx_test,  ]
-      dat_train <- dat_cf[idx_train, ]
-
-      X_test <- df_get_X(dat_test)
+    for (k in seq_along(fold_cache)) {
+      fc <- fold_cache[[k]]
 
       eta4_k <- if (isTRUE(x_info)) {
-        estimate_conditional_expectation_kernlab_phi(dat_train, phi, new_X = X_test)
+        estimate_conditional_expectation_kernlab_phi_core(
+          phi      = phi,
+          new_X    = fc$X_test,
+          X_obs    = fc$train$X_obs,
+          l_obs    = fc$train$l_obs,
+          pi_p_obs = fc$train$pi_p_obs,
+          prep     = fc$train$prep_eta4
+        )
       } else {
-        matrix(0, nrow = nrow(dat_test), ncol = p_phi)
+        matrix(0, nrow = nrow(fc$test$l), ncol = p_phi)
       }
 
-      sphi_k <- df_score_phi_contrib(dat_test, phi, eta4_k)
-      eq_k   <- colMeans(sphi_k, na.rm = TRUE)
+      sphi_k <- df_score_phi_contrib_fast(
+        l1 = fc$test$l,
+        d_p1 = fc$test$d_p,
+        d_np1 = fc$test$d_np,
+        pi_p1 = fc$test$pi_p,
+        phi = phi,
+        eta4_star_local = eta4_k
+      )
 
+      eq_k <- colMeans(sphi_k, na.rm = TRUE)
       if (any(!is.finite(eq_k))) return(big_penalty)
 
-      w_k <- length(idx_test) / n
-      eq_agg <- eq_agg + w_k * eq_k
+      eq_agg <- eq_agg + fc$w * eq_k
     }
 
     if (any(!is.finite(eq_agg))) return(big_penalty)
@@ -1543,20 +1774,30 @@ efficient_estimator_dml2 <- function(dat,
   if (isTRUE(x_info)) {
     if (progress) {
       cat("Step 3/3: cross-fitting nuisances for joint scores ...\n")
-      pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
+      pb <- utils::txtProgressBar(min = 0, max = length(fold_cache), style = 3)
     }
 
-    for (k in seq_along(folds)) {
-      idx_test  <- folds[[k]]
-      idx_train <- setdiff(seq_len(n), idx_test)
+    for (k in seq_along(fold_cache)) {
+      fc <- fold_cache[[k]]
+      idx_test <- fc$idx_test
 
-      dat_test  <- dat_cf[idx_test,  ]
-      dat_train <- dat_cf[idx_train, ]
-
-      X_test <- df_get_X(dat_test)
-
-      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_hat, new_X = X_test)
-      h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_hat, new_X = X_test)
+      eta4_k <- estimate_conditional_expectation_kernlab_phi_core(
+        phi      = phi_hat,
+        new_X    = fc$X_test,
+        X_obs    = fc$train$X_obs,
+        l_obs    = fc$train$l_obs,
+        pi_p_obs = fc$train$pi_p_obs,
+        prep     = fc$train$prep_eta4
+      )
+      h4_k <- estimate_conditional_expectation_kernlab_theta_core(
+        phi      = phi_hat,
+        new_X    = fc$X_test,
+        X_obs    = fc$train$X_obs,
+        y_obs    = fc$train$y_obs,
+        l_obs    = fc$train$l_obs,
+        pi_p_obs = fc$train$pi_p_obs,
+        prep     = fc$train$prep_h4
+      )
 
       eta4_all[idx_test, ] <- eta4_k
       h4_all[idx_test]     <- h4_k
@@ -1578,18 +1819,26 @@ efficient_estimator_dml2 <- function(dat,
     }
   }
 
-  contrib_theta <- efficient_theta_contrib(dat_cf, phi_hat, h4_all)
+  # Precompute l for full sample for score/jacobian (fast path; output-identical)
+  X_cf <- df_get_X(dat_cf)
+  y_cf <- as.numeric(dat_cf$y)
+  l_cf <- df_make_l_matrix(X_cf, y_cf)
+  d_p_cf  <- as.numeric(dat_cf$d_p)
+  d_np_cf <- as.numeric(dat_cf$d_np)
+  pi_p_cf <- df_clip_prob(as.numeric(dat_cf$pi_p))
+
+  contrib_theta <- efficient_theta_contrib_fast(l_cf, y_cf, d_p_cf, d_np_cf, pi_p_cf, phi_hat, h4_all)
   theta_hat     <- mean(contrib_theta, na.rm = TRUE)
 
-  s_phi   <- df_score_phi_contrib(dat_cf, phi_hat, eta4_all)
+  s_phi   <- df_score_phi_contrib_fast(l_cf, d_p_cf, d_np_cf, pi_p_cf, phi_hat, eta4_all)
   s_theta <- as.numeric(contrib_theta - theta_hat)
 
   score_mat <- cbind(s_phi, s_theta)
 
-  g_phi_mean <- function(phi) colMeans(df_score_phi_contrib(dat_cf, phi, eta4_all), na.rm = TRUE)
+  g_phi_mean <- function(phi) colMeans(df_score_phi_contrib_fast(l_cf, d_p_cf, d_np_cf, pi_p_cf, phi, eta4_all), na.rm = TRUE)
   A11 <- df_numeric_jacobian(g_phi_mean, phi_hat)
 
-  g_theta_mean <- function(phi) mean(efficient_theta_contrib(dat_cf, phi, h4_all) - theta_hat, na.rm = TRUE)
+  g_theta_mean <- function(phi) mean(efficient_theta_contrib_fast(l_cf, y_cf, d_p_cf, d_np_cf, pi_p_cf, phi, h4_all) - theta_hat, na.rm = TRUE)
   A21 <- df_numeric_jacobian(g_theta_mean, phi_hat)
 
   A_hat <- rbind(
@@ -1688,17 +1937,64 @@ efficient_estimator_dml1 <- function(dat,
     idx_train <- setdiff(seq_len(n), idx_test)
     w_k[k]    <- length(idx_test) / n
 
-    dat_test  <- dat_cf[idx_test,  ]
-    dat_train <- dat_cf[idx_train, ]
+    dat_test  <- dat_cf[idx_test,  , drop = FALSE]
+    dat_train <- dat_cf[idx_train, , drop = FALSE]
+
+    X_test <- df_get_X(dat_test)
+    y_test <- as.numeric(dat_test$y)
+    l_test <- df_make_l_matrix(X_test, y_test)
+
+    d_p_test  <- as.numeric(dat_test$d_p)
+    d_np_test <- as.numeric(dat_test$d_np)
+    pi_p_test <- df_clip_prob(as.numeric(dat_test$pi_p))
+
+    # train cache for eta4/h4 (only if x_info=TRUE)
+    train_cache <- NULL
+    if (isTRUE(x_info)) {
+      X_all_tr <- df_get_X(dat_train)
+      idx_obs  <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+
+      X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
+      y_obs    <- as.numeric(dat_train$y[idx_obs])
+      pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
+      l_obs    <- df_make_l_matrix(X_obs, y_obs)
+
+      prep_eta4 <- df_krr_mixed_prepare(
+        X_train = X_obs,
+        sigma   = NULL,
+        context = "eta4*(X;phi) nuisance regression"
+      )
+      prep_h4 <- df_krr_mixed_prepare(
+        X_train = X_obs,
+        sigma   = NULL,
+        context = "h4*(X;phi) nuisance regression"
+      )
+
+      train_cache <- list(
+        X_obs     = X_obs,
+        y_obs     = y_obs,
+        pi_p_obs  = pi_p_obs,
+        l_obs     = l_obs,
+        prep_eta4 = prep_eta4,
+        prep_h4   = prep_h4
+      )
+    }
 
     ee_fun_k <- function(phi) {
-      X_test <- df_get_X(dat_test)
       eta4_k <- if (isTRUE(x_info)) {
-        estimate_conditional_expectation_kernlab_phi(dat_train, phi, new_X = X_test)
+        estimate_conditional_expectation_kernlab_phi_core(
+          phi      = phi,
+          new_X    = X_test,
+          X_obs    = train_cache$X_obs,
+          l_obs    = train_cache$l_obs,
+          pi_p_obs = train_cache$pi_p_obs,
+          prep     = train_cache$prep_eta4
+        )
       } else {
-        matrix(0, nrow = nrow(dat_test), ncol = p_phi)
+        matrix(0, nrow = nrow(l_test), ncol = p_phi)
       }
-      colMeans(df_score_phi_contrib(dat_test, phi, eta4_k), na.rm = TRUE)
+
+      colMeans(df_score_phi_contrib_fast(l_test, d_p_test, d_np_test, pi_p_test, phi, eta4_k), na.rm = TRUE)
     }
 
     attempt <- 0
@@ -1757,18 +2053,31 @@ efficient_estimator_dml1 <- function(dat,
 
     phi_k_mat[k, ] <- phi_k
 
-    X_test <- df_get_X(dat_test)
-
     if (isTRUE(x_info)) {
-      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_k, new_X = X_test)
-      h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_k, new_X = X_test)
+      eta4_k <- estimate_conditional_expectation_kernlab_phi_core(
+        phi      = phi_k,
+        new_X    = X_test,
+        X_obs    = train_cache$X_obs,
+        l_obs    = train_cache$l_obs,
+        pi_p_obs = train_cache$pi_p_obs,
+        prep     = train_cache$prep_eta4
+      )
+      h4_k <- estimate_conditional_expectation_kernlab_theta_core(
+        phi      = phi_k,
+        new_X    = X_test,
+        X_obs    = train_cache$X_obs,
+        y_obs    = train_cache$y_obs,
+        l_obs    = train_cache$l_obs,
+        pi_p_obs = train_cache$pi_p_obs,
+        prep     = train_cache$prep_h4
+      )
     } else {
-      eta4_k <- matrix(0, nrow = nrow(dat_test), ncol = p_phi)
-      h4_k   <- rep(0, nrow(dat_test))
+      eta4_k <- matrix(0, nrow = nrow(l_test), ncol = p_phi)
+      h4_k   <- rep(0, nrow(l_test))
     }
 
-    s_phi_k   <- df_score_phi_contrib(dat_test, phi_k, eta4_k)
-    contrib_k <- efficient_theta_contrib(dat_test, phi_k, h4_k)
+    s_phi_k   <- df_score_phi_contrib_fast(l_test, d_p_test, d_np_test, pi_p_test, phi_k, eta4_k)
+    contrib_k <- efficient_theta_contrib_fast(l_test, y_test, d_p_test, d_np_test, pi_p_test, phi_k, h4_k)
 
     contrib_all[idx_test] <- contrib_k
 
@@ -1777,10 +2086,10 @@ efficient_estimator_dml1 <- function(dat,
 
     score_k <- cbind(s_phi_k, s_theta_k)
 
-    g_phi_mean_k <- function(phi) colMeans(df_score_phi_contrib(dat_test, phi, eta4_k), na.rm = TRUE)
+    g_phi_mean_k <- function(phi) colMeans(df_score_phi_contrib_fast(l_test, d_p_test, d_np_test, pi_p_test, phi, eta4_k), na.rm = TRUE)
     A11_k <- df_numeric_jacobian(g_phi_mean_k, phi_k)
 
-    g_theta_mean_k <- function(phi) mean(efficient_theta_contrib(dat_test, phi, h4_k) - theta_k[k], na.rm = TRUE)
+    g_theta_mean_k <- function(phi) mean(efficient_theta_contrib_fast(l_test, y_test, d_p_test, d_np_test, pi_p_test, phi, h4_k) - theta_k[k], na.rm = TRUE)
     A21_k <- df_numeric_jacobian(g_theta_mean_k, phi_k)
 
     A_k <- rbind(
@@ -2140,4 +2449,3 @@ Eff_P <- function(dat,
                                  max_iter = max_iter, logit = logit, progress = progress,
                                  x_info = x_info)
 }
-
