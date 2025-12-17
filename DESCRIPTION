@@ -31,7 +31,6 @@ Depends:
 Imports:
     nleqslv,
     kernlab,
-    np,
     stats,
     utils,
     parallel

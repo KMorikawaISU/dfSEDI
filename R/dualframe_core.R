@@ -16,6 +16,12 @@
 ##  - Eff_P   : if y is binary and logit=TRUE (or logit=NULL auto-detect), mu(X) is estimated
 ##              by parametric logistic regression (glm binomial)
 ##
+## NEW: x_info flag (speed / (0,0)-absent setting)
+##  - x_info=TRUE  (default): keep the original behavior (estimate h4*, eta4* by KRR for Eff)
+##  - x_info=FALSE: assume no (d_np,d_p)=(0,0) units are available (or X unavailable there).
+##                  We then set h4*=eta4*=0 and skip their estimation entirely (faster).
+##                  Any (0,0) rows accidentally included are dropped inside wrappers.
+##
 ## Stability updates:
 ##  - RBF sigma estimation uses deterministic subsampling (reproducible)
 ##  - Probability clipping for pi_p, pi_np, pi_np_p to avoid Inf/NaN
@@ -73,6 +79,29 @@ df_floor_pos <- function(x, floor = NULL) {
   x[!is.finite(x)] <- floor
   x <- pmax(x, floor)
   x
+}
+
+# Apply x_info setting:
+#  - x_info=TRUE : keep dat as is
+#  - x_info=FALSE: drop any (d_p,d_np)=(0,0) rows (if present)
+df_apply_x_info <- function(dat, x_info = TRUE) {
+  if (isTRUE(x_info)) return(dat)
+  if (!is.data.frame(dat)) return(dat)
+  if (!all(c("d_p", "d_np") %in% names(dat))) return(dat)
+
+  d_p  <- as.numeric(dat$d_p)
+  d_np <- as.numeric(dat$d_np)
+  keep <- !(d_p == 0 & d_np == 0)
+
+  if (any(!keep, na.rm = TRUE)) {
+    # silent by default (speed path); set option to warn if desired
+    if (isTRUE(getOption("dfSEDI.warn_drop_00", FALSE))) {
+      warning(sprintf("dfSEDI: x_info=FALSE dropped %d rows with (d_p,d_np)=(0,0).",
+                      sum(!keep, na.rm = TRUE)), call. = FALSE)
+    }
+    dat <- dat[keep, , drop = FALSE]
+  }
+  dat
 }
 
 # Binary Y helpers ------------------------------------------------------------
@@ -1432,7 +1461,10 @@ efficient_estimator_dml2 <- function(dat,
                                      phi_start   = NULL,
                                      K           = 2,
                                      max_restart = 10,
-                                     progress    = FALSE) {
+                                     progress    = FALSE,
+                                     x_info      = TRUE) {
+  dat <- df_apply_x_info(dat, x_info)
+
   n <- nrow(dat)
   X <- df_get_X(dat)
   p_x <- ncol(X)
@@ -1459,7 +1491,12 @@ efficient_estimator_dml2 <- function(dat,
       dat_train <- dat_cf[idx_train, ]
 
       X_test <- df_get_X(dat_test)
-      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi, new_X = X_test)
+
+      eta4_k <- if (isTRUE(x_info)) {
+        estimate_conditional_expectation_kernlab_phi(dat_train, phi, new_X = X_test)
+      } else {
+        matrix(0, nrow = nrow(dat_test), ncol = p_phi)
+      }
 
       sphi_k <- df_score_phi_contrib(dat_test, phi, eta4_k)
       eq_k   <- colMeans(sphi_k, na.rm = TRUE)
@@ -1500,35 +1537,45 @@ efficient_estimator_dml2 <- function(dat,
 
   phi_hat <- as.numeric(res$par)
 
-  if (progress) {
-    cat("Step 3/3: cross-fitting nuisances for joint scores ...\n")
-    pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
-  }
-
   eta4_all <- matrix(NA_real_, nrow = n, ncol = p_phi)
   h4_all   <- rep(NA_real_, n)
 
-  for (k in seq_along(folds)) {
-    idx_test  <- folds[[k]]
-    idx_train <- setdiff(seq_len(n), idx_test)
+  if (isTRUE(x_info)) {
+    if (progress) {
+      cat("Step 3/3: cross-fitting nuisances for joint scores ...\n")
+      pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
+    }
 
-    dat_test  <- dat_cf[idx_test,  ]
-    dat_train <- dat_cf[idx_train, ]
+    for (k in seq_along(folds)) {
+      idx_test  <- folds[[k]]
+      idx_train <- setdiff(seq_len(n), idx_test)
 
-    X_test <- df_get_X(dat_test)
+      dat_test  <- dat_cf[idx_test,  ]
+      dat_train <- dat_cf[idx_train, ]
 
-    eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_hat, new_X = X_test)
-    h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_hat, new_X = X_test)
+      X_test <- df_get_X(dat_test)
 
-    eta4_all[idx_test, ] <- eta4_k
-    h4_all[idx_test]     <- h4_k
+      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_hat, new_X = X_test)
+      h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_hat, new_X = X_test)
 
-    if (progress) utils::setTxtProgressBar(pb, k)
-  }
+      eta4_all[idx_test, ] <- eta4_k
+      h4_all[idx_test]     <- h4_k
 
-  if (progress) {
-    close(pb)
-    cat("\n")
+      if (progress) utils::setTxtProgressBar(pb, k)
+    }
+
+    if (progress) {
+      close(pb)
+      cat("\n")
+    }
+  } else {
+    # x_info=FALSE: set augmentation terms to 0 and skip estimation (fast path)
+    eta4_all[,] <- 0
+    h4_all[] <- 0
+    if (progress) {
+      cat("Step 3/3: x_info=FALSE -> skip eta4*/h4* estimation (set to 0).\n")
+      flush.console()
+    }
   }
 
   contrib_theta <- efficient_theta_contrib(dat_cf, phi_hat, h4_all)
@@ -1589,6 +1636,8 @@ efficient_estimator_dml2 <- function(dat,
       phi_start   = phi_start,
       max_restart = max_restart,
       progress    = progress,
+      x_info      = isTRUE(x_info),
+      aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       convergence = res$convergence,
       theta_var_method = theta_var_method,
       sandwich_n_eff = js$n_eff
@@ -1604,7 +1653,10 @@ efficient_estimator_dml1 <- function(dat,
                                      phi_start   = NULL,
                                      K           = 2,
                                      max_restart = 10,
-                                     progress    = FALSE) {
+                                     progress    = FALSE,
+                                     x_info      = TRUE) {
+  dat <- df_apply_x_info(dat, x_info)
+
   n <- nrow(dat)
   X <- df_get_X(dat)
   p_x <- ncol(X)
@@ -1641,7 +1693,11 @@ efficient_estimator_dml1 <- function(dat,
 
     ee_fun_k <- function(phi) {
       X_test <- df_get_X(dat_test)
-      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi, new_X = X_test)
+      eta4_k <- if (isTRUE(x_info)) {
+        estimate_conditional_expectation_kernlab_phi(dat_train, phi, new_X = X_test)
+      } else {
+        matrix(0, nrow = nrow(dat_test), ncol = p_phi)
+      }
       colMeans(df_score_phi_contrib(dat_test, phi, eta4_k), na.rm = TRUE)
     }
 
@@ -1655,13 +1711,10 @@ efficient_estimator_dml1 <- function(dat,
     }
 
     phi_k <- NULL
-    used_fallback <- FALSE
 
     if (sol$termcd <= 2) {
       phi_k <- as.numeric(sol$x)
     } else {
-      used_fallback <- TRUE
-
       obj_k <- function(phi) {
         eq <- ee_fun_k(phi)
         if (any(!is.finite(eq))) return(big_penalty)
@@ -1705,8 +1758,14 @@ efficient_estimator_dml1 <- function(dat,
     phi_k_mat[k, ] <- phi_k
 
     X_test <- df_get_X(dat_test)
-    eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_k, new_X = X_test)
-    h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_k, new_X = X_test)
+
+    if (isTRUE(x_info)) {
+      eta4_k <- estimate_conditional_expectation_kernlab_phi(dat_train, phi_k, new_X = X_test)
+      h4_k   <- estimate_conditional_expectation_kernlab_theta(dat_train, phi_k, new_X = X_test)
+    } else {
+      eta4_k <- matrix(0, nrow = nrow(dat_test), ncol = p_phi)
+      h4_k   <- rep(0, nrow(dat_test))
+    }
 
     s_phi_k   <- df_score_phi_contrib(dat_test, phi_k, eta4_k)
     contrib_k <- efficient_theta_contrib(dat_test, phi_k, h4_k)
@@ -1750,7 +1809,8 @@ efficient_estimator_dml1 <- function(dat,
       var = NA_real_,
       se = NA_real_,
       ci = c(NA_real_, NA_real_),
-      info = list(type = "Eff", dml_type = "DML1", K = K, progress = progress)
+      info = list(type = "Eff", dml_type = "DML1", K = K, progress = progress,
+                  x_info = isTRUE(x_info))
     ))
   }
 
@@ -1812,6 +1872,8 @@ efficient_estimator_dml1 <- function(dat,
       phi_start   = phi_start,
       max_restart = max_restart,
       progress    = progress,
+      x_info      = isTRUE(x_info),
+      aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       theta_var_method = theta_var_method,
       n_contrib_eff = sum(is.finite(contrib_all))
     )
@@ -1833,7 +1895,9 @@ subefficient_contrib <- function(dat, mu_hat) {
     (1 - d_np) * (d_p / pi_p * y + (1 - d_p / pi_p) * mu)
 }
 
-subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, progress = FALSE) {
+subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, progress = FALSE, x_info = TRUE) {
+  dat <- df_apply_x_info(dat, x_info)
+
   n <- nrow(dat)
   folds <- make_folds(n, K)
 
@@ -1893,6 +1957,7 @@ subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, progress = FAL
        se    = theta_res$se,
        ci    = theta_res$ci,
        info  = list(type = "Eff_S", K = K, progress = progress,
+                    x_info = isTRUE(x_info),
                     logit = use_logit,
                     mu_model = if (isTRUE(use_logit)) "kernel_logistic" else "kernel_ridge"))
 }
@@ -1906,7 +1971,10 @@ efficient_parametric_estimator <- function(dat,
                                            eta4_star = 0,
                                            max_iter  = 20,
                                            logit     = NULL,
-                                           progress  = FALSE) {
+                                           progress  = FALSE,
+                                           x_info    = TRUE) {
+  dat <- df_apply_x_info(dat, x_info)
+
   X_all <- df_get_X(dat)
   p_x <- ncol(X_all)
   p_phi <- 1 + p_x + 1
@@ -1967,36 +2035,42 @@ efficient_parametric_estimator <- function(dat,
   } else {
     phi_hat <- as.numeric(sol$x)
 
-    subset_idx <- which(as.numeric(dat$d_np) == 1 | as.numeric(dat$d_p) == 1)
-    dat_sub <- dat[subset_idx, ]
-    X_sub <- df_get_X(dat_sub)
-
-    X_full <- df_get_X(dat)
-
-    if (isTRUE(use_logit)) {
-      y01_sub <- df_as_binary01(dat_sub$y)$y01
-      df_sub <- data.frame(y = y01_sub, X_sub)
-      colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
-
-      glm_fit <- stats::glm(y ~ ., data = df_sub, family = stats::binomial())
-
-      df_full <- data.frame(X_full)
-      colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
-      mu_hat <- as.numeric(stats::predict(glm_fit, newdata = df_full, type = "response"))
-      mu_hat <- df_clip_prob(mu_hat)
-
-      mu_model <- "parametric_logistic"
+    if (!isTRUE(x_info)) {
+      # x_info=FALSE: no need to fit working h4/mu model; set to 0 (fast path)
+      mu_hat <- rep(0, n)
+      mu_model <- "fixed_zero(x_info=FALSE)"
     } else {
-      df_sub <- data.frame(y = as.numeric(dat_sub$y), X_sub)
-      colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
+      subset_idx <- which(as.numeric(dat$d_np) == 1 | as.numeric(dat$d_p) == 1)
+      dat_sub <- dat[subset_idx, ]
+      X_sub <- df_get_X(dat_sub)
 
-      lm_fit <- stats::lm(y ~ ., data = df_sub)
+      X_full <- df_get_X(dat)
 
-      df_full <- data.frame(X_full)
-      colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
-      mu_hat <- as.numeric(stats::predict(lm_fit, newdata = df_full))
+      if (isTRUE(use_logit)) {
+        y01_sub <- df_as_binary01(dat_sub$y)$y01
+        df_sub <- data.frame(y = y01_sub, X_sub)
+        colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
 
-      mu_model <- "parametric_linear"
+        glm_fit <- stats::glm(y ~ ., data = df_sub, family = stats::binomial())
+
+        df_full <- data.frame(X_full)
+        colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
+        mu_hat <- as.numeric(stats::predict(glm_fit, newdata = df_full, type = "response"))
+        mu_hat <- df_clip_prob(mu_hat)
+
+        mu_model <- "parametric_logistic"
+      } else {
+        df_sub <- data.frame(y = as.numeric(dat_sub$y), X_sub)
+        colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
+
+        lm_fit <- stats::lm(y ~ ., data = df_sub)
+
+        df_full <- data.frame(X_full)
+        colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
+        mu_hat <- as.numeric(stats::predict(lm_fit, newdata = df_full))
+
+        mu_model <- "parametric_linear"
+      }
     }
 
     contrib <- efficient_theta_contrib(dat, phi_hat, h4_star_local = mu_hat)
@@ -2017,6 +2091,7 @@ efficient_parametric_estimator <- function(dat,
                   eta4_star = eta4_star,
                   max_iter  = max_iter,
                   progress  = progress,
+                  x_info    = isTRUE(x_info),
                   logit     = use_logit,
                   mu_model  = mu_model)
   )
@@ -2032,7 +2107,8 @@ Eff <- function(dat,
                 max_restart = 10,
                 type        = NULL,
                 dml_type    = 2,
-                progress    = interactive()) {
+                progress    = interactive(),
+                x_info      = TRUE) {
 
   if (!is.null(type)) dml_type <- type
 
@@ -2041,14 +2117,16 @@ Eff <- function(dat,
   if (!dml_type %in% c("DML1", "DML2")) stop("Eff(): dml_type must be 1, 2, 'DML1', or 'DML2'.")
 
   if (dml_type == "DML2") {
-    efficient_estimator_dml2(dat, phi_start = phi_start, K = K, max_restart = max_restart, progress = progress)
+    efficient_estimator_dml2(dat, phi_start = phi_start, K = K, max_restart = max_restart,
+                             progress = progress, x_info = x_info)
   } else {
-    efficient_estimator_dml1(dat, phi_start = phi_start, K = K, max_restart = max_restart, progress = progress)
+    efficient_estimator_dml1(dat, phi_start = phi_start, K = K, max_restart = max_restart,
+                             progress = progress, x_info = x_info)
   }
 }
 
-Eff_S <- function(dat, K = 2, logit = NULL, progress = interactive()) {
-  subefficient_estimator_dml2(dat, K = K, logit = logit, progress = progress)
+Eff_S <- function(dat, K = 2, logit = NULL, progress = interactive(), x_info = TRUE) {
+  subefficient_estimator_dml2(dat, K = K, logit = logit, progress = progress, x_info = x_info)
 }
 
 Eff_P <- function(dat,
@@ -2056,7 +2134,10 @@ Eff_P <- function(dat,
                   eta4_star = 0,
                   max_iter  = 20,
                   logit     = NULL,
-                  progress  = interactive()) {
+                  progress  = interactive(),
+                  x_info    = TRUE) {
   efficient_parametric_estimator(dat, phi_start = phi_start, eta4_star = eta4_star,
-                                 max_iter = max_iter, logit = logit, progress = progress)
+                                 max_iter = max_iter, logit = logit, progress = progress,
+                                 x_info = x_info)
 }
+

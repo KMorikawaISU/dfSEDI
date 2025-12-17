@@ -59,7 +59,45 @@ All core functions assume a data frame `dat` that contains at least:
 - `pi_p` : design inclusion probability for the probability sample
 - `pi_np` : (optional; simulations only) true NP inclusion probability
 
-### Mixed continuous/discrete covariates (automatic)
+### Important: handling the $(d_{np}, d_p) = (0,0)$ pattern (`x_info`)
+
+In the paper’s notation, there are four response patterns
+$(\delta_{NP}, \delta_P)\in\{0,1\}^2$. In many *practical*
+data-integration tasks you only have units that appear in *either* the
+probability sample or the non-probability sample, i.e. you only observe
+the union sample $\delta_{NP}\cup\delta_P = 1$. In that common case,
+there are **no rows** with $(d_{np}, d_p)=(0,0)$.
+
+The paper also notes that the theory covers the case where $X$ is
+unavailable when $(\delta_{NP},\delta_P)=(0,0)$; in that case, it
+suffices to set the augmentation functions $h_4^*(X)$ and $\eta_4^*(X)$
+to zero.
+
+dfSEDI exposes this choice via the flag `x_info`:
+
+- `x_info = FALSE` (**recommended default for most users**):  
+  Use the simplified formulation with $h_4^*(X)=\eta_4^*(X)=0$.  
+  This mode is intended for the common situation where you only have the
+  union sample, or you do not have covariates $X$ for $(0,0)$ units. It
+  also avoids any computations that would require summing over
+  $(d_{np},d_p)=(0,0)$ and can be substantially faster.
+
+- `x_info = TRUE`:  
+  Use the full formulation as written in the main text of the paper.  
+  This is appropriate if you explicitly include $(0,0)$ units in `dat`
+  **and** you have $X$ for those units (e.g., simulation studies, or
+  settings with a population register providing $X$).
+
+> Practical tip: If your input data include only sampled units (union
+> sample), you can create it as:
+>
+> ``` r
+> dat_union <- subset(dat, d_np == 1 | d_p == 1)
+> ```
+
+------------------------------------------------------------------------
+
+## Mixed continuous/discrete covariates (automatic)
 
 dfSEDI estimates nuisance functions (e.g., $\mu(X)=E[Y\mid X]$, $\pi_P$,
 $\eta_4^*(X)$, $h_4^*(X)$) using kernel methods.
@@ -137,6 +175,46 @@ dat$X <- data.frame(
 )
 ```
 
+### Example A (typical): union sample only (`x_info = FALSE`)
+
+If you want to mimic the most common real-data situation where you only
+observe the union sample:
+
+``` r
+dat_union <- subset(dat, d_np == 1 | d_p == 1)
+
+fit_eff_union <- Eff(
+  dat         = dat_union,
+  K           = 2,
+  type        = 2,      # DML2
+  x_info      = FALSE,
+  progress    = TRUE
+)
+
+fit_eff_union$theta
+fit_eff_union$se
+fit_eff_union$ci
+```
+
+### Example B (simulation / full info): include $(0,0)$ rows (`x_info = TRUE`)
+
+For simulation studies where you keep the full population-like data
+structure:
+
+``` r
+fit_eff_full <- Eff(
+  dat         = dat,
+  K           = 2,
+  type        = 2,      # DML2
+  x_info      = TRUE,
+  progress    = TRUE
+)
+
+fit_eff_full$theta
+fit_eff_full$se
+fit_eff_full$ci
+```
+
 ------------------------------------------------------------------------
 
 ## Eff: DML1
@@ -159,6 +237,7 @@ fit_eff_dml1 <- Eff(
   type        = 1,      # DML1
   phi_start   = NULL,
   max_restart = 10,
+  x_info      = TRUE,   # or FALSE if you only have the union sample
   progress    = TRUE
 )
 
@@ -185,6 +264,7 @@ fit_eff_dml2 <- Eff(
   type        = 2,      # DML2
   phi_start   = NULL,
   max_restart = 10,
+  x_info      = TRUE,   # or FALSE if you only have the union sample
   progress    = TRUE
 )
 
@@ -200,7 +280,9 @@ $\phi$ (`phi_se`, `phi_ci`).
 
 > Tip: DML2 can be substantially slower than DML1, especially with mixed
 > (continuous/categorical) covariates, because the objective for $\phi$
-> may refit nuisance regressions many times.
+> may refit nuisance regressions many times.  
+> If you do not have $(0,0)$ units / do not have $X$ for them, using
+> `x_info = FALSE` can be much faster.
 
 ------------------------------------------------------------------------
 

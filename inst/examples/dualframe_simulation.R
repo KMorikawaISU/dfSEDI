@@ -1,7 +1,8 @@
+############################################################
 ## inst/examples/dualframe_simulation.R
+############################################################
 
 library(dfSEDI)
-
 
 generate_dualframe_population <- function(N) {
   # Continuous and discrete covariates
@@ -40,10 +41,16 @@ generate_dualframe_population <- function(N) {
 simulate_one_replication <- function(seed,
                                      N        = 10000,
                                      K        = 2,
-                                     progress = FALSE) {
+                                     progress = FALSE,
+                                     x_info   = TRUE) {
 
   set.seed(seed)
   dat <- generate_dualframe_population(N)
+
+  # If you want to emulate "no (0,0) units observed", you can set x_info=FALSE:
+  # dat <- dat[dat$d_np == 1 | dat$d_p == 1, , drop = FALSE]
+  # The estimators below also accept x_info and will drop (0,0) internally.
+  # (But note: SM is then a sample mean, not a population mean.)
 
   # Simple mean (SM)
   res_SM <- df_sandwich_from_contrib(dat$y)
@@ -57,23 +64,26 @@ simulate_one_replication <- function(seed,
   fit_Eff <- Eff(
     dat         = dat,
     K           = K,
-    phi_start   = NULL,    # or c(-2.15, -0.5, -0.75)
+    phi_start   = NULL,
     max_restart = 10,
-    progress    = progress
+    progress    = progress,
+    x_info      = x_info
   )
 
   fit_EffS <- Eff_S(
     dat      = dat,
     K        = K,
-    progress = progress
+    progress = progress,
+    x_info   = x_info
   )
 
   fit_EffP <- Eff_P(
     dat       = dat,
-    phi_start = NULL,      # or c(-2.15, -0.5, -0.75)
+    phi_start = NULL,
     eta4_star = 0,
     max_iter  = 20,
-    progress  = progress
+    progress  = progress,
+    x_info    = x_info
   )
 
   # Collect theta (point estimates)
@@ -97,7 +107,7 @@ simulate_one_replication <- function(seed,
 ## main(): single dataset test, no Monte Carlo
 ############################################################
 
-main <- function(N = 10000, K = 2) {
+main <- function(N = 10000, K = 2, x_info = TRUE) {
 
   dat <- generate_dualframe_population(N)
 
@@ -108,9 +118,10 @@ main <- function(N = 10000, K = 2) {
   fit_eff <- Eff(
     dat         = dat,
     K           = K,
-    phi_start   = phi_true,   # start from true value (optional)
+    phi_start   = phi_true,
     max_restart = 10,
-    progress    = TRUE
+    progress    = TRUE,
+    x_info      = x_info
   )
 
   cat("\n=== Eff ===\n")
@@ -123,7 +134,8 @@ main <- function(N = 10000, K = 2) {
   fit_effS <- Eff_S(
     dat      = dat,
     K        = K,
-    progress = TRUE
+    progress = TRUE,
+    x_info   = x_info
   )
 
   cat("\n=== Eff_S ===\n")
@@ -137,7 +149,8 @@ main <- function(N = 10000, K = 2) {
     phi_start = phi_true,
     eta4_star = 0,
     max_iter  = 20,
-    progress  = TRUE
+    progress  = TRUE,
+    x_info    = x_info
   )
 
   cat("\n=== Eff_P ===\n")
