@@ -9,7 +9,7 @@ dfSEDI implements semiparametric efficient data integration methods for dual-fra
 
 Main user-facing estimators:
 
-- `Eff`     : semiparametric efficient estimator (supports DML1 / DML2, K-fold)
+- `Eff`     : semiparametric efficient estimator (**default: DML1**, supports DML1 / DML2, K-fold)
 - `Eff_S`   : sub-efficient estimator (Remark 6-type, K-fold)
 - `Eff_P`   : parametric efficient estimator (working model)
 
@@ -66,11 +66,11 @@ in that case, it suffices to set the augmentation functions \(h_4^*(X)\) and \(\
 
 dfSEDI exposes this choice via the flag `x_info`:
 
-- `x_info = FALSE` (**recommended default for most users**):  
+- `x_info = FALSE` (**recommended for most real-data use cases**):  
   Use the simplified formulation with \(h_4^*(X)=\eta_4^*(X)=0\).  
   This mode is intended for the common situation where you only have the union sample,
-  or you do not have covariates \(X\) for \((0,0)\) units. It also avoids any computations
-  that would require summing over \((d_{np},d_p)=(0,0)\) and can be substantially faster.
+  or you do not have covariates \(X\) for \((0,0)\) units. It also avoids computations
+  involving the \((0,0)\) pattern and can be substantially faster.
 
 - `x_info = TRUE`:  
   Use the full formulation as written in the main text of the paper.  
@@ -155,10 +155,10 @@ If you want to mimic the most common real-data situation where you only observe 
 ```r
 dat_union <- subset(dat, d_np == 1 | d_p == 1)
 
+# Eff uses DML1 by default (faster).
 fit_eff_union <- Eff(
   dat         = dat_union,
-  K           = 2,
-  type        = 2,      # DML2
+  K           = 3,
   x_info      = FALSE,
   progress    = TRUE
 )
@@ -166,6 +166,7 @@ fit_eff_union <- Eff(
 fit_eff_union$theta
 fit_eff_union$se
 fit_eff_union$ci
+fit_eff_union$info
 ```
 
 ### Example B (simulation / full info): include \((0,0)\) rows (`x_info = TRUE`)
@@ -173,10 +174,10 @@ fit_eff_union$ci
 For simulation studies where you keep the full population-like data structure:
 
 ```r
+# Eff uses DML1 by default (faster).
 fit_eff_full <- Eff(
   dat         = dat,
-  K           = 2,
-  type        = 2,      # DML2
+  K           = 3,
   x_info      = TRUE,
   progress    = TRUE
 )
@@ -184,11 +185,24 @@ fit_eff_full <- Eff(
 fit_eff_full$theta
 fit_eff_full$se
 fit_eff_full$ci
+fit_eff_full$info
 ```
 
 ---
 
-## Eff: DML1
+## Eff: DML (DML1 default)
+
+`Eff()` supports two DML variants:
+
+- `type = 1` (or `"DML1"`) : **DML1 (default; usually faster)**
+- `type = 2` (or `"DML2"`) : DML2 (optional; can be slower)
+
+Why DML1 is typically faster in practice:
+
+- DML1 estimates fold-specific quantities and aggregates them.
+- DML2 can require evaluating an objective for \(\phi\) many times; depending on the nuisance models, this may refit expensive regressions repeatedly.
+
+### Eff: DML1 (default)
 
 DML1 conceptually computes fold-specific estimates and aggregates them:
 
@@ -198,13 +212,13 @@ DML1 conceptually computes fold-specific estimates and aggregates them:
   - compute fold-specific estimates on test fold \(k\)
 - aggregate fold-specific estimates across \(k\)
 
-DML1 example:
+DML1 example (default):
 
 ```r
 fit_eff_dml1 <- Eff(
   dat         = dat,
   K           = 3,
-  type        = 1,      # DML1
+  # type      = 1,      # optional (DML1 is the default)
   phi_start   = NULL,
   max_restart = 10,
   x_info      = TRUE,   # or FALSE if you only have the union sample
@@ -218,12 +232,7 @@ fit_eff_dml1$ci
 fit_eff_dml1$info
 ```
 
----
-
-## Eff: DML2
-
-- `type = 1` (or `"DML1"`) : DML1
-- `type = 2` (or `"DML2"`) : DML2 (default)
+### Eff: DML2 (optional)
 
 DML2 example:
 
@@ -248,8 +257,52 @@ fit_eff_dml2$info
 Eff returns joint sandwich-based standard errors for both \(\theta\) and \(\phi\)
 (`phi_se`, `phi_ci`).
 
-> Tip: DML2 can be substantially slower than DML1, especially with mixed (continuous/categorical) covariates, because the objective for \(\phi\) may refit nuisance regressions many times.  
-> If you do not have \((0,0)\) units / do not have \(X\) for them, using `x_info = FALSE` can be much faster.
+> Tip: If you do not have \((0,0)\) units / do not have \(X\) for them, using `x_info = FALSE` can be much faster.
+> This is common when your dataset is the union sample only.
+
+---
+
+## Comparison estimators (P / NP / NP ∪ P)
+
+For simulations, it is sometimes useful to compare `Eff` against simpler estimators:
+
+- `df_estimate_P()`     : probability-only estimator (HT-type)
+- `df_estimate_NP()`    : non-probability-only estimator (Chang & Kott-type)
+- `df_estimate_NP_P()`  : NP union P estimator (Chang & Kott-type)
+
+These are mainly intended for **simulation settings** where `dat` contains a “population-like”
+structure (including \((0,0)\) units) and `pi_p` is defined for the full frame.
+
+Example:
+
+```r
+# Probability-only (HT-type)
+fit_P <- df_estimate_P(dat)
+
+# Non-probability-only (Chang & Kott-type)
+fit_NP <- df_estimate_NP(dat)
+
+# NP union P (Chang & Kott-type)
+fit_NP_P <- df_estimate_NP_P(dat)
+
+c(
+  Eff   = fit_eff_full$theta,
+  P     = fit_P$theta,
+  NP    = fit_NP$theta,
+  NP_P  = fit_NP_P$theta
+)
+```
+
+Each returns `theta`, `se`, `ci`:
+
+```r
+fit_P$theta;    fit_P$se;    fit_P$ci
+fit_NP$theta;   fit_NP$se;   fit_NP$ci
+fit_NP_P$theta; fit_NP_P$se; fit_NP_P$ci
+```
+
+> Note: `df_estimate_NP()` / `df_estimate_NP_P()` solve estimating equations and may return `NA`
+> if the solver fails to converge. This is expected in some small samples or unstable designs.
 
 ---
 
