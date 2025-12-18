@@ -149,14 +149,7 @@ base_fun <- function(X) {
 }
 ```
 
-To reproduce an older “include `y` as the last column” design (advanced; uses a closure):
 
-```r
-y_vec <- as.numeric(dat$y)
-base_fun <- function(X) {
-  cbind(1, X, y_vec)
-}
-```
 
 > Tip: If you use a closure like this, make sure `base_fun` is defined for the same `dat` you pass into `df_estimate_NP()` / `df_estimate_NP_P()`.
 
