@@ -158,7 +158,7 @@ user-supplied basis function:
 - `base_fun(X)` must return a **numeric matrix** with shape:
 
 $$
-B = \operatorname{base\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
+B = \texttt{base\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
 $$
 
 ### Strict validation
