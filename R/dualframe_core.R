@@ -290,6 +290,88 @@ df_make_l_matrix <- function(X, y) {
   l
 }
 
+# Evaluate and validate base_fun(X) for pi_np estimation (strict checks).
+# Expected convention in this file: X is n x p and base_fun(X) returns n x (p+2).
+df_eval_base_fun <- function(base_fun,
+                             X,
+                             expected_ncol = NULL,
+                             context = "base_fun") {
+  if (!is.function(base_fun)) {
+    stop(context, ": `base_fun` must be a function.", call. = FALSE)
+  }
+
+  X <- as.matrix(X)
+  n <- nrow(X)
+
+  b_raw <- tryCatch(
+    base_fun(X),
+    error = function(e) {
+      stop(context, ": base_fun(X) failed: ", conditionMessage(e), call. = FALSE)
+    }
+  )
+
+  if (is.data.frame(b_raw)) b_raw <- as.matrix(b_raw)
+
+  # Allow a length-n vector (treated as a single-column basis)
+  if (is.null(dim(b_raw))) {
+    if (length(b_raw) == n) {
+      b_raw <- matrix(b_raw, nrow = n, ncol = 1)
+    } else {
+      stop(
+        context, ": base_fun(X) returned a vector of length ", length(b_raw),
+        " but expected length ", n, " (nrow(X)).",
+        call. = FALSE
+      )
+    }
+  }
+
+  if (!is.matrix(b_raw)) {
+    stop(context, ": base_fun(X) must return a matrix (or a data.frame coercible to matrix).",
+         call. = FALSE)
+  }
+
+  if (nrow(b_raw) != n) {
+    stop(
+      context, ": base_fun(X) must have the same number of rows as X.\n",
+      "nrow(X) = ", n, ", but nrow(base_fun(X)) = ", nrow(b_raw), ".",
+      call. = FALSE
+    )
+  }
+
+  if (ncol(b_raw) < 1L) {
+    stop(context, ": base_fun(X) must have at least 1 column.", call. = FALSE)
+  }
+
+  if (!is.null(expected_ncol)) {
+    expected_ncol <- as.integer(expected_ncol)[1]
+    if (is.finite(expected_ncol) && expected_ncol >= 1L) {
+      if (ncol(b_raw) != expected_ncol) {
+        stop(
+          context, ": unexpected number of columns in base_fun(X).\n",
+          "Expected ", expected_ncol, " columns, but got ", ncol(b_raw), ".",
+          call. = FALSE
+        )
+      }
+    }
+  }
+
+  b <- as.matrix(b_raw)
+  storage.mode(b) <- "numeric"
+
+  if (any(!is.finite(b))) {
+    idx <- which(!is.finite(b), arr.ind = TRUE)
+    show <- idx[seq_len(min(5L, nrow(idx))), , drop = FALSE]
+    show_txt <- paste(apply(show, 1, function(rc) paste0("(", rc[1], ",", rc[2], ")")), collapse = ", ")
+    stop(
+      context, ": base_fun(X) must return finite numeric values (no NA/Inf).\n",
+      "Example non-finite positions (row,col): ", show_txt, ".",
+      call. = FALSE
+    )
+  }
+
+  b
+}
+
 df_kernlab_predict <- function(model, newdata) {
   newdata <- as.matrix(newdata)
 
@@ -1017,46 +1099,105 @@ df_joint_sandwich <- function(score_mat, A_hat) {
 }
 
 ############################################################
-## 1. Basis functions
-############################################################
-
-g2 <- function(dat) {
-  X <- df_get_X(dat)
-  cbind(1, X, as.numeric(dat$y))
-}
-g3 <- g2
-g4 <- g2
-
-############################################################
 ## 2. Chang & Kott estimating eq.
 ############################################################
 
-pi_np.est_simple <- function(dat, h2, h3, h4, p.use = TRUE) {
-  function(phi) {
-    phi <- as.numeric(phi)
-    X    <- df_get_X(dat)
-    y    <- as.numeric(dat$y)
-    l    <- as.matrix(cbind(1, X, y))
-    pi_p <- df_clip_prob(as.numeric(dat$pi_p))
+pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
 
-    eta   <- as.numeric(l %*% phi)
-    pi_np <- df_clip_prob(1 / (1 + exp(-eta)))
+  if (!is.data.frame(dat)) {
+    stop("pi_np.est_simple(): `dat` must be a data.frame.", call. = FALSE)
+  }
+  if (!is.function(base_fun)) {
+    stop("pi_np.est_simple(): `base_fun` must be a function.", call. = FALSE)
+  }
 
-    d_p  <- as.numeric(dat$d_p)
-    d_np <- as.numeric(dat$d_np)
+  # Required columns in dat
+  need <- c("d_np")
+  if (isTRUE(p.use)) need <- c(need, "d_p", "pi_p")
+  if (!all(need %in% names(dat))) {
+    miss <- setdiff(need, names(dat))
+    stop("pi_np.est_simple(): missing required columns in `dat`: ",
+         paste(miss, collapse = ", "), call. = FALSE)
+  }
 
-    if (p.use) {
-      denom  <- df_clip_prob(pi_p + pi_np - pi_p * pi_np)
-      d_set4 <- matrix(1 - (d_p + d_np - d_p * d_np) / denom,
-                       nrow = nrow(dat), ncol = 1)
-    } else {
-      d_set4 <- matrix(1 - d_np / pi_np,
-                       nrow = nrow(dat), ncol = 1)
+  # Cache objects that do not depend on phi
+  X <- df_get_X(dat)
+
+  # Enforce the convention: X is n x p  => base_fun(X) must be n x (p+2)
+  expected_k <- ncol(X) + 2L
+
+  b_mat <- df_eval_base_fun(
+    base_fun,
+    X,
+    expected_ncol = expected_k,
+    context = "pi_np.est_simple()/base_fun"
+  )
+
+  n <- nrow(b_mat)
+
+  d_np <- as.numeric(dat$d_np)
+  if (length(d_np) != n) {
+    stop("pi_np.est_simple(): length(d_np) must equal nrow(dat).", call. = FALSE)
+  }
+  if (any(!is.finite(d_np))) {
+    stop("pi_np.est_simple(): `d_np` contains NA/Inf.", call. = FALSE)
+  }
+  if (any(!(d_np %in% c(0, 1)))) {
+    stop("pi_np.est_simple(): `d_np` must be coded as 0/1 (or logical).", call. = FALSE)
+  }
+
+  d_p <- NULL
+  pi_p <- NULL
+  if (isTRUE(p.use)) {
+    d_p <- as.numeric(dat$d_p)
+    if (length(d_p) != n) {
+      stop("pi_np.est_simple(): length(d_p) must equal nrow(dat).", call. = FALSE)
+    }
+    if (any(!is.finite(d_p))) {
+      stop("pi_np.est_simple(): `d_p` contains NA/Inf.", call. = FALSE)
+    }
+    if (any(!(d_p %in% c(0, 1)))) {
+      stop("pi_np.est_simple(): `d_p` must be coded as 0/1 (or logical).", call. = FALSE)
     }
 
-    H4     <- as.matrix(h4(dat))
-    est_eq <- t(H4) %*% d_set4
-    as.numeric(est_eq)
+    pi_p <- df_clip_prob(as.numeric(dat$pi_p))
+    if (length(pi_p) != n) {
+      stop("pi_np.est_simple(): length(pi_p) must equal nrow(dat).", call. = FALSE)
+    }
+    if (any(!is.finite(pi_p))) {
+      stop(
+        "pi_np.est_simple(): `pi_p` contains NA/Inf.\n",
+        "Impute missing pi_p (e.g., via impute_pi_p_crossfit()) before calling pi_np.est_simple(..., p.use=TRUE).",
+        call. = FALSE
+      )
+    }
+  }
+
+  function(phi) {
+    phi <- as.numeric(phi)
+
+    if (length(phi) != ncol(b_mat)) {
+      stop(
+        sprintf("pi_np.est_simple(): length(phi)=%d but ncol(base_fun(X))=%d.",
+                length(phi), ncol(b_mat)),
+        call. = FALSE
+      )
+    }
+    if (any(!is.finite(phi))) {
+      stop("pi_np.est_simple(): `phi` contains NA/Inf.", call. = FALSE)
+    }
+
+    eta   <- as.numeric(b_mat %*% phi)
+    pi_np <- df_clip_prob(plogis(eta))
+
+    if (isTRUE(p.use)) {
+      denom  <- df_clip_prob(pi_p + pi_np - pi_p * pi_np)
+      d_set4 <- 1 - (d_p + d_np - d_p * d_np) / denom
+    } else {
+      d_set4 <- 1 - d_np / pi_np
+    }
+
+    as.numeric(crossprod(b_mat, d_set4))
   }
 }
 
@@ -1538,70 +1679,149 @@ df_estimate_P <- function(dat) {
   list(theta = theta_res$theta, var = theta_res$var, se = theta_res$se, ci = theta_res$ci)
 }
 
-df_estimate_NP <- function(dat, phi_start = NULL, max_iter = 20) {
-  X <- df_get_X(dat)
-  p <- ncol(X)
+df_estimate_NP <- function(dat, base_fun, phi_start = NULL, max_iter = 20) {
 
-  if (is.null(phi_start)) {
-    phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p), 0)
+  if (missing(base_fun) || is.null(base_fun) || !is.function(base_fun)) {
+    stop("df_estimate_NP(): please supply `base_fun` (a function mapping X -> n x (p+2) basis matrix).",
+         call. = FALSE)
   }
+
+  X <- df_get_X(dat)
+  expected_k <- ncol(X) + 2L
+
+  # Validate base_fun output early (strict)
+  b_mat <- df_eval_base_fun(
+    base_fun,
+    X,
+    expected_ncol = expected_k,
+    context = "df_estimate_NP()/base_fun"
+  )
+  p_phi <- ncol(b_mat)
+
+  # Default start: logit(mean(d_np)) for the first coefficient, others = 0
+  if (is.null(phi_start)) {
+    p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
+    phi_start <- c(stats::qlogis(p0), rep(0, p_phi - 1L))
+  } else {
+    phi_start <- as.numeric(phi_start)
+    if (length(phi_start) != p_phi) {
+      stop(sprintf("df_estimate_NP(): length(phi_start)=%d but ncol(base_fun(X))=%d.",
+                   length(phi_start), p_phi),
+           call. = FALSE)
+    }
+    if (any(!is.finite(phi_start))) {
+      stop("df_estimate_NP(): `phi_start` contains NA/Inf.", call. = FALSE)
+    }
+  }
+
+  ee_fun <- pi_np.est_simple(dat, base_fun, p.use = FALSE)
 
   phi_est <- list(termcd = 99)
   it <- 0
   while (phi_est$termcd > 2 && it < max_iter) {
-    init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
-    phi_est <- nleqslv::nleqslv(init, pi_np.est_simple(dat, g2, g3, g4, p.use = FALSE))
+    init <- phi_start + stats::runif(p_phi, -0.1, 0.1)
+    phi_est <- nleqslv::nleqslv(init, ee_fun)
     it <- it + 1
   }
 
   if (phi_est$termcd > 2) {
-    phi_hat   <- rep(NA_real_, length(phi_start))
+    phi_hat   <- rep(NA_real_, p_phi)
     theta_res <- df_sandwich_from_contrib(rep(NA_real_, nrow(dat)))
   } else {
     phi_hat <- as.numeric(phi_est$x)
-    l       <- as.matrix(cbind(1, X, as.numeric(dat$y)))
-    pi_np   <- df_clip_prob(1 / (1 + exp(-as.numeric(l %*% phi_hat))))
-    contrib <- as.numeric(dat$d_np) * as.numeric(dat$y) / pi_np
+
+    # Use the same basis as in the estimating equation
+    eta   <- as.numeric(b_mat %*% phi_hat)
+    pi_np <- df_clip_prob(plogis(eta))
+
+    contrib   <- as.numeric(dat$d_np) * as.numeric(dat$y) / pi_np
     theta_res <- df_sandwich_from_contrib(contrib)
   }
 
-  list(phi = phi_hat, theta = theta_res$theta, var = theta_res$var, se = theta_res$se, ci = theta_res$ci)
+  list(phi = phi_hat,
+       theta = theta_res$theta,
+       var = theta_res$var,
+       se = theta_res$se,
+       ci = theta_res$ci)
 }
 
-df_estimate_NP_P <- function(dat, phi_start = NULL, max_iter = 20) {
+df_estimate_NP_P <- function(dat, base_fun, phi_start = NULL, max_iter = 20) {
+
+  if (missing(base_fun) || is.null(base_fun) || !is.function(base_fun)) {
+    stop("df_estimate_NP_P(): please supply `base_fun` (a function mapping X -> n x (p+2) basis matrix).",
+         call. = FALSE)
+  }
+
   X <- df_get_X(dat)
-  p <- ncol(X)
+  expected_k <- ncol(X) + 2L
+
+  # Validate base_fun output early (strict)
+  b_mat <- df_eval_base_fun(
+    base_fun,
+    X,
+    expected_ncol = expected_k,
+    context = "df_estimate_NP_P()/base_fun"
+  )
+  p_phi <- ncol(b_mat)
+
+  # pi_p must be fully finite for p.use=TRUE
+  pi_p <- df_clip_prob(as.numeric(dat$pi_p))
+  if (any(!is.finite(pi_p))) {
+    stop(
+      "df_estimate_NP_P(): `pi_p` contains NA/Inf.\n",
+      "Impute missing pi_p first (e.g., impute_pi_p_crossfit()) before calling df_estimate_NP_P().",
+      call. = FALSE
+    )
+  }
 
   if (is.null(phi_start)) {
-    phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p), 0)
+    p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
+    phi_start <- c(stats::qlogis(p0), rep(0, p_phi - 1L))
+  } else {
+    phi_start <- as.numeric(phi_start)
+    if (length(phi_start) != p_phi) {
+      stop(sprintf("df_estimate_NP_P(): length(phi_start)=%d but ncol(base_fun(X))=%d.",
+                   length(phi_start), p_phi),
+           call. = FALSE)
+    }
+    if (any(!is.finite(phi_start))) {
+      stop("df_estimate_NP_P(): `phi_start` contains NA/Inf.", call. = FALSE)
+    }
   }
+
+  ee_fun <- pi_np.est_simple(dat, base_fun, p.use = TRUE)
 
   phi_est <- list(termcd = 99)
   it <- 0
   while (phi_est$termcd > 2 && it < max_iter) {
-    init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
-    phi_est <- nleqslv::nleqslv(init, pi_np.est_simple(dat, g2, g3, g4, p.use = TRUE))
+    init <- phi_start + stats::runif(p_phi, -0.1, 0.1)
+    phi_est <- nleqslv::nleqslv(init, ee_fun)
     it <- it + 1
   }
 
   if (phi_est$termcd > 2) {
-    phi_hat   <- rep(NA_real_, length(phi_start))
+    phi_hat   <- rep(NA_real_, p_phi)
     theta_res <- df_sandwich_from_contrib(rep(NA_real_, nrow(dat)))
   } else {
     phi_hat <- as.numeric(phi_est$x)
-    l       <- as.matrix(cbind(1, X, as.numeric(dat$y)))
-    pi_np   <- df_clip_prob(1 / (1 + exp(-as.numeric(l %*% phi_hat))))
 
-    pi_p  <- df_clip_prob(as.numeric(dat$pi_p))
+    # Use the same basis as in the estimating equation
+    eta   <- as.numeric(b_mat %*% phi_hat)
+    pi_np <- df_clip_prob(plogis(eta))
+
     d_np  <- as.numeric(dat$d_np)
     d_p   <- as.numeric(dat$d_p)
     denom <- df_clip_prob(pi_np + pi_p - pi_np * pi_p)
 
-    contrib <- as.numeric(dat$y) * (d_np + d_p - d_np * d_p) / denom
+    contrib   <- as.numeric(dat$y) * (d_np + d_p - d_np * d_p) / denom
     theta_res <- df_sandwich_from_contrib(contrib)
   }
 
-  list(phi = phi_hat, theta = theta_res$theta, var = theta_res$var, se = theta_res$se, ci = theta_res$ci)
+  list(phi = phi_hat,
+       theta = theta_res$theta,
+       var = theta_res$var,
+       se = theta_res$se,
+       ci = theta_res$ci)
 }
 
 ############################################################
