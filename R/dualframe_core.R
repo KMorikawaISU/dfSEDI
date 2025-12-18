@@ -2635,7 +2635,7 @@ Eff <- function(dat,
                 phi_start   = NULL,
                 max_restart = 10,
                 type        = NULL,
-                dml_type    = 2,
+                dml_type    = 1,
                 progress    = interactive(),
                 x_info      = TRUE) {
 
