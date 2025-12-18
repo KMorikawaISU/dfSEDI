@@ -22,6 +22,13 @@
 ##                  We then set h4*=eta4*=0 and skip their estimation entirely (faster).
 ##                  Any (0,0) rows accidentally included are dropped inside wrappers.
 ##
+## NEW (population size + Hajek option; output-preserving by default):
+##  - df_estimate_P(), df_estimate_NP(), df_estimate_NP_P() now accept:
+##      N     : population size (frame size). Required if dat does NOT include (d_p,d_np)=(0,0) rows
+##              and hajek=FALSE.
+##      hajek : if TRUE, compute the Hajek (ratio) version of the estimator (does not require N).
+##  - Default behavior is unchanged when full frame data are provided (N is inferred as nrow(dat)).
+##
 ## Stability updates:
 ##  - RBF sigma estimation uses deterministic subsampling (reproducible)
 ##  - Probability clipping for pi_p, pi_np, pi_np_p to avoid Inf/NaN
@@ -1672,14 +1679,159 @@ df_sandwich_from_contrib <- function(contrib, level = 0.95) {
   list(theta = theta_hat, var = var_hat, se = se_hat, ci = ci, n_eff = n)
 }
 
-df_estimate_P <- function(dat) {
+# --- NEW: population size + Hajek helpers (used only when N is supplied or hajek=TRUE) ---
+
+df_parse_population_N <- function(N) {
+  if (is.null(N)) return(NULL)
+  if (length(N) == 0L) return(NULL)
+
+  if (is.character(N)) {
+    N0 <- gsub("[,[:space:]]", "", N[1])
+    N <- suppressWarnings(as.numeric(N0))
+  } else {
+    N <- as.numeric(N)[1]
+  }
+
+  if (!is.finite(N) || N <= 0) {
+    stop("Population size `N` must be a positive finite number.", call. = FALSE)
+  }
+
+  if (abs(N - round(N)) > 1e-8) {
+    warning("`N` was not an integer; rounding to the nearest integer.", call. = FALSE)
+  }
+
+  as.numeric(round(N))
+}
+
+df_dat_has_frame_units <- function(dat) {
+  if (!is.data.frame(dat)) return(FALSE)
+  if (!all(c("d_p", "d_np") %in% names(dat))) return(FALSE)
+  d_p  <- as.numeric(dat$d_p)
+  d_np <- as.numeric(dat$d_np)
+  any(d_p == 0 & d_np == 0, na.rm = TRUE)
+}
+
+df_resolve_population_N <- function(dat, N = NULL, require = FALSE, context = "estimator") {
+  N0 <- df_parse_population_N(N)
+  if (!is.null(N0)) {
+    if (N0 < nrow(dat)) {
+      stop(context, ": supplied `N` (", N0, ") is smaller than nrow(dat) (", nrow(dat), ").", call. = FALSE)
+    }
+    return(N0)
+  }
+
+  if (df_dat_has_frame_units(dat)) {
+    return(as.numeric(nrow(dat)))
+  }
+
+  if (isTRUE(require)) {
+    stop(
+      context, ": full frame data were not provided (no (d_p,d_np)=(0,0) rows detected).\n",
+      "Please supply the population size via `N=...` (e.g., N=10000), or set `hajek=TRUE`.",
+      call. = FALSE
+    )
+  }
+
+  NULL
+}
+
+# Sandwich like df_sandwich_from_contrib(), but assumes `n_missing` additional 0-contributions.
+df_sandwich_from_contrib_with_zeros <- function(contrib, n_missing = 0L, level = 0.95) {
+  contrib <- as.numeric(contrib)
+  contrib <- contrib[is.finite(contrib)]
+  n_obs <- length(contrib)
+
+  n_missing <- as.integer(n_missing)
+  if (!is.finite(n_missing) || n_missing < 0L) n_missing <- 0L
+
+  n_eff <- n_obs + n_missing
+  if (n_eff <= 1L) {
+    return(list(theta = NA_real_, var = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_), n_eff = n_eff))
+  }
+
+  sum_c   <- sum(contrib)
+  sumsq_c <- sum(contrib^2)
+
+  theta_hat <- sum_c / n_eff
+
+  # sample variance of vector length n_eff: [contrib, 0, ..., 0]
+  s2 <- (sumsq_c - n_eff * theta_hat^2) / (n_eff - 1)
+  s2 <- pmax(s2, 0)
+
+  var_hat <- s2 / n_eff
+  se_hat  <- sqrt(pmax(var_hat, 0))
+
+  z  <- stats::qnorm(1 - (1 - level) / 2)
+  ci <- c(theta_hat - z * se_hat, theta_hat + z * se_hat)
+
+  list(theta = theta_hat, var = var_hat, se = se_hat, ci = ci, n_eff = n_eff)
+}
+
+# Hajek (ratio) variance proxy for weighted mean: sum(w*y)/sum(w)
+df_hajek_mean_with_se <- function(y, w, level = 0.95) {
+  y <- as.numeric(y)
+  w <- as.numeric(w)
+
+  keep <- is.finite(y) & is.finite(w) & (w > 0)
+  y <- y[keep]
+  w <- w[keep]
+
+  if (length(y) <= 1L) {
+    return(list(theta = NA_real_, var = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_), n_eff = length(y)))
+  }
+
+  den <- sum(w)
+  if (!is.finite(den) || den <= 0) {
+    return(list(theta = NA_real_, var = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_), n_eff = length(y)))
+  }
+
+  theta_hat <- sum(w * y) / den
+
+  v <- sum((w^2) * (y - theta_hat)^2) / (den^2)
+  v <- pmax(v, 0)
+  se <- sqrt(v)
+
+  z  <- stats::qnorm(1 - (1 - level) / 2)
+  ci <- c(theta_hat - z * se, theta_hat + z * se)
+
+  list(theta = theta_hat, var = v, se = se, ci = ci, n_eff = length(y))
+}
+
+df_estimate_P <- function(dat, N = NULL, hajek = FALSE) {
   pi_p <- df_clip_prob(as.numeric(dat$pi_p))
-  contrib   <- as.numeric(dat$d_p) * as.numeric(dat$y) / pi_p
-  theta_res <- df_sandwich_from_contrib(contrib)
+  d_p  <- as.numeric(dat$d_p)
+  y    <- as.numeric(dat$y)
+
+  if (isTRUE(hajek)) {
+    idx <- which(d_p == 1)
+    w <- 1 / pi_p[idx]
+    hj <- df_hajek_mean_with_se(y = y[idx], w = w)
+    return(list(theta = hj$theta, var = hj$var, se = hj$se, ci = hj$ci))
+  }
+
+  N_total <- df_resolve_population_N(dat, N = N, require = TRUE, context = "df_estimate_P()")
+  n_missing <- as.integer(round(N_total - nrow(dat)))
+  if (n_missing < 0L) {
+    stop("df_estimate_P(): N < nrow(dat).", call. = FALSE)
+  }
+
+  contrib <- d_p * y / pi_p
+
+  theta_res <- if (n_missing == 0L) {
+    df_sandwich_from_contrib(contrib)
+  } else {
+    df_sandwich_from_contrib_with_zeros(contrib, n_missing = n_missing)
+  }
+
   list(theta = theta_res$theta, var = theta_res$var, se = theta_res$se, ci = theta_res$ci)
 }
 
-df_estimate_NP <- function(dat, base_fun, phi_start = NULL, max_iter = 20) {
+df_estimate_NP <- function(dat,
+                           base_fun,
+                           phi_start = NULL,
+                           max_iter = 20,
+                           N = NULL,
+                           hajek = FALSE) {
 
   if (missing(base_fun) || is.null(base_fun) || !is.function(base_fun)) {
     stop("df_estimate_NP(): please supply `base_fun` (a function mapping X -> n x (p+2) basis matrix).",
@@ -1734,8 +1886,26 @@ df_estimate_NP <- function(dat, base_fun, phi_start = NULL, max_iter = 20) {
     eta   <- as.numeric(b_mat %*% phi_hat)
     pi_np <- df_clip_prob(plogis(eta))
 
-    contrib   <- as.numeric(dat$d_np) * as.numeric(dat$y) / pi_np
-    theta_res <- df_sandwich_from_contrib(contrib)
+    d_np <- as.numeric(dat$d_np)
+    y    <- as.numeric(dat$y)
+
+    if (isTRUE(hajek)) {
+      idx <- which(d_np == 1)
+      w <- 1 / pi_np[idx]
+      hj <- df_hajek_mean_with_se(y = y[idx], w = w)
+      theta_res <- hj
+    } else {
+      N_total <- df_resolve_population_N(dat, N = N, require = TRUE, context = "df_estimate_NP()")
+      n_missing <- as.integer(round(N_total - nrow(dat)))
+      if (n_missing < 0L) stop("df_estimate_NP(): N < nrow(dat).", call. = FALSE)
+
+      contrib <- d_np * y / pi_np
+      theta_res <- if (n_missing == 0L) {
+        df_sandwich_from_contrib(contrib)
+      } else {
+        df_sandwich_from_contrib_with_zeros(contrib, n_missing = n_missing)
+      }
+    }
   }
 
   list(phi = phi_hat,
@@ -1745,7 +1915,12 @@ df_estimate_NP <- function(dat, base_fun, phi_start = NULL, max_iter = 20) {
        ci = theta_res$ci)
 }
 
-df_estimate_NP_P <- function(dat, base_fun, phi_start = NULL, max_iter = 20) {
+df_estimate_NP_P <- function(dat,
+                             base_fun,
+                             phi_start = NULL,
+                             max_iter = 20,
+                             N = NULL,
+                             hajek = FALSE) {
 
   if (missing(base_fun) || is.null(base_fun) || !is.function(base_fun)) {
     stop("df_estimate_NP_P(): please supply `base_fun` (a function mapping X -> n x (p+2) basis matrix).",
@@ -1811,10 +1986,28 @@ df_estimate_NP_P <- function(dat, base_fun, phi_start = NULL, max_iter = 20) {
 
     d_np  <- as.numeric(dat$d_np)
     d_p   <- as.numeric(dat$d_p)
-    denom <- df_clip_prob(pi_np + pi_p - pi_np * pi_p)
+    y     <- as.numeric(dat$y)
 
-    contrib   <- as.numeric(dat$y) * (d_np + d_p - d_np * d_p) / denom
-    theta_res <- df_sandwich_from_contrib(contrib)
+    denom <- df_clip_prob(pi_np + pi_p - pi_np * pi_p)
+    d_union <- d_np + d_p - d_np * d_p
+
+    if (isTRUE(hajek)) {
+      idx <- which(d_union == 1)
+      w <- 1 / denom[idx]
+      hj <- df_hajek_mean_with_se(y = y[idx], w = w)
+      theta_res <- hj
+    } else {
+      N_total <- df_resolve_population_N(dat, N = N, require = TRUE, context = "df_estimate_NP_P()")
+      n_missing <- as.integer(round(N_total - nrow(dat)))
+      if (n_missing < 0L) stop("df_estimate_NP_P(): N < nrow(dat).", call. = FALSE)
+
+      contrib <- y * d_union / denom
+      theta_res <- if (n_missing == 0L) {
+        df_sandwich_from_contrib(contrib)
+      } else {
+        df_sandwich_from_contrib_with_zeros(contrib, n_missing = n_missing)
+      }
+    }
   }
 
   list(phi = phi_hat,
@@ -2634,7 +2827,7 @@ Eff <- function(dat,
                 K           = 2,
                 phi_start   = NULL,
                 max_restart = 10,
-                type        = NULL,
+                type        = 1
                 dml_type    = 1,
                 progress    = interactive(),
                 x_info      = TRUE) {

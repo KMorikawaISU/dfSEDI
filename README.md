@@ -157,7 +157,9 @@ user-supplied basis function:
   `df_get_X(dat)`)
 - `base_fun(X)` must return a **numeric matrix** with shape:
 
-\\ B = \texttt{base_fun}(X) \in \mathbb{R}^{n \times (p+2)}. \\
+$$
+B = \texttt{base\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
+$$
 
 ### Strict validation
 
