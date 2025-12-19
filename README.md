@@ -90,6 +90,20 @@ dfSEDI exposes this choice via the flag `x_info`:
   **and** you have \\X\\ for those units (e.g., simulation studies, or
   settings with a population register providing \\X\\).
 
+> Note on population size `N` when `x_info = FALSE`:
+>
+> If you pass a **union-sample-only** dataset to
+> `Eff(..., x_info = FALSE)` (i.e., `dat` has no $(d_{np}, d_p)=(0,0)$
+> rows), dfSEDI can still target the full-frame mean $\theta = E(Y)$
+> **if you provide the population size** via `N = ...`. Internally, the
+> estimator is computed on a population-total scale and then rescaled by
+> `nrow(dat) / N`.
+>
+> If you omit `N`, `Eff(..., x_info = FALSE)` returns the *un-rescaled*
+> average over the observed union sample. In that case, you can recover
+> the population-mean scale by multiplying `theta`, `se`, and `ci` by
+> `nrow(dat_union) / N`.
+
 > Practical tip: If your input data include only sampled units (union
 > sample), you can create it as:
 >
@@ -157,7 +171,7 @@ user-supplied basis function:
   `df_get_X(dat)`)
 - `base_fun(X)` must return a **numeric matrix** with shape:
 
-$$ B = \mathtt{base\\_fun}(X) \in \mathbb{R}^{n \times (p+2)}. $$
+\\ B = \texttt{base_fun}(X) \in \mathbb{R}^{n \times (p+2)}. \\
 
 ### Strict validation
 
@@ -241,6 +255,7 @@ fit_eff_union <- Eff(
   dat         = dat_union,
   K           = 3,
   x_info      = FALSE,
+  N           = N,      # population size (frame size)
   progress    = TRUE
 )
 
@@ -502,6 +517,19 @@ fit_effP_union$theta
 fit_effP_union$se
 fit_effP_union$ci
 fit_effP_union$info
+```
+
+> Note on scaling: `Eff_P()` currently does **not** take a
+> population-size argument `N`. If you need $\theta=E(Y)$ on the
+> full-frame mean scale when using a union-sample-only dataset, rescale
+> the output by `n_union / N` (where `n_union = nrow(dat_union)` and `N`
+> is the frame size):
+
+``` r
+n_union <- nrow(dat_union)
+theta_pop <- fit_effP_union$theta * n_union / N
+se_pop    <- fit_effP_union$se    * n_union / N
+ci_pop    <- fit_effP_union$ci    * n_union / N
 ```
 
 `Eff_P` assumes parametric working models for both the sampling
