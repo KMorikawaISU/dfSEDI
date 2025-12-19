@@ -2516,58 +2516,73 @@ efficient_estimator_dml1 <- function(dat,
       colMeans(df_score_phi_contrib_fast(l_test, d_p_test, d_np_test, pi_p_test, phi, eta4_k), na.rm = TRUE)
     }
 
-    attempt <- 0
-    sol <- list(termcd = 99)
-    while (attempt < max_restart && sol$termcd > 2) {
-      attempt <- attempt + 1
-      init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
-      sol_try <- try(nleqslv::nleqslv(init, ee_fun_k), silent = TRUE)
-      if (!inherits(sol_try, "try-error")) sol <- sol_try
+    # --- phi estimation (optim only) ---
+    # We solve for phi on this fold by minimizing || mean(score_phi) ||^2.
+    # This avoids nleqslv (which can be slow/unstable in small samples).
+    obj_k <- function(phi) {
+      eq <- ee_fun_k(phi)
+      if (any(!is.finite(eq))) return(big_penalty)
+      sum(eq^2)
     }
 
-    phi_k <- NULL
+    method_phi <- getOption("dfSEDI.phi_optim_method", "Nelder-Mead")
+    method_phi <- as.character(method_phi)[1]
+    if (!method_phi %in% c("Nelder-Mead", "BFGS", "CG", "L-BFGS-B", "SANN")) method_phi <- "Nelder-Mead"
 
-    if (sol$termcd <= 2) {
-      phi_k <- as.numeric(sol$x)
+    maxit_phi <- getOption("dfSEDI.phi_optim_maxit", 500L)
+    maxit_phi <- as.integer(maxit_phi)[1]
+    if (!is.finite(maxit_phi) || maxit_phi < 1L) maxit_phi <- 500L
+
+    tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-8)
+    tol_obj <- as.numeric(tol_obj)[1]
+    if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
+
+    control_phi <- getOption("dfSEDI.phi_optim_control", list(maxit = maxit_phi))
+    if (!is.list(control_phi)) control_phi <- list(maxit = maxit_phi)
+    if (is.null(control_phi$maxit)) control_phi$maxit <- maxit_phi
+
+    best <- NULL
+
+    # 1) Try phi_start first (often good enough; big speedup vs random restarts)
+    res0 <- try(stats::optim(par = phi_start, fn = obj_k, method = method_phi, control = control_phi),
+                silent = TRUE)
+    if (!inherits(res0, "try-error") && is.finite(res0$value)) {
+      best <- res0
     } else {
-      obj_k <- function(phi) {
-        eq <- ee_fun_k(phi)
-        if (any(!is.finite(eq))) return(big_penalty)
-        sum(eq^2)
-      }
-
       best <- list(value = Inf, par = phi_start, convergence = 1)
+    }
 
+    # 2) Random restarts if needed
+    if (!is.finite(best$value) || best$value > tol_obj || best$convergence != 0) {
       for (a in seq_len(max_restart)) {
         init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
-        res_try <- try(stats::optim(par = init, fn = obj_k, method = "Nelder-Mead"),
+        res_try <- try(stats::optim(par = init, fn = obj_k, method = method_phi, control = control_phi),
                        silent = TRUE)
         if (!inherits(res_try, "try-error") && is.finite(res_try$value) && res_try$value < best$value) {
           best <- res_try
         }
-        if (is.finite(best$value) && best$value < 1e-8) break
+        if (is.finite(best$value) && best$value < tol_obj) break
       }
+    }
 
-      if (!is.finite(best$value) || best$value >= 0.99 * big_penalty) {
-        if (progress) {
-          cat(sprintf("  fold %d/%d: phi failed (estimating equation returned non-finite values).\n", k, K))
-          flush.console()
-        } else {
-          warning(sprintf("dfSEDI: fold %d/%d: phi failed (non-finite estimating equation).", k, K),
-                  call. = FALSE)
-        }
-        next
-      }
-
-      phi_k <- as.numeric(best$par)
-
+    if (!is.finite(best$value) || best$value >= 0.99 * big_penalty) {
       if (progress) {
-        cat(sprintf("  fold %d/%d: nleqslv failed; used optim fallback (obj=%.3e).\n", k, K, best$value))
+        cat(sprintf("  fold %d/%d: phi failed (objective non-finite).
+", k, K))
         flush.console()
       } else {
-        warning(sprintf("dfSEDI: fold %d/%d: nleqslv failed; used optim fallback for phi.", k, K),
+        warning(sprintf("dfSEDI: fold %d/%d: phi failed (objective non-finite).", k, K),
                 call. = FALSE)
       }
+      next
+    }
+
+    phi_k <- as.numeric(best$par)
+
+    if (progress) {
+      cat(sprintf("  fold %d/%d: phi via optim (obj=%.3e).
+", k, K, best$value))
+      flush.console()
     }
 
     phi_k_mat[k, ] <- phi_k
