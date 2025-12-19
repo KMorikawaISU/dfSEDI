@@ -55,6 +55,11 @@
 ##  - Faster mixed prediction: pre-split indices; fit global model only if needed
 ##  - df_get_X fast-path for numeric matrices
 ##  - Internal fast score evaluators for DML objectives/jacobians (avoid repeated df_get_X)
+##
+## Hotfix (Scenario S1/S2 gausspr failure):
+##  - If dat is created by data.frame(X = I(matrix(...))), then dat$X has class "AsIs".
+##    kernlab::gausspr is an S4 generic and can error for x="AsIs" even if the object is matrix-like.
+##  - We strip only the "AsIs" class inside df_apply_x_info() and df_get_X().
 ############################################################
 
 ############################################################
@@ -105,8 +110,17 @@ df_floor_pos <- function(x, floor = NULL) {
 #  - x_info=TRUE : keep dat as is
 #  - x_info=FALSE: drop any (d_p,d_np)=(0,0) rows (if present)
 df_apply_x_info <- function(dat, x_info = TRUE) {
-  if (isTRUE(x_info)) return(dat)
   if (!is.data.frame(dat)) return(dat)
+
+  # Hotfix: strip only "AsIs" (from data.frame(X = I(matrix(...)))).
+  # kernlab::gausspr is an S4 generic and can fail for x="AsIs".
+  if ("X" %in% names(dat) && inherits(dat$X, "AsIs")) {
+    x0 <- dat$X
+    class(x0) <- setdiff(class(x0), "AsIs")
+    dat$X <- x0
+  }
+
+  if (isTRUE(x_info)) return(dat)
   if (!all(c("d_p", "d_np") %in% names(dat))) return(dat)
 
   d_p  <- as.numeric(dat$d_p)
@@ -121,6 +135,14 @@ df_apply_x_info <- function(dat, x_info = TRUE) {
     }
     dat <- dat[keep, , drop = FALSE]
   }
+
+  # (After subsetting, ensure AsIs didn't persist)
+  if ("X" %in% names(dat) && inherits(dat$X, "AsIs")) {
+    x0 <- dat$X
+    class(x0) <- setdiff(class(x0), "AsIs")
+    dat$X <- x0
+  }
+
   dat
 }
 
@@ -218,6 +240,12 @@ df_get_X <- function(dat) {
   if ("X" %in% names(dat)) {
     X <- dat$X
 
+    # Hotfix: strip only "AsIs" (from data.frame(X = I(matrix(...)))).
+    # kernlab::gausspr is an S4 generic and can fail for x="AsIs".
+    if (inherits(X, "AsIs")) {
+      class(X) <- setdiff(class(X), "AsIs")
+    }
+
     if (is.data.frame(X)) {
       X_df <- X
 
@@ -272,6 +300,12 @@ df_get_X <- function(dat) {
     if (is.matrix(X) && (is.double(X) || is.integer(X))) {
       X_num <- X
       storage.mode(X_num) <- "numeric"
+
+      # ensure AsIs is not present (S4 dispatch safety)
+      if (inherits(X_num, "AsIs")) {
+        class(X_num) <- setdiff(class(X_num), "AsIs")
+      }
+
       if (is.null(attr(X_num, "dfSEDI_categorical_cols"))) {
         attr(X_num, "dfSEDI_categorical_cols") <- integer(0)
       }
@@ -281,6 +315,9 @@ df_get_X <- function(dat) {
     X_num <- apply(X, 2, function(col) suppressWarnings(as.numeric(col)))
     X_num <- as.matrix(X_num)
     storage.mode(X_num) <- "numeric"
+    if (inherits(X_num, "AsIs")) {
+      class(X_num) <- setdiff(class(X_num), "AsIs")
+    }
     attr(X_num, "dfSEDI_categorical_cols") <- integer(0)
     return(X_num)
   }
@@ -345,8 +382,7 @@ df_eval_base_fun <- function(base_fun,
 
   if (nrow(b_raw) != n) {
     stop(
-      context, ": base_fun(X) must have the same number of rows as X.
-",
+      context, ": base_fun(X) must have the same number of rows as X.\n",
       "nrow(X) = ", n, ", but nrow(base_fun(X)) = ", nrow(b_raw), ".",
       call. = FALSE
     )
@@ -361,8 +397,7 @@ df_eval_base_fun <- function(base_fun,
     if (is.finite(expected_ncol) && expected_ncol >= 1L) {
       if (ncol(b_raw) != expected_ncol) {
         stop(
-          context, ": unexpected number of columns in base_fun(X).
-",
+          context, ": unexpected number of columns in base_fun(X).\n",
           "Expected ", expected_ncol, " columns, but got ", ncol(b_raw), ".",
           call. = FALSE
         )
@@ -378,8 +413,7 @@ df_eval_base_fun <- function(base_fun,
     show <- idx[seq_len(min(5L, nrow(idx))), , drop = FALSE]
     show_txt <- paste(apply(show, 1, function(rc) paste0("(", rc[1], ",", rc[2], ")")), collapse = ", ")
     stop(
-      context, ": base_fun(X) must return finite numeric values (no NA/Inf).
-",
+      context, ": base_fun(X) must return finite numeric values (no NA/Inf).\n",
       "Example non-finite positions (row,col): ", show_txt, ".",
       call. = FALSE
     )
@@ -403,10 +437,8 @@ df_kernlab_predict <- function(model, newdata) {
       stats::predict(model, newdata)
     }, error = function(e2) {
       stop(
-        "dfSEDI: prediction failed for a kernlab::gausspr model.
-",
-        "Please try running `library(kernlab)` once and re-run.
-",
+        "dfSEDI: prediction failed for a kernlab::gausspr model.\n",
+        "Please try running `library(kernlab)` once and re-run.\n",
         "Original error: ", conditionMessage(e2)
       )
     })
