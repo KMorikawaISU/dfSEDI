@@ -2961,7 +2961,7 @@ Eff <- function(dat,
                 K           = 2,
                 phi_start   = NULL,
                 max_restart = 10,
-                type        = 1,
+                type        = 2, #default
                 dml_type    = 1,
                 progress    = interactive(),
                 x_info      = TRUE,

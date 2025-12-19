@@ -194,16 +194,6 @@ base_fun <- function(X) {
 }
 ```
 
-To reproduce an older “include `y` as the last column” design (advanced;
-uses a closure):
-
-``` r
-y_vec <- as.numeric(dat$y)
-base_fun <- function(X) {
-  cbind(1, X, y_vec)
-}
-```
-
 > Tip: If you use a closure like this, make sure `base_fun` is defined
 > for the same `dat` you pass into `df_estimate_NP()` /
 > `df_estimate_NP_P()`.
@@ -253,7 +243,7 @@ dat_union <- subset(dat, d_np == 1 | d_p == 1)
 # Eff uses DML1 by default (faster).
 fit_eff_union <- Eff(
   dat         = dat_union,
-  K           = 3,
+  K           = 2,
   x_info      = FALSE,
   N           = N,      # population size (frame size)
   progress    = TRUE
@@ -274,7 +264,7 @@ structure:
 # Eff uses DML1 by default (faster).
 fit_eff_full <- Eff(
   dat         = dat,
-  K           = 3,
+  K           = 2,
   x_info      = TRUE,
   progress    = TRUE
 )
@@ -287,21 +277,14 @@ fit_eff_full$info
 
 ------------------------------------------------------------------------
 
-## Eff: DML (DML1 default)
+## Eff: DML (DML1 optional)
 
 `Eff()` supports two DML variants:
 
-- `type = 1` (or `"DML1"`) : **DML1 (default; usually faster)**
-- `type = 2` (or `"DML2"`) : DML2 (optional; can be slower)
+- `type = 1` (or `"DML1"`) : DML1 (optional; can be slower)
+- `type = 2` (or `"DML2"`) : **DML2 (default; usually faster)**
 
-Why DML1 is typically faster in practice:
-
-- DML1 estimates fold-specific quantities and aggregates them.
-- DML2 can require evaluating an objective for \\\phi\\ many times;
-  depending on the nuisance models, this may refit expensive regressions
-  repeatedly.
-
-### Eff: DML1 (default)
+### Eff: DML1 (optional)
 
 DML1 conceptually computes fold-specific estimates and aggregates them:
 
@@ -318,7 +301,7 @@ DML1 example (default):
 fit_eff_dml1 <- Eff(
   dat         = dat,
   K           = 3,
-  # type      = 1,      # optional (DML1 is the default)
+  type        = 1,      # DML1
   phi_start   = NULL,
   max_restart = 10,
   x_info      = TRUE,   # or FALSE if you only have the union sample
@@ -332,7 +315,7 @@ fit_eff_dml1$ci
 fit_eff_dml1$info
 ```
 
-### Eff: DML2 (optional)
+### Eff: DML2 (default)
 
 DML2 example:
 
