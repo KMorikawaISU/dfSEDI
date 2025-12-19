@@ -126,7 +126,7 @@ options(dfSEDI.allow_small_cells = FALSE)          # bypass flag
 - `base_fun(X)` must return a **numeric matrix** with shape:
 
 $$
-B = \mathtt{base\\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
+B = \mathtt{base\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
 $$
 
 ### Strict validation
@@ -166,23 +166,26 @@ Example:
 ```r
 library(dfSEDI)
 
-# Load the bundled example script (defines generate_dualframe_population)
+# Load the bundled example script (defines generate_dualframe_population and run_mc)
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
 set.seed(18)
 N <- 10000
-dat <- generate_dualframe_population(N = N)
+dat <- generate_dualframe_population(N = N, Scenario = 1)
 
 str(dat)
 ```
 
-If you want `X` to contain an explicit categorical column (recommended in real data), you can do:
+If you want `X` to contain an explicit categorical column (recommended in real data), you can supply `X` as a `data.frame`
+and mark discrete variables as `factor`. For example, the bundled DGP has a binary covariate in `Scenario = 3`:
 
 ```r
-dat$X <- data.frame(
-  x1 = dat$X[, 1],
-  x2 = factor(dat$X[, 2])
+dat3 <- generate_dualframe_population(N = N, Scenario = 3)
+
+dat3$X <- data.frame(
+  x = dat3$X[, 1],
+  z = factor(dat3$X[, 2])
 )
 ```
 
@@ -225,6 +228,51 @@ fit_eff_full$se
 fit_eff_full$ci
 fit_eff_full$info
 ```
+
+
+
+## Example: Monte Carlo simulation helper (`run_mc`) 
+
+The bundled example script `inst/examples/dualframe_simulation.R` also defines a simple Monte Carlo runner `run_mc()`
+that repeatedly generates datasets and computes:
+
+- `P`, `NP`, `NP_P`
+- `Eff` (full data; `x_info = TRUE`)
+- `Eff_union_dat` (union sample only; `x_info = FALSE`)
+- `Eff_S`, `Eff_P`
+
+`run_mc()` returns a **long-format** data frame containing point estimates (`theta`), sandwich SEs (`se`), and 95% CIs
+(`ci_l`, `ci_u`) for each estimator in each replication, along with realized sample sizes.
+
+Example:
+
+```r
+library(dfSEDI)
+
+# Load the bundled example script (defines generate_dualframe_population and run_mc)
+example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
+source(example_file)
+
+B <- 200
+N <- 10000
+
+# Scenario = 1 corresponds to a paper-style S1 setup in the bundled DGP
+res <- run_mc(
+  B             = B,
+  N             = N,
+  Scenario      = 1,
+  K             = 2,
+  seed_start    = 1,
+  show_progress = TRUE
+)
+
+head(res)
+
+# Optional summary (true theta is 0 in the bundled scenarios)
+summarize_mc(res, theta_true = 0)
+```
+
+To run the other bundled scenarios, set `Scenario = 2` or `Scenario = 3`.
 
 ---
 
@@ -425,7 +473,7 @@ fit_effP_bin <- Eff_P(dat, logit = TRUE)
 
 # Force non-logistic (even if y is binary)
 fit_effS_lin <- Eff_S(dat, K = 2, logit = FALSE)
-fit_effP_lin <- Eff_P(dat, logit = FALSE)
+fit_effP_lin <- Eff_P(dat, K = 2, logit = FALSE)
 ```
 
 ### Note on coding of success (=1)
