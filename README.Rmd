@@ -125,9 +125,7 @@ options(dfSEDI.allow_small_cells = FALSE)          # bypass flag
 - `X` is the \\(n \\times p\\) design matrix extracted from `dat` (via `df_get_X(dat)`)
 - `base_fun(X)` must return a **numeric matrix** with shape:
 
-$$
-B = \mathtt{base\\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
-$$
+$$ B = \mathtt{base\\_fun}(X) \in \mathbb{R}^{n \times (p+2)}. $$
 
 ### Strict validation
 
@@ -149,7 +147,14 @@ base_fun <- function(X) {
 }
 ```
 
+To reproduce an older “include `y` as the last column” design (advanced; uses a closure):
 
+```r
+y_vec <- as.numeric(dat$y)
+base_fun <- function(X) {
+  cbind(1, X, y_vec)
+}
+```
 
 > Tip: If you use a closure like this, make sure `base_fun` is defined for the same `dat` you pass into `df_estimate_NP()` / `df_estimate_NP_P()`.
 
@@ -166,26 +171,23 @@ Example:
 ```r
 library(dfSEDI)
 
-# Load the bundled example script (defines generate_dualframe_population and run_mc)
+# Load the bundled example script (defines generate_dualframe_population)
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
 set.seed(18)
 N <- 10000
-dat <- generate_dualframe_population(N = N, Scenario = 1)
+dat <- generate_dualframe_population(N = N)
 
 str(dat)
 ```
 
-If you want `X` to contain an explicit categorical column (recommended in real data), you can supply `X` as a `data.frame`
-and mark discrete variables as `factor`. For example, the bundled DGP has a binary covariate in `Scenario = 3`:
+If you want `X` to contain an explicit categorical column (recommended in real data), you can do:
 
 ```r
-dat3 <- generate_dualframe_population(N = N, Scenario = 3)
-
-dat3$X <- data.frame(
-  x = dat3$X[, 1],
-  z = factor(dat3$X[, 2])
+dat$X <- data.frame(
+  x1 = dat$X[, 1],
+  x2 = factor(dat$X[, 2])
 )
 ```
 
@@ -228,51 +230,6 @@ fit_eff_full$se
 fit_eff_full$ci
 fit_eff_full$info
 ```
-
-
-
-## Example: Monte Carlo simulation helper (`run_mc`) 
-
-The bundled example script `inst/examples/dualframe_simulation.R` also defines a simple Monte Carlo runner `run_mc()`
-that repeatedly generates datasets and computes:
-
-- `P`, `NP`, `NP_P`
-- `Eff` (full data; `x_info = TRUE`)
-- `Eff_union_dat` (union sample only; `x_info = FALSE`)
-- `Eff_S`, `Eff_P`
-
-`run_mc()` returns a **long-format** data frame containing point estimates (`theta`), sandwich SEs (`se`), and 95% CIs
-(`ci_l`, `ci_u`) for each estimator in each replication, along with realized sample sizes.
-
-Example:
-
-```r
-library(dfSEDI)
-
-# Load the bundled example script (defines generate_dualframe_population and run_mc)
-example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
-source(example_file)
-
-B <- 200
-N <- 10000
-
-# Scenario = 1 corresponds to a paper-style S1 setup in the bundled DGP
-res <- run_mc(
-  B             = B,
-  N             = N,
-  Scenario      = 1,
-  K             = 2,
-  seed_start    = 1,
-  show_progress = TRUE
-)
-
-head(res)
-
-# Optional summary (true theta is 0 in the bundled scenarios)
-summarize_mc(res, theta_true = 0)
-```
-
-To run the other bundled scenarios, set `Scenario = 2` or `Scenario = 3`.
 
 ---
 
@@ -348,7 +305,7 @@ Eff returns joint sandwich-based standard errors for both \\(\\theta\\) and \\(\
 
 ---
 
-## Comparison estimators (P / NP / NP ∪ P)  ✅ Updated for `base_fun`
+## Comparison estimators (P / NP / NP ∪ P)  ✅ Updated: population size `N` and Hajek option
 
 For simulations, it is sometimes useful to compare `Eff` against simpler estimators:
 
@@ -356,10 +313,25 @@ For simulations, it is sometimes useful to compare `Eff` against simpler estimat
 - `df_estimate_NP()`    : non-probability-only estimator (Chang & Kott-type; requires `base_fun`)
 - `df_estimate_NP_P()`  : NP union P estimator (Chang & Kott-type; requires `base_fun`)
 
-These are mainly intended for **simulation settings** where `dat` contains a “population-like”
-structure (including \\((0,0)\\) units) and `pi_p` is defined for the full frame.
+### Why `N` matters (union-only input)
 
-Example:
+`df_estimate_P()` / `df_estimate_NP()` / `df_estimate_NP_P()` compute \\(\\theta=E(Y)\\) using contributions that are naturally on the **population-total** scale.
+When your `dat` includes the **full frame** (i.e., it contains \\((d_{np}, d_p)=(0,0)\\) rows), the functions can safely use `N = nrow(dat)` internally.
+
+However, if you only pass the **union sample** (no \\((0,0)\\) rows), then `nrow(dat)` is **not** the population size and would create a scale error.
+To prevent silent nonsense, dfSEDI **requires** you to specify the population size `N` in that case **unless** you request the Hajek (ratio) form.
+
+### Function signatures (updated)
+
+- `df_estimate_P(dat, N = NULL, hajek = FALSE)`
+- `df_estimate_NP(dat, base_fun, phi_start = NULL, max_iter = 20, N = NULL, hajek = FALSE)`
+- `df_estimate_NP_P(dat, base_fun, phi_start = NULL, max_iter = 20, N = NULL, hajek = FALSE)`
+
+**Defaults are output-preserving**: if `dat` contains full-frame rows, omitting `N` and `hajek` reproduces the previous behavior and output fields.
+
+### Examples
+
+**(A) Full-frame `dat` (simulation-like): no need to pass `N`**
 
 ```r
 # Probability-only (HT-type)
@@ -370,28 +342,45 @@ base_fun <- function(X) {
   cbind(1, X, X[, 1]^2)
 }
 
-# Non-probability-only (Chang & Kott-type)
-fit_NP <- df_estimate_NP(dat, base_fun = base_fun)
-
-# NP union P (Chang & Kott-type)
-# NOTE: pi_p must be fully observed (no NA/Inf), or you must impute first.
+fit_NP   <- df_estimate_NP(dat, base_fun = base_fun)
 fit_NP_P <- df_estimate_NP_P(dat, base_fun = base_fun)
-
-c(
-  Eff   = fit_eff_full$theta,
-  P     = fit_P$theta,
-  NP    = fit_NP$theta,
-  NP_P  = fit_NP_P$theta
-)
 ```
 
-Each returns `theta`, `se`, `ci`:
+**(B) Union-only `dat_union`: pass `N` (HT-style mean over the full population)**
+
+```r
+dat_union <- subset(dat, d_np == 1 | d_p == 1)
+
+N_pop <- 10000  # known population/frame size
+
+fit_P     <- df_estimate_P(dat_union, N = N_pop)
+fit_NP    <- df_estimate_NP(dat_union, base_fun = base_fun, N = N_pop)
+fit_NP_P  <- df_estimate_NP_P(dat_union, base_fun = base_fun, N = N_pop)
+```
+
+**(C) Union-only `dat_union`: Hajek (ratio) form (does not require `N`)**
+
+```r
+fit_P_hajek    <- df_estimate_P(dat_union, hajek = TRUE)
+fit_NP_hajek   <- df_estimate_NP(dat_union, base_fun = base_fun, hajek = TRUE)
+fit_NP_P_hajek <- df_estimate_NP_P(dat_union, base_fun = base_fun, hajek = TRUE)
+
+# Hajek results are returned as additional fields:
+fit_P_hajek$hajek_theta
+fit_P_hajek$hajek_se
+fit_P_hajek$hajek_ci
+```
+
+Each estimator always returns `theta`, `se`, `ci`:
 
 ```r
 fit_P$theta;    fit_P$se;    fit_P$ci
 fit_NP$theta;   fit_NP$se;   fit_NP$ci
 fit_NP_P$theta; fit_NP_P$se; fit_NP_P$ci
 ```
+
+If `hajek = TRUE`, the returned object also includes `hajek_theta`, `hajek_se`, and `hajek_ci`
+(while preserving the original `theta/se/ci` fields).
 
 > Note: `df_estimate_NP()` / `df_estimate_NP_P()` solve estimating equations and may return `NA`
 > if the solver fails to converge. This is expected in some small samples or unstable designs.
@@ -436,6 +425,28 @@ fit_effP$ci
 fit_effP$info
 ```
 
+
+### Eff_P with union sample only (`x_info = FALSE`)
+
+If your input data contain only sampled units (union sample), set `x_info = FALSE`:
+
+```r
+dat_union <- subset(dat, d_np == 1 | d_p == 1)
+
+fit_effP_union <- Eff_P(
+  dat      = dat_union,
+  x_info   = FALSE,
+  progress = TRUE
+)
+
+fit_effP_union$phi
+fit_effP_union$theta
+fit_effP_union$se
+fit_effP_union$ci
+fit_effP_union$info
+```
+
+
 `Eff_P` assumes parametric working models for both the sampling mechanism and the
 outcome regression. It returns point estimates and standard errors for \\(\\theta\\);
 standard errors for \\(\\phi\\) are not currently implemented in `Eff_P`.
@@ -473,7 +484,7 @@ fit_effP_bin <- Eff_P(dat, logit = TRUE)
 
 # Force non-logistic (even if y is binary)
 fit_effS_lin <- Eff_S(dat, K = 2, logit = FALSE)
-fit_effP_lin <- Eff_P(dat, K = 2, logit = FALSE)
+fit_effP_lin <- Eff_P(dat, logit = FALSE)
 ```
 
 ### Note on coding of success (=1)
@@ -503,6 +514,13 @@ For the propensity parameter \\(\\phi\\):
   - `phi_ci`  : 95% confidence intervals for each component of `phi`
 
 - `Eff_P` returns `phi` but currently leaves `phi_var`, `phi_se`, and `phi_ci` as `NULL`.
+
+If you call a comparison estimator (`df_estimate_P/NP/NP_P`) with `hajek = TRUE`,
+the returned list also includes:
+
+- `hajek_theta` : Hajek (ratio) estimate for \\(\\theta\\)
+- `hajek_se`    : standard error for `hajek_theta` (delta-method)
+- `hajek_ci`    : 95% CI for `hajek_theta`
 
 The `info` element stores meta information (K, type, convergence code, etc.) that can
 be useful for diagnostics.

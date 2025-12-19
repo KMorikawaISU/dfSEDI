@@ -180,15 +180,23 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
   ))
 
   # (5) Efficient using union sample only: x_info = FALSE
+  # NOTE: To target the population mean E(Y) with union-only data, we must supply the
+  # full frame size N (because the returned value is an average over the observed rows).
   dat_union <- dat[dat$d_np == 1 | dat$d_p == 1, , drop = FALSE]
-  fit_Eff_union <- safe_fit(Eff(
+
+  eff_union_args <- list(
     dat         = dat_union,
     K           = K,
     phi_start   = NULL,
     max_restart = 10,
     progress    = progress_each,
     x_info      = FALSE
-  ))
+  )
+  if ("N" %in% names(formals(Eff))) {
+    eff_union_args$N <- nrow(dat)
+  }
+
+  fit_Eff_union <- safe_fit(do.call(Eff, eff_union_args))
 
   # (6) Sub-efficient
   fit_EffS <- safe_fit(Eff_S(

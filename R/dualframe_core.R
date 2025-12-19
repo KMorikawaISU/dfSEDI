@@ -29,6 +29,12 @@
 ##      hajek : if TRUE, compute the Hajek (ratio) version of the estimator (does not require N).
 ##  - Default behavior is unchanged when full frame data are provided (N is inferred as nrow(dat)).
 ##
+## IMPORTANT (Eff + x_info=FALSE):
+##  - When x_info=FALSE and the data do not include (d_p,d_np)=(0,0) rows (e.g., a union-only dataset),
+##    Eff() can still be interpreted as targeting the full-frame mean E(Y) ONLY if the population size N
+##    is supplied. In that case, theta (and its SE/CI) is scaled by n_obs / N, where n_obs = nrow(dat)
+##    after dropping (0,0) rows.
+##
 ## Stability updates:
 ##  - RBF sigma estimation uses deterministic subsampling (reproducible)
 ##  - Probability clipping for pi_p, pi_np, pi_np_p to avoid Inf/NaN
@@ -339,7 +345,8 @@ df_eval_base_fun <- function(base_fun,
 
   if (nrow(b_raw) != n) {
     stop(
-      context, ": base_fun(X) must have the same number of rows as X.\n",
+      context, ": base_fun(X) must have the same number of rows as X.
+",
       "nrow(X) = ", n, ", but nrow(base_fun(X)) = ", nrow(b_raw), ".",
       call. = FALSE
     )
@@ -354,7 +361,8 @@ df_eval_base_fun <- function(base_fun,
     if (is.finite(expected_ncol) && expected_ncol >= 1L) {
       if (ncol(b_raw) != expected_ncol) {
         stop(
-          context, ": unexpected number of columns in base_fun(X).\n",
+          context, ": unexpected number of columns in base_fun(X).
+",
           "Expected ", expected_ncol, " columns, but got ", ncol(b_raw), ".",
           call. = FALSE
         )
@@ -370,7 +378,8 @@ df_eval_base_fun <- function(base_fun,
     show <- idx[seq_len(min(5L, nrow(idx))), , drop = FALSE]
     show_txt <- paste(apply(show, 1, function(rc) paste0("(", rc[1], ",", rc[2], ")")), collapse = ", ")
     stop(
-      context, ": base_fun(X) must return finite numeric values (no NA/Inf).\n",
+      context, ": base_fun(X) must return finite numeric values (no NA/Inf).
+",
       "Example non-finite positions (row,col): ", show_txt, ".",
       call. = FALSE
     )
@@ -394,8 +403,10 @@ df_kernlab_predict <- function(model, newdata) {
       stats::predict(model, newdata)
     }, error = function(e2) {
       stop(
-        "dfSEDI: prediction failed for a kernlab::gausspr model.\n",
-        "Please try running `library(kernlab)` once and re-run.\n",
+        "dfSEDI: prediction failed for a kernlab::gausspr model.
+",
+        "Please try running `library(kernlab)` once and re-run.
+",
         "Original error: ", conditionMessage(e2)
       )
     })
@@ -2026,13 +2037,37 @@ efficient_estimator_dml2 <- function(dat,
                                      K           = 2,
                                      max_restart = 10,
                                      progress    = FALSE,
-                                     x_info      = TRUE) {
+                                     x_info      = TRUE,
+                                     N           = NULL) {
+
+  had_frame_units <- df_dat_has_frame_units(dat)
+
+  N_total <- NULL
+  if (!isTRUE(x_info)) {
+    N_total <- df_resolve_population_N(dat, N = N, require = FALSE, context = "Eff()/x_info=FALSE")
+  }
+
   dat <- df_apply_x_info(dat, x_info)
 
   n <- nrow(dat)
   X <- df_get_X(dat)
   p_x <- ncol(X)
   p_phi <- 1 + p_x + 1
+
+  theta_scale <- 1
+  if (!isTRUE(x_info)) {
+    if (is.null(N_total) && !isTRUE(had_frame_units)) {
+      warning(
+        "Eff(): x_info=FALSE but population size N was not provided and no (d_p,d_np)=(0,0) rows were detected.\n",
+        "Returning the mean over the provided data (not the full-frame mean).\n",
+        "To target the full-frame mean, call Eff(..., x_info=FALSE, N=<population size>).",
+        call. = FALSE
+      )
+    }
+    if (!is.null(N_total) && is.finite(N_total) && N_total > 0) {
+      theta_scale <- n / N_total
+    }
+  }
 
   if (is.null(phi_start)) {
     phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
@@ -2241,17 +2276,20 @@ efficient_estimator_dml2 <- function(dat,
   pi_p_cf <- df_clip_prob(as.numeric(dat_cf$pi_p))
 
   contrib_theta <- efficient_theta_contrib_fast(l_cf, y_cf, d_p_cf, d_np_cf, pi_p_cf, phi_hat, h4_all)
-  theta_hat     <- mean(contrib_theta, na.rm = TRUE)
+
+  # Unscaled (n-based) mean
+  theta_hat_n     <- mean(contrib_theta, na.rm = TRUE)
+  theta_hat       <- theta_hat_n
 
   s_phi   <- df_score_phi_contrib_fast(l_cf, d_p_cf, d_np_cf, pi_p_cf, phi_hat, eta4_all)
-  s_theta <- as.numeric(contrib_theta - theta_hat)
+  s_theta <- as.numeric(contrib_theta - theta_hat_n)
 
   score_mat <- cbind(s_phi, s_theta)
 
   g_phi_mean <- function(phi) colMeans(df_score_phi_contrib_fast(l_cf, d_p_cf, d_np_cf, pi_p_cf, phi, eta4_all), na.rm = TRUE)
   A11 <- df_numeric_jacobian(g_phi_mean, phi_hat)
 
-  g_theta_mean <- function(phi) mean(efficient_theta_contrib_fast(l_cf, y_cf, d_p_cf, d_np_cf, pi_p_cf, phi, h4_all) - theta_hat, na.rm = TRUE)
+  g_theta_mean <- function(phi) mean(efficient_theta_contrib_fast(l_cf, y_cf, d_p_cf, d_np_cf, pi_p_cf, phi, h4_all) - theta_hat_n, na.rm = TRUE)
   A21 <- df_numeric_jacobian(g_theta_mean, phi_hat)
 
   A_hat <- rbind(
@@ -2263,24 +2301,33 @@ efficient_estimator_dml2 <- function(dat,
   V  <- js$var
 
   phi_var <- V[1:p_phi, 1:p_phi, drop = FALSE]
-  th_var  <- V[p_phi + 1, p_phi + 1]
+  th_var_n  <- V[p_phi + 1, p_phi + 1]
 
   phi_se <- sqrt(pmax(diag(phi_var), 0))
-  th_se  <- sqrt(pmax(th_var, 0))
+  th_se_n  <- sqrt(pmax(th_var_n, 0))
 
   z <- stats::qnorm(0.975)
   phi_ci <- rbind(phi_hat - z * phi_se, phi_hat + z * phi_se)
   rownames(phi_ci) <- c("lower", "upper")
-  theta_ci <- c(theta_hat - z * th_se, theta_hat + z * th_se)
+
+  theta_ci_n <- c(theta_hat_n - z * th_se_n, theta_hat_n + z * th_se_n)
 
   theta_var_method <- "joint_sandwich"
-  if (!is.finite(th_se) || !is.finite(th_var)) {
+
+  # fallback (still n-based)
+  if (!is.finite(th_se_n) || !is.finite(th_var_n)) {
     fb <- df_sandwich_from_contrib(contrib_theta)
-    th_var <- fb$var
-    th_se  <- fb$se
-    theta_ci <- fb$ci
+    th_var_n <- fb$var
+    th_se_n  <- fb$se
+    theta_ci_n <- fb$ci
     theta_var_method <- "contrib_sandwich_fallback"
   }
+
+  # Apply population scaling for theta when x_info=FALSE and N is available (or full frame was provided)
+  theta_hat <- theta_hat_n * theta_scale
+  th_var    <- th_var_n * (theta_scale^2)
+  th_se     <- th_se_n * theta_scale
+  theta_ci  <- theta_ci_n * theta_scale
 
   list(
     phi    = phi_hat,
@@ -2302,7 +2349,10 @@ efficient_estimator_dml2 <- function(dat,
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       convergence = res$convergence,
       theta_var_method = theta_var_method,
-      sandwich_n_eff = js$n_eff
+      sandwich_n_eff = js$n_eff,
+      population_N = N_total,
+      n_obs = n,
+      theta_scale = theta_scale
     )
   )
 }
@@ -2316,13 +2366,37 @@ efficient_estimator_dml1 <- function(dat,
                                      K           = 2,
                                      max_restart = 10,
                                      progress    = FALSE,
-                                     x_info      = TRUE) {
+                                     x_info      = TRUE,
+                                     N           = NULL) {
+
+  had_frame_units <- df_dat_has_frame_units(dat)
+
+  N_total <- NULL
+  if (!isTRUE(x_info)) {
+    N_total <- df_resolve_population_N(dat, N = N, require = FALSE, context = "Eff()/x_info=FALSE")
+  }
+
   dat <- df_apply_x_info(dat, x_info)
 
   n <- nrow(dat)
   X <- df_get_X(dat)
   p_x <- ncol(X)
   p_phi <- 1 + p_x + 1
+
+  theta_scale <- 1
+  if (!isTRUE(x_info)) {
+    if (is.null(N_total) && !isTRUE(had_frame_units)) {
+      warning(
+        "Eff(): x_info=FALSE but population size N was not provided and no (d_p,d_np)=(0,0) rows were detected.\n",
+        "Returning the mean over the provided data (not the full-frame mean).\n",
+        "To target the full-frame mean, call Eff(..., x_info=FALSE, N=<population size>).",
+        call. = FALSE
+      )
+    }
+    if (!is.null(N_total) && is.finite(N_total) && N_total > 0) {
+      theta_scale <- n / N_total
+    }
+  }
 
   if (is.null(phi_start)) {
     phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
@@ -2532,7 +2606,10 @@ efficient_estimator_dml1 <- function(dat,
       se = NA_real_,
       ci = c(NA_real_, NA_real_),
       info = list(type = "Eff", dml_type = "DML1", K = K, progress = progress,
-                  x_info = isTRUE(x_info))
+                  x_info = isTRUE(x_info),
+                  population_N = N_total,
+                  n_obs = n,
+                  theta_scale = theta_scale)
     ))
   }
 
@@ -2540,7 +2617,8 @@ efficient_estimator_dml1 <- function(dat,
   w_use <- w_use / sum(w_use)
 
   phi_hat   <- as.numeric(t(w_use) %*% phi_k_mat[valid, , drop = FALSE])
-  theta_hat <- mean(contrib_all, na.rm = TRUE)
+
+  theta_hat_n <- mean(contrib_all, na.rm = TRUE)
 
   valid_var <- valid[sapply(valid, function(kk) {
     Vkk <- var_k_list[[kk]]
@@ -2559,24 +2637,30 @@ efficient_estimator_dml1 <- function(dat,
   }
 
   phi_var <- V_hat[1:p_phi, 1:p_phi, drop = FALSE]
-  th_var  <- V_hat[p_phi + 1, p_phi + 1]
+  th_var_n  <- V_hat[p_phi + 1, p_phi + 1]
 
   phi_se <- sqrt(pmax(diag(phi_var), 0))
-  th_se  <- sqrt(pmax(th_var, 0))
+  th_se_n  <- sqrt(pmax(th_var_n, 0))
 
   z <- stats::qnorm(0.975)
   phi_ci <- rbind(phi_hat - z * phi_se, phi_hat + z * phi_se)
   rownames(phi_ci) <- c("lower", "upper")
-  theta_ci <- c(theta_hat - z * th_se, theta_hat + z * th_se)
+  theta_ci_n <- c(theta_hat_n - z * th_se_n, theta_hat_n + z * th_se_n)
 
   theta_var_method <- "fold_joint_sandwich"
-  if (!is.finite(th_se) || !is.finite(th_var)) {
+  if (!is.finite(th_se_n) || !is.finite(th_var_n)) {
     fb <- df_sandwich_from_contrib(contrib_all)
-    th_var <- fb$var
-    th_se  <- fb$se
-    theta_ci <- fb$ci
+    th_var_n <- fb$var
+    th_se_n  <- fb$se
+    theta_ci_n <- fb$ci
     theta_var_method <- "contrib_sandwich_fallback"
   }
+
+  # Apply population scaling for theta
+  theta_hat <- theta_hat_n * theta_scale
+  th_var    <- th_var_n * (theta_scale^2)
+  th_se     <- th_se_n * theta_scale
+  theta_ci  <- theta_ci_n * theta_scale
 
   list(
     phi    = phi_hat,
@@ -2597,7 +2681,10 @@ efficient_estimator_dml1 <- function(dat,
       x_info      = isTRUE(x_info),
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       theta_var_method = theta_var_method,
-      n_contrib_eff = sum(is.finite(contrib_all))
+      n_contrib_eff = sum(is.finite(contrib_all)),
+      population_N = N_total,
+      n_obs = n,
+      theta_scale = theta_scale
     )
   )
 }
@@ -2830,7 +2917,8 @@ Eff <- function(dat,
                 type        = 1,
                 dml_type    = 1,
                 progress    = interactive(),
-                x_info      = TRUE) {
+                x_info      = TRUE,
+                N           = NULL) {
 
   if (!is.null(type)) dml_type <- type
 
@@ -2840,10 +2928,10 @@ Eff <- function(dat,
 
   if (dml_type == "DML2") {
     efficient_estimator_dml2(dat, phi_start = phi_start, K = K, max_restart = max_restart,
-                             progress = progress, x_info = x_info)
+                             progress = progress, x_info = x_info, N = N)
   } else {
     efficient_estimator_dml1(dat, phi_start = phi_start, K = K, max_restart = max_restart,
-                             progress = progress, x_info = x_info)
+                             progress = progress, x_info = x_info, N = N)
   }
 }
 
