@@ -134,10 +134,9 @@ options(dfSEDI.allow_small_cells = FALSE)          # bypass flag
 - `X` is the \\(n \\times p\\) design matrix extracted from `dat` (via `df_get_X(dat)`)
 - `base_fun(X)` must return a **numeric matrix** with shape:
 
-\\[
-B = \\texttt{base_fun}(X) \\in \\mathbb{R}^{n \\times (p+2)}.
-\\]
-
+$$
+B = \\texttt{base\\_fun}(X) \\in \\mathbb{R}^{n \\times (p+2)}.
+$$
 ### Strict validation
 
 dfSEDI performs strict checks for safety:
@@ -238,19 +237,26 @@ fit_eff_full$info
 ---
 
 
-## Monte Carlo simulation (serial / parallel with progress)
+## Monte Carlo simulation (run_mc)
 
 The example script `inst/examples/dualframe_simulation.R` also defines:
 
-- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset)`
+- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, ...)`
 - `summarize_mc(res, theta_true = 0)`
 
-`run_mc()` returns a **long-format** data frame (one row per replication × estimator),
-so it is easy to summarize or plot.
+`run_mc()` returns a long-format data frame (one row per replication × estimator).
+The typical columns are:
+
+- `Scenario`, `rep`, `estimator`
+- `theta`, `se`, `ci_l`, `ci_u`
+- `n_np`, `n_p`, `n_union`
+- `error`
 
 ### Serial MC (built-in progress bar)
 
 ```r
+library(dfSEDI)
+
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
@@ -260,40 +266,45 @@ res <- run_mc(
   Scenario = 1,
   K = 2,
   seed_start = 1,
-  show_progress = TRUE,        # text progress bar
+  show_progress = TRUE,
   progress_each_fit = FALSE
 )
 
-summary <- summarize_mc(res, theta_true = 0)
-summary
+summarize_mc(res, theta_true = 0)
 ```
 
-### Parallel MC + progress bar (recommended cross-platform)
+### Parallel MC with a progress bar (Windows)
 
-Base `parallel` does not provide an easy progress bar for parallel workers.
-For a progress bar **with parallel execution**, we recommend the *snow* cluster
-approach with `pbapply`.
+Windows does not support fork-based parallelism (`mclapply`). Use a PSOCK cluster with `pbapply`:
 
-**Needed packages (Suggests):** `parallel`, `pbapply`
+Needed packages (Suggests): `pbapply` (and base R `parallel`)
 
 ```r
 # install.packages("pbapply")  # if needed
 
+library(dfSEDI)
+library(parallel)
+library(pbapply)
+
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
-library(parallel)
-library(pbapply)
+B <- 200
+N <- 10000
+Scenario <- 1
+K <- 2
+
+seeds <- 1 + seq_len(B) - 1
 
 n_workers <- max(1L, parallel::detectCores() - 1L)
 cl <- parallel::makeCluster(n_workers)
 on.exit(parallel::stopCluster(cl), add = TRUE)
 
-# (Optional) show a nice text progress bar
 pbapply::pboptions(type = "txt")
 
-# Ensure workers can call dfSEDI + the example functions
-parallel::clusterEvalQ(cl, { library(dfSEDI) })
+parallel::clusterEvalQ(cl, library(dfSEDI))
+
+# Export the functions defined by the example script
 parallel::clusterExport(
   cl,
   varlist = c(
@@ -307,12 +318,50 @@ parallel::clusterExport(
   envir = environment()
 )
 
-B <- 100
-seed_start <- 1
-seeds <- seed_start + seq_len(B) - 1
+one_rep <- function(seed) {
+  set.seed(seed)
+  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
+  fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
 
-# One replication -> one long-format data.frame
-one_rep_long <- function(seed) {
+  rbind(
+    extract_row(fits$P,         "P",             seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,        "NP",            seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,      "NP_P",          seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff,       "Eff",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union, "Eff_union_dat", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,     "Eff_S",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,     "Eff_P",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
+  )
+}
+
+out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
+res_par <- do.call(rbind, out_list)
+
+summarize_mc(res_par, theta_true = 0)
+```
+
+### Parallel MC with a progress bar (macOS / Linux)
+
+Option A (simplest and cross-platform): use the same PSOCK + `pbapply` approach as above (`parallel::makeCluster`, `pbapply::pblapply`).
+
+Option B (fork-based, often faster): use `pbmcapply`:
+
+Needed packages (Suggests): `pbmcapply`
+
+```r
+# install.packages("pbmcapply")  # if needed
+
+library(dfSEDI)
+library(pbmcapply)
+
+example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
+source(example_file)
+
+B <- 200
+seeds <- 1 + seq_len(B) - 1
+
+res_list <- pbmcapply::pbmclapply(seeds, function(seed) {
+  set.seed(seed)
   dat <- generate_dualframe_population(N = 10000, Scenario = 1)
   fits <- fit_all_estimators_once(dat = dat, Scenario = 1, K = 2, progress_each = FALSE)
 
@@ -325,329 +374,14 @@ one_rep_long <- function(seed) {
     extract_row(fits$Eff_S,     "Eff_S",         seed, 1, fits$n_np, fits$n_p, fits$n_union),
     extract_row(fits$Eff_P,     "Eff_P",         seed, 1, fits$n_np, fits$n_p, fits$n_union)
   )
-}
+}, mc.cores = max(1L, parallel::detectCores() - 1L))
 
-# Progress bar appears in the master process while workers run in parallel
-out_list <- pbapply::pblapply(seeds, function(s) {
-  set.seed(s)
-  one_rep_long(s)
-}, cl = cl)
-
-res_par <- do.call(rbind, out_list)
-
-summary_par <- summarize_mc(res_par, theta_true = 0)
-summary_par
+res_par <- do.call(rbind, res_list)
+summarize_mc(res_par, theta_true = 0)
 ```
 
-### Notes
-
-- **Windows users:** use the snow cluster approach above (works everywhere).
-- **macOS/Linux users:** you can also use fork-based parallelism (`mclapply`), but
-  progress bars are trickier. If you want a progress bar in multicore mode,
-  consider `pbmcapply` (Suggests) instead.
-
-If you want to list optional packages in DESCRIPTION:
-
-- `pbapply` (progress bar for snow parallel)
-- `pbmcapply` (progress bar for multicore; macOS/Linux)
-
-
----
-
-## Eff: DML (DML1 optional)
-
-`Eff()` supports two DML variants:
-
-- `type = 1` (or `"DML1"`) : DML1 (optional; can be slower)
-- `type = 2` (or `"DML2"`) : **DML2 (default; usually faster)**
-
-
-### Eff: DML1 (optional)
-
-DML1 conceptually computes fold-specific estimates and aggregates them:
-
-- split data into folds \\(S_1, \\ldots, S_K\\)
-- for each fold \\(k\\):
-  - estimate nuisances (including \\(\\pi_p\\)) on training data (all folds except \\(k\\))
-  - compute fold-specific estimates on test fold \\(k\\)
-- aggregate fold-specific estimates across \\(k\\)
-
-DML1 example (default):
-
-```r
-fit_eff_dml1 <- Eff(
-  dat         = dat,
-  K           = 3,
-  type        = 1,      # DML1
-  phi_start   = NULL,
-  max_restart = 10,
-  x_info      = TRUE,   # or FALSE if you only have the union sample
-  progress    = TRUE
-)
-
-fit_eff_dml1$phi
-fit_eff_dml1$theta
-fit_eff_dml1$se
-fit_eff_dml1$ci
-fit_eff_dml1$info
-```
-
-### Eff: DML2 (default)
-
-DML2 example:
-
-```r
-fit_eff_dml2 <- Eff(
-  dat         = dat,
-  K           = 2,
-  type        = 2,      # DML2
-  phi_start   = NULL,
-  max_restart = 10,
-  x_info      = TRUE,   # or FALSE if you only have the union sample
-  progress    = TRUE
-)
-
-fit_eff_dml2$phi
-fit_eff_dml2$theta
-fit_eff_dml2$se
-fit_eff_dml2$ci
-fit_eff_dml2$info
-```
-
-Eff returns joint sandwich-based standard errors for both \\(\\theta\\) and \\(\\phi\\)
-(`phi_se`, `phi_ci`).
-
-> Tip: If you do not have \\((0,0)\\) units / do not have \\(X\\) for them, using `x_info = FALSE` can be much faster.
-> This is common when your dataset is the union sample only.
-
----
-
-## Comparison estimators (P / NP / NP ∪ P)  ✅ Updated: population size `N` and Hajek option
-
-For simulations, it is sometimes useful to compare `Eff` against simpler estimators:
-
-- `df_estimate_P()`     : probability-only estimator (HT-type)
-- `df_estimate_NP()`    : non-probability-only estimator (Chang & Kott-type; requires `base_fun`)
-- `df_estimate_NP_P()`  : NP union P estimator (Chang & Kott-type; requires `base_fun`)
-
-### Why `N` matters (union-only input)
-
-`df_estimate_P()` / `df_estimate_NP()` / `df_estimate_NP_P()` compute \\(\\theta=E(Y)\\) using contributions that are naturally on the **population-total** scale.
-When your `dat` includes the **full frame** (i.e., it contains \\((d_{np}, d_p)=(0,0)\\) rows), the functions can safely use `N = nrow(dat)` internally.
-
-However, if you only pass the **union sample** (no \\((0,0)\\) rows), then `nrow(dat)` is **not** the population size and would create a scale error.
-To prevent silent nonsense, dfSEDI **requires** you to specify the population size `N` in that case **unless** you request the Hajek (ratio) form.
-
-### Function signatures (updated)
-
-- `df_estimate_P(dat, N = NULL, hajek = FALSE)`
-- `df_estimate_NP(dat, base_fun, phi_start = NULL, max_iter = 20, N = NULL, hajek = FALSE)`
-- `df_estimate_NP_P(dat, base_fun, phi_start = NULL, max_iter = 20, N = NULL, hajek = FALSE)`
-
-**Defaults are output-preserving**: if `dat` contains full-frame rows, omitting `N` and `hajek` reproduces the previous behavior and output fields.
-
-### Examples
-
-**(A) Full-frame `dat` (simulation-like): no need to pass `N`**
-
-```r
-# Probability-only (HT-type)
-fit_P <- df_estimate_P(dat)
-
-# Define the basis for the NP inclusion model
-base_fun <- function(X) {
-  cbind(1, X, X[, 1]^2)
-}
-
-fit_NP   <- df_estimate_NP(dat, base_fun = base_fun)
-fit_NP_P <- df_estimate_NP_P(dat, base_fun = base_fun)
-```
-
-**(B) Union-only `dat_union`: pass `N` (HT-style mean over the full population)**
-
-```r
-dat_union <- subset(dat, d_np == 1 | d_p == 1)
-
-N_pop <- 10000  # known population/frame size
-
-fit_P     <- df_estimate_P(dat_union, N = N_pop)
-fit_NP    <- df_estimate_NP(dat_union, base_fun = base_fun, N = N_pop)
-fit_NP_P  <- df_estimate_NP_P(dat_union, base_fun = base_fun, N = N_pop)
-```
-
-**(C) Union-only `dat_union`: Hajek (ratio) form (does not require `N`)**
-
-```r
-fit_P_hajek    <- df_estimate_P(dat_union, hajek = TRUE)
-fit_NP_hajek   <- df_estimate_NP(dat_union, base_fun = base_fun, hajek = TRUE)
-fit_NP_P_hajek <- df_estimate_NP_P(dat_union, base_fun = base_fun, hajek = TRUE)
-
-# Hajek results are returned as additional fields:
-fit_P_hajek$hajek_theta
-fit_P_hajek$hajek_se
-fit_P_hajek$hajek_ci
-```
-
-Each estimator always returns `theta`, `se`, `ci`:
-
-```r
-fit_P$theta;    fit_P$se;    fit_P$ci
-fit_NP$theta;   fit_NP$se;   fit_NP$ci
-fit_NP_P$theta; fit_NP_P$se; fit_NP_P$ci
-```
-
-If `hajek = TRUE`, the returned object also includes `hajek_theta`, `hajek_se`, and `hajek_ci`
-(while preserving the original `theta/se/ci` fields).
-
-> Note: `df_estimate_NP()` / `df_estimate_NP_P()` solve estimating equations and may return `NA`
-> if the solver fails to converge. This is expected in some small samples or unstable designs.
-
----
-
-## Eff_S (sub-efficient)
-
-```r
-fit_effS <- Eff_S(
-  dat      = dat,
-  K        = 2,
-  progress = TRUE
-)
-
-fit_effS$theta
-fit_effS$se
-fit_effS$ci
-fit_effS$info
-```
-
-`Eff_S` is based on a sub-efficient influence function that only involves the outcome
-regression \\(\\mu(X)=E(Y \\mid X)\\).
-
----
-
-## Eff_P (parametric working model)
-
-```r
-fit_effP <- Eff_P(
-  dat       = dat,
-  phi_start = NULL,
-  eta4_star = 0,
-  max_iter  = 20,
-  progress  = TRUE
-)
-
-fit_effP$phi
-fit_effP$theta
-fit_effP$se
-fit_effP$ci
-fit_effP$info
-```
-
-
-### Eff_P with union sample only (`x_info = FALSE`)
-
-If your input data contain only sampled units (union sample), set `x_info = FALSE`:
-
-```r
-dat_union <- subset(dat, d_np == 1 | d_p == 1)
-
-fit_effP_union <- Eff_P(
-  dat      = dat_union,
-  x_info   = FALSE,
-  progress = TRUE
-)
-
-fit_effP_union$phi
-fit_effP_union$theta
-fit_effP_union$se
-fit_effP_union$ci
-fit_effP_union$info
-```
-
-> Note on scaling: `Eff_P()` currently does **not** take a population-size argument `N`.
-> If you need \(\theta=E(Y)\) on the full-frame mean scale when using a union-sample-only dataset,
-> rescale the output by `n_union / N` (where `n_union = nrow(dat_union)` and `N` is the frame size):
-
-```r
-n_union <- nrow(dat_union)
-theta_pop <- fit_effP_union$theta * n_union / N
-se_pop    <- fit_effP_union$se    * n_union / N
-ci_pop    <- fit_effP_union$ci    * n_union / N
-```
-
-`Eff_P` assumes parametric working models for both the sampling mechanism and the
-outcome regression. It returns point estimates and standard errors for \\(\\theta\\);
-standard errors for \\(\\phi\\) are not currently implemented in `Eff_P`.
-
----
-
-## Binary outcomes (Y is 0/1): logistic models for Eff_S and Eff_P
-
-If the outcome `y` is binary (0/1), dfSEDI can use logistic models for the outcome regression \\(\\mu(X)=P(Y=1\\mid X)\\):
-
-- **Eff_S**: \\(\\mu(X)\\) is estimated by **kernel logistic regression** (RBF / mixed kernel + ridge regularization).
-- **Eff_P**: \\(\\mu(X)\\) is estimated by **parametric logistic regression** (`glm(..., family=binomial())`).
-
-### How dfSEDI decides whether `y` is binary
-
-`y` is treated as binary if it is one of:
-
-- numeric/integer with exactly two unique finite values (e.g. 0/1),
-- `logical`,
-- a 2-level `factor` (or `character`, which will be treated like a 2-level factor).
-
-By default, both `Eff_S()` and `Eff_P()` have `logit = NULL`, which means:
-
-- If `y` is binary, dfSEDI **automatically uses logistic models** for \\(\\mu(X)\\).
-- If `y` is not binary, dfSEDI uses the original models:
-  - Eff_S: kernel ridge regression for \\(\\mu(X)\\)
-  - Eff_P: linear regression for \\(\\mu(X)\\)
-
-You can override this behavior explicitly:
-
-```r
-# Force logistic (errors if y is not binary)
-fit_effS_bin <- Eff_S(dat, K = 2, logit = TRUE)
-fit_effP_bin <- Eff_P(dat, logit = TRUE)
-
-# Force non-logistic (even if y is binary)
-fit_effS_lin <- Eff_S(dat, K = 2, logit = FALSE)
-fit_effP_lin <- Eff_P(dat, logit = FALSE)
-```
-
-### Note on coding of success (=1)
-
-- If `y` is a 2-level factor, dfSEDI treats the **second level** as the success category (=1).
-- If `y` is numeric with two unique values, dfSEDI treats the **larger value** as success (=1).
-
-To avoid ambiguity, you can always recode explicitly to `0/1` (or reorder factor levels) before calling dfSEDI.
-
----
-
-## Returned object structure
-
-`Eff`, `Eff_S`, and `Eff_P` return a list with (at least):
-
-- `theta` : point estimate of \\(\\theta = E(Y)\\)
-- `var`   : sandwich variance estimate for `theta`
-- `se`    : sandwich standard error for `theta`
-- `ci`    : 95% confidence interval for `theta`
-
-For the propensity parameter \\(\\phi\\):
-
-- `Eff` (DML1 / DML2) returns
-  - `phi`     : estimate of the NP propensity parameter
-  - `phi_var` : joint sandwich variance matrix for `phi`
-  - `phi_se`  : standard errors for each component of `phi`
-  - `phi_ci`  : 95% confidence intervals for each component of `phi`
-
-- `Eff_P` returns `phi` but currently leaves `phi_var`, `phi_se`, and `phi_ci` as `NULL`.
-
-If you call a comparison estimator (`df_estimate_P/NP/NP_P`) with `hajek = TRUE`,
-the returned list also includes:
-
-- `hajek_theta` : Hajek (ratio) estimate for \\(\\theta\\)
-- `hajek_se`    : standard error for `hajek_theta` (delta-method)
-- `hajek_ci`    : 95% CI for `hajek_theta`
-
-The `info` element stores meta information (K, type, convergence code, etc.) that can
-be useful for diagnostics.
+Notes:
+- In the parallel examples above, we run one replication per seed, and the progress bar is shown in the master process.
+- If you want to list optional packages in DESCRIPTION, add:
+  - `pbapply` (progress bar for PSOCK clusters; works on Windows/macOS/Linux)
+  - `pbmcapply` (progress bar for fork-based parallelism; macOS/Linux only)
