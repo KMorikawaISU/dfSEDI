@@ -1,8 +1,25 @@
 ############################################################
 ## inst/examples/dualframe_simulation.R
+##
+## Dual-frame simulation + MC runner for dfSEDI
+##
+## - Scenarios S1/S2/S3 (paper-style DGP)
+## - Fit: P / NP / NP_P / Eff / Eff_union_dat / Eff_S / Eff_P
+## - MC: run_mc(B=..., ...) returns long-format results
+## - Summary: summarize_mc(res, theta_true=...)
+## - Parallel: run_mc(..., parallel="multicore" or "snow", n_cores=...)
+##
+## Notes:
+## - This script defines functions only; it does NOT run MC by default.
+## - For Windows, use parallel="snow" (multicore is not supported).
 ############################################################
 
+# dfSEDI is the main dependency
 library(dfSEDI)
+
+############################################################
+## 0) Utilities
+############################################################
 
 #------------------------------------------------------------
 # Normalize scenario input: 1/2/3 or "S1"/"S2"/"S3"
@@ -21,11 +38,49 @@ normalize_scenario <- function(Scenario) {
 }
 
 #------------------------------------------------------------
-# Data generating process (paper-style scenarios)
+# Safe wrapper: return NA outputs instead of stopping the whole loop
+#------------------------------------------------------------
+safe_fit <- function(expr) {
+  tryCatch(
+    expr,
+    error = function(e) {
+      list(theta = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_), error = e$message)
+    }
+  )
+}
+
+#------------------------------------------------------------
+# Convert a single fit object into one row (long format)
+#------------------------------------------------------------
+extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union) {
+  ci <- fit$ci
+  if (is.null(ci) || length(ci) != 2) ci <- c(NA_real_, NA_real_)
+
+  data.frame(
+    Scenario  = paste0("S", normalize_scenario(Scenario)),
+    rep       = rep,
+    estimator = estimator,
+    theta     = as.numeric(fit$theta),
+    se        = as.numeric(fit$se),
+    ci_l      = as.numeric(ci[1]),
+    ci_u      = as.numeric(ci[2]),
+    n_np      = n_np,
+    n_p       = n_p,
+    n_union   = n_union,
+    error     = if (!is.null(fit$error)) fit$error else NA_character_,
+    stringsAsFactors = FALSE
+  )
+}
+
+############################################################
+## 1) Data generating process (paper-style scenarios)
+############################################################
+#------------------------------------------------------------
+# DGP summary
 #
 # S1: Outcome O1 and NP mechanism NP1, available L=(X,Y)
 #   X ~ N(0,1)
-#   Y = -exp(-2) + cos(2X) + 0.5X + eps
+#   Y = -exp(-2) + cos(2X) + 0.5X + eps, eps~N(0,0.5^2)
 #   logit P(d_np=1 | x,y) = -2.15 - 0.5 x - 0.75 y
 #
 # S2: Outcome O2 and NP mechanism NP1, available L=(X,Y)
@@ -85,7 +140,7 @@ generate_dualframe_population <- function(N, Scenario = 1, pi_p_offset = 0.005) 
   }
 
   data.frame(
-    X     = I(X),   # store as a matrix-column
+    X     = I(X),   # store as a matrix-column (AsIs class is OK; dfSEDI strips internally)
     y     = y,
     d_np  = d_np,
     d_p   = d_p,
@@ -94,11 +149,11 @@ generate_dualframe_population <- function(N, Scenario = 1, pi_p_offset = 0.005) 
   )
 }
 
-#------------------------------------------------------------
-# Default basis function for Chang & Kott-type NP estimators
+############################################################
+## 2) Default basis function for Chang & Kott-type NP estimators
+############################################################
 # - S1/S2: g(x) = (1, x, x^2)^T  -> returns n x (p+2) with p=1 => 3 columns
 # - S3:    g(x) = (1, x, x^2, z)^T -> p=2 => 4 columns
-#------------------------------------------------------------
 make_base_fun <- function(Scenario) {
   sc <- normalize_scenario(Scenario)
 
@@ -116,46 +171,23 @@ make_base_fun <- function(Scenario) {
   base_fun
 }
 
-#------------------------------------------------------------
-# Safe wrapper: return NA outputs instead of stopping the whole loop
-#------------------------------------------------------------
-safe_fit <- function(expr) {
-  tryCatch(
-    expr,
-    error = function(e) {
-      list(theta = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_), error = e$message)
-    }
-  )
-}
-
-#------------------------------------------------------------
-# Convert a single fit object into one row (long format)
-#------------------------------------------------------------
-extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union) {
-  ci <- fit$ci
-  if (is.null(ci) || length(ci) != 2) ci <- c(NA_real_, NA_real_)
-
-  data.frame(
-    Scenario  = paste0("S", normalize_scenario(Scenario)),
-    rep       = rep,
-    estimator = estimator,
-    theta     = as.numeric(fit$theta),
-    se        = as.numeric(fit$se),
-    ci_l      = as.numeric(ci[1]),
-    ci_u      = as.numeric(ci[2]),
-    n_np      = n_np,
-    n_p       = n_p,
-    n_union   = n_union,
-    error     = if (!is.null(fit$error)) fit$error else NA_character_,
-    stringsAsFactors = FALSE
-  )
-}
-
-#------------------------------------------------------------
-# Fit all requested estimators once
+############################################################
+## 3) Fit all requested estimators once (single dataset)
+############################################################
 #   P, NP, NP_P, Eff, Eff(union_dat), Eff_S, Eff_P
-#------------------------------------------------------------
-fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE) {
+#
+# Arguments:
+# - K         : #folds used inside Eff/Eff_S
+# - Eff_type  : 1 (DML1) or 2 (DML2)
+# - x_info    : TRUE (full formula), FALSE (union-only formulation)
+#
+fit_all_estimators_once <- function(dat,
+                                    Scenario,
+                                    K = 2,
+                                    Eff_type = 1,
+                                    x_info = TRUE,
+                                    progress_each = FALSE) {
+
   base_fun <- make_base_fun(Scenario)
 
   n_np    <- sum(dat$d_np == 1)
@@ -169,33 +201,33 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
   fit_NP   <- safe_fit(df_estimate_NP(dat, base_fun = base_fun))
   fit_NP_P <- safe_fit(df_estimate_NP_P(dat, base_fun = base_fun))
 
-  # (4) Efficient (full data with (0,0) rows allowed): x_info = TRUE
+  # (4) Efficient estimator (full data allowed): x_info is user-controlled here
   fit_Eff <- safe_fit(Eff(
     dat         = dat,
     K           = K,
+    type        = Eff_type,        # 1=DML1, 2=DML2
     phi_start   = NULL,
     max_restart = 10,
     progress    = progress_each,
-    x_info      = TRUE
+    x_info      = x_info
   ))
 
-  # (5) Efficient using union sample only: x_info = FALSE
-  # NOTE: To target the population mean E(Y) with union-only data, we must supply the
-  # full frame size N (because the returned value is an average over the observed rows).
+  # (5) Efficient estimator using union sample only:
+  #     if x_info=FALSE and you want population mean E(Y), pass N.
   dat_union <- dat[dat$d_np == 1 | dat$d_p == 1, , drop = FALSE]
 
   eff_union_args <- list(
     dat         = dat_union,
     K           = K,
+    type        = Eff_type,
     phi_start   = NULL,
     max_restart = 10,
     progress    = progress_each,
     x_info      = FALSE
   )
   if ("N" %in% names(formals(Eff))) {
-    eff_union_args$N <- nrow(dat)
+    eff_union_args$N <- nrow(dat)  # true frame size in simulations
   }
-
   fit_Eff_union <- safe_fit(do.call(Eff, eff_union_args))
 
   # (6) Sub-efficient
@@ -203,7 +235,7 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
     dat      = dat,
     K        = K,
     progress = progress_each,
-    x_info   = TRUE
+    x_info   = x_info
   ))
 
   # (7) Parametric efficient (working model)
@@ -213,7 +245,7 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
     eta4_star = 0,
     max_iter  = 20,
     progress  = progress_each,
-    x_info    = TRUE
+    x_info    = x_info
   ))
 
   list(
@@ -231,92 +263,178 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
 }
 
 ############################################################
-## One Monte Carlo replication (returns fits + theta vector)
+## 4) One MC replication: returns long-format rows
 ############################################################
-simulate_one_replication <- function(seed,
-                                     N        = 10000,
-                                     K        = 2,
-                                     Scenario = 1,
-                                     progress = FALSE) {
+mc_one_rep_long <- function(seed,
+                            rep_id,
+                            N,
+                            Scenario,
+                            K,
+                            Eff_type,
+                            x_info,
+                            pi_p_offset,
+                            progress_each_fit = FALSE) {
 
   set.seed(seed)
-  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
 
-  fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress)
-
-  theta_vec <- c(
-    P             = fits$P$theta,
-    NP            = fits$NP$theta,
-    NP_P          = fits$NP_P$theta,
-    Eff           = fits$Eff$theta,
-    Eff_union_dat = fits$Eff_union$theta,
-    Eff_S         = fits$Eff_S$theta,
-    Eff_P         = fits$Eff_P$theta
+  dat <- generate_dualframe_population(
+    N = N,
+    Scenario = Scenario,
+    pi_p_offset = pi_p_offset
   )
 
-  list(
-    theta = theta_vec,
-    fits  = fits,
-    dat   = dat
+  fits <- fit_all_estimators_once(
+    dat = dat,
+    Scenario = Scenario,
+    K = K,
+    Eff_type = Eff_type,
+    x_info = x_info,
+    progress_each = progress_each_fit
+  )
+
+  rbind(
+    extract_row(fits$P,         "P",             rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,        "NP",            rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,      "NP_P",          rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff,       "Eff",           rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union, "Eff_union_dat", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,     "Eff_S",         rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,     "Eff_P",         rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
 }
 
 ############################################################
-## Monte Carlo runner (long-format output)
+## 5) MC runner (serial / parallel)
 ############################################################
 run_mc <- function(B,
                    N = 10000,
                    Scenario = 1,
                    K = 2,
+                   Eff_type = 1,              # 1=DML1, 2=DML2
+                   x_info = TRUE,
                    seed_start = 1,
                    show_progress = TRUE,
                    progress_each_fit = FALSE,
-                   pi_p_offset = 0.005) {
+                   pi_p_offset = 0.005,
+                   parallel = c("none", "multicore", "snow"),
+                   n_cores = NULL) {
 
-  out_list <- vector("list", B)
+  parallel <- match.arg(parallel)
 
-  if (show_progress) {
-    pb <- txtProgressBar(min = 0, max = B, style = 3)
-    on.exit(close(pb), add = TRUE)
-  }
+  B <- as.integer(B)
+  if (!is.finite(B) || B < 1L) stop("B must be a positive integer.")
 
-  for (b in seq_len(B)) {
-    seed <- seed_start + b - 1
-    set.seed(seed)
+  sc <- normalize_scenario(Scenario)
 
-    dat <- generate_dualframe_population(
+  seeds <- seed_start + seq_len(B) - 1L
+  rep_ids <- seq_len(B)
+
+  # worker function (must be self-contained)
+  worker <- function(i) {
+    mc_one_rep_long(
+      seed = seeds[i],
+      rep_id = rep_ids[i],
       N = N,
-      Scenario = Scenario,
-      pi_p_offset = pi_p_offset
-    )
-
-    fits <- fit_all_estimators_once(
-      dat = dat,
-      Scenario = Scenario,
+      Scenario = sc,
       K = K,
-      progress_each = progress_each_fit
+      Eff_type = Eff_type,
+      x_info = x_info,
+      pi_p_offset = pi_p_offset,
+      progress_each_fit = progress_each_fit
     )
-
-    out_list[[b]] <- rbind(
-      extract_row(fits$P,         "P",             b, Scenario, fits$n_np, fits$n_p, fits$n_union),
-      extract_row(fits$NP,        "NP",            b, Scenario, fits$n_np, fits$n_p, fits$n_union),
-      extract_row(fits$NP_P,      "NP_P",          b, Scenario, fits$n_np, fits$n_p, fits$n_union),
-      extract_row(fits$Eff,       "Eff",           b, Scenario, fits$n_np, fits$n_p, fits$n_union),
-      extract_row(fits$Eff_union, "Eff_union_dat", b, Scenario, fits$n_np, fits$n_p, fits$n_union),
-      extract_row(fits$Eff_S,     "Eff_S",         b, Scenario, fits$n_np, fits$n_p, fits$n_union),
-      extract_row(fits$Eff_P,     "Eff_P",         b, Scenario, fits$n_np, fits$n_p, fits$n_union)
-    )
-
-    if (show_progress) setTxtProgressBar(pb, b)
   }
+
+  # ---- Serial ----
+  if (parallel == "none") {
+    out_list <- vector("list", B)
+
+    if (show_progress) {
+      pb <- utils::txtProgressBar(min = 0, max = B, style = 3)
+      on.exit(close(pb), add = TRUE)
+    }
+
+    for (b in seq_len(B)) {
+      out_list[[b]] <- worker(b)
+      if (show_progress) utils::setTxtProgressBar(pb, b)
+    }
+
+    return(do.call(rbind, out_list))
+  }
+
+  # ---- Parallel (base 'parallel' package; recommended in R) ----
+  if (!requireNamespace("parallel", quietly = TRUE)) {
+    stop("Package 'parallel' is required for parallel != 'none'.", call. = FALSE)
+  }
+
+  if (is.null(n_cores)) {
+    n_cores <- parallel::detectCores(logical = TRUE)
+    if (!is.finite(n_cores) || n_cores < 1L) n_cores <- 1L
+    # leave 1 core free by default
+    n_cores <- max(1L, as.integer(n_cores) - 1L)
+  }
+  n_cores <- as.integer(n_cores)
+  if (!is.finite(n_cores) || n_cores < 1L) n_cores <- 1L
+
+  if (parallel == "multicore") {
+    # NOTE: not supported on Windows
+    out_list <- parallel::mclapply(seq_len(B), worker, mc.cores = n_cores)
+    return(do.call(rbind, out_list))
+  }
+
+  # snow cluster (works on Windows/macOS/Linux)
+  cl <- parallel::makeCluster(n_cores)
+  on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
+
+  # Make sure workers can see dfSEDI + functions defined in this script
+  parallel::clusterEvalQ(cl, library(dfSEDI))
+
+  # Export everything the worker uses (functions + objects)
+  parallel::clusterExport(
+    cl,
+    varlist = c(
+      "normalize_scenario",
+      "generate_dualframe_population",
+      "make_base_fun",
+      "safe_fit",
+      "extract_row",
+      "fit_all_estimators_once",
+      "mc_one_rep_long",
+      "seeds",
+      "rep_ids",
+      "N",
+      "sc",
+      "K",
+      "Eff_type",
+      "x_info",
+      "pi_p_offset",
+      "progress_each_fit"
+    ),
+    envir = environment()
+  )
+
+  out_list <- parallel::parLapply(cl, seq_len(B), function(i) {
+    # call the already-exported function
+    mc_one_rep_long(
+      seed = seeds[i],
+      rep_id = rep_ids[i],
+      N = N,
+      Scenario = sc,
+      K = K,
+      Eff_type = Eff_type,
+      x_info = x_info,
+      pi_p_offset = pi_p_offset,
+      progress_each_fit = progress_each_fit
+    )
+  })
 
   do.call(rbind, out_list)
 }
 
-#------------------------------------------------------------
-# Optional: summarize MC results (mean, bias, RMSE, coverage)
+############################################################
+## 6) MC summary
+############################################################
+# Summarize MC results (mean, bias, RMSE, coverage)
 # theta_true defaults to 0 (true mean is 0 in the bundled scenarios)
-#------------------------------------------------------------
 summarize_mc <- function(res, theta_true = 0) {
   split_list <- split(res, res$estimator)
 
@@ -345,7 +463,7 @@ summarize_mc <- function(res, theta_true = 0) {
       n_ok       = nrow(dd),
       mean_theta = mean(dd$theta),
       bias       = mean(dd$theta) - theta_true,
-      sd         = sd(dd$theta),
+      sd         = stats::sd(dd$theta),
       rmse       = sqrt(mean((dd$theta - theta_true)^2)),
       mean_se    = mean(dd$se),
       coverage   = mean(dd$ci_l <= theta_true & theta_true <= dd$ci_u),
@@ -358,68 +476,57 @@ summarize_mc <- function(res, theta_true = 0) {
 }
 
 ############################################################
-## main(): single dataset test, no Monte Carlo
+## 7) Single dataset quick test (no MC)
 ############################################################
-main <- function(N = 10000, K = 2, Scenario = 1, x_info = TRUE) {
+main <- function(N = 10000,
+                 K = 2,
+                 Scenario = 1,
+                 Eff_type = 1,
+                 x_info = TRUE,
+                 pi_p_offset = 0.005) {
 
-  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
+  dat <- generate_dualframe_population(
+    N = N,
+    Scenario = Scenario,
+    pi_p_offset = pi_p_offset
+  )
 
-  sc <- normalize_scenario(Scenario)
-
-  # Optional starting value for phi (useful for debugging only)
-  # For S1/S2, the true NP mechanism is linear in (1, x, y).
-  # For S3, the mechanism is nonlinear in y, so there is no "true phi" under the working model.
-  phi_start <- if (sc %in% c(1, 2)) c(-2.15, -0.5, -0.75) else NULL
-
-  # 1) Efficient estimator Eff
-  fit_eff <- Eff(
-    dat         = dat,
-    K           = K,
-    phi_start   = phi_start,
-    max_restart = 10,
-    progress    = TRUE,
-    x_info      = x_info
+  fits <- fit_all_estimators_once(
+    dat = dat,
+    Scenario = Scenario,
+    K = K,
+    Eff_type = Eff_type,
+    x_info = x_info,
+    progress_each = TRUE
   )
 
   cat("\n=== Eff ===\n")
-  print(fit_eff$phi)
-  print(fit_eff$theta)
-  print(fit_eff$se)
-  print(fit_eff$ci)
+  print(fits$Eff$phi)
+  print(fits$Eff$theta)
+  print(fits$Eff$se)
+  print(fits$Eff$ci)
 
-  # 2) Sub-efficient estimator Eff_S
-  fit_effS <- Eff_S(
-    dat      = dat,
-    K        = K,
-    progress = TRUE,
-    x_info   = x_info
-  )
-
-  cat("\n=== Eff_S ===\n")
-  print(fit_effS$theta)
-  print(fit_effS$se)
-  print(fit_effS$ci)
-
-  # 3) Parametric efficient estimator Eff_P
-  fit_effP <- Eff_P(
-    dat       = dat,
-    phi_start = phi_start,
-    eta4_star = 0,
-    max_iter  = 20,
-    progress  = TRUE,
-    x_info    = x_info
-  )
-
-  cat("\n=== Eff_P ===\n")
-  print(fit_effP$phi)
-  print(fit_effP$theta)
-  print(fit_effP$se)
-  print(fit_effP$ci)
-
-  invisible(list(
-    dat     = dat,
-    Eff     = fit_eff,
-    Eff_S   = fit_effS,
-    Eff_P   = fit_effP
-  ))
+  invisible(list(dat = dat, fits = fits))
 }
+
+############################################################
+## 8) Usage examples (commented out)
+############################################################
+
+# ---- Example: single run ----
+# source(system.file("examples", "dualframe_simulation.R", package="dfSEDI"))
+# out <- main(N=10000, K=2, Scenario=1, Eff_type=1, x_info=TRUE)
+#
+# ---- Example: MC (serial) ----
+# res <- run_mc(B=100, N=10000, Scenario=1, K=2, Eff_type=1, x_info=TRUE, parallel="none")
+# summarize_mc(res, theta_true=0)
+#
+# ---- Example: MC (parallel, macOS/Linux) ----
+# res <- run_mc(B=200, N=10000, Scenario=1, K=2, Eff_type=1, x_info=TRUE,
+#               parallel="multicore", n_cores=4)
+# summarize_mc(res)
+#
+# ---- Example: MC (parallel, Windows/macOS/Linux) ----
+# res <- run_mc(B=200, N=10000, Scenario=1, K=2, Eff_type=1, x_info=TRUE,
+#               parallel="snow", n_cores=4)
+# summarize_mc(res)

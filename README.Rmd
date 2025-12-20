@@ -237,6 +237,123 @@ fit_eff_full$info
 
 ---
 
+
+## Monte Carlo simulation (serial / parallel with progress)
+
+The example script `inst/examples/dualframe_simulation.R` also defines:
+
+- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset)`
+- `summarize_mc(res, theta_true = 0)`
+
+`run_mc()` returns a **long-format** data frame (one row per replication × estimator),
+so it is easy to summarize or plot.
+
+### Serial MC (built-in progress bar)
+
+```r
+example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
+source(example_file)
+
+res <- run_mc(
+  B = 100,
+  N = 10000,
+  Scenario = 1,
+  K = 2,
+  seed_start = 1,
+  show_progress = TRUE,        # text progress bar
+  progress_each_fit = FALSE
+)
+
+summary <- summarize_mc(res, theta_true = 0)
+summary
+```
+
+### Parallel MC + progress bar (recommended cross-platform)
+
+Base `parallel` does not provide an easy progress bar for parallel workers.
+For a progress bar **with parallel execution**, we recommend the *snow* cluster
+approach with `pbapply`.
+
+**Needed packages (Suggests):** `parallel`, `pbapply`
+
+```r
+# install.packages("pbapply")  # if needed
+
+example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
+source(example_file)
+
+library(parallel)
+library(pbapply)
+
+n_workers <- max(1L, parallel::detectCores() - 1L)
+cl <- parallel::makeCluster(n_workers)
+on.exit(parallel::stopCluster(cl), add = TRUE)
+
+# (Optional) show a nice text progress bar
+pbapply::pboptions(type = "txt")
+
+# Ensure workers can call dfSEDI + the example functions
+parallel::clusterEvalQ(cl, { library(dfSEDI) })
+parallel::clusterExport(
+  cl,
+  varlist = c(
+    "normalize_scenario",
+    "generate_dualframe_population",
+    "make_base_fun",
+    "safe_fit",
+    "extract_row",
+    "fit_all_estimators_once"
+  ),
+  envir = environment()
+)
+
+B <- 100
+seed_start <- 1
+seeds <- seed_start + seq_len(B) - 1
+
+# One replication -> one long-format data.frame
+one_rep_long <- function(seed) {
+  dat <- generate_dualframe_population(N = 10000, Scenario = 1)
+  fits <- fit_all_estimators_once(dat = dat, Scenario = 1, K = 2, progress_each = FALSE)
+
+  rbind(
+    extract_row(fits$P,         "P",             seed, 1, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,        "NP",            seed, 1, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,      "NP_P",          seed, 1, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff,       "Eff",           seed, 1, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union, "Eff_union_dat", seed, 1, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,     "Eff_S",         seed, 1, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,     "Eff_P",         seed, 1, fits$n_np, fits$n_p, fits$n_union)
+  )
+}
+
+# Progress bar appears in the master process while workers run in parallel
+out_list <- pbapply::pblapply(seeds, function(s) {
+  set.seed(s)
+  one_rep_long(s)
+}, cl = cl)
+
+res_par <- do.call(rbind, out_list)
+
+summary_par <- summarize_mc(res_par, theta_true = 0)
+summary_par
+```
+
+### Notes
+
+- **Windows users:** use the snow cluster approach above (works everywhere).
+- **macOS/Linux users:** you can also use fork-based parallelism (`mclapply`), but
+  progress bars are trickier. If you want a progress bar in multicore mode,
+  consider `pbmcapply` (Suggests) instead.
+
+If you want to list optional packages in DESCRIPTION:
+
+- `pbapply` (progress bar for snow parallel)
+- `pbmcapply` (progress bar for multicore; macOS/Linux)
+
+
+---
+
 ## Eff: DML (DML1 optional)
 
 `Eff()` supports two DML variants:
