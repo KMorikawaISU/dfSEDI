@@ -175,8 +175,6 @@ $$
 B = \texttt{base\\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
 $$
 
-### Strict validation
-
 dfSEDI performs strict checks for safety:
 
 - `nrow(base_fun(X))` must equal `nrow(X)`
@@ -385,47 +383,73 @@ summarize_mc(res_par, theta_true = 0)
 
 ### Parallel MC with a progress bar (macOS / Linux)
 
-Option A (simplest and cross-platform): use the same PSOCK + `pbapply`
-approach as above (`parallel::makeCluster`, `pbapply::pblapply`).
+We recommend using the same PSOCK + `pbapply` approach as in the Windows
+section. This is more robust than fork-based parallelism and avoids the
+common `scheduled cores ... did not deliver results` issue.
 
-Option B (fork-based, often faster): use `pbmcapply`:
-
-Needed packages (Suggests): `pbmcapply`
+Needed packages (Suggests): `pbapply` (and base R `parallel`)
 
 ``` r
-# install.packages("pbmcapply")  # if needed
+# install.packages("pbapply")  # if needed
 
 library(dfSEDI)
-library(pbmcapply)
+library(parallel)
+library(pbapply)
 
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
 B <- 200
+N <- 10000
+Scenario <- 1
+K <- 2
+
 seeds <- 1 + seq_len(B) - 1
 
-res_list <- pbmcapply::pbmclapply(seeds, function(seed) {
+n_workers <- max(1L, parallel::detectCores() - 1L)
+cl <- parallel::makeCluster(n_workers)
+on.exit(parallel::stopCluster(cl), add = TRUE)
+
+pbapply::pboptions(type = "txt")
+
+parallel::clusterEvalQ(cl, library(dfSEDI))
+
+parallel::clusterExport(
+  cl,
+  varlist = c(
+    "normalize_scenario",
+    "generate_dualframe_population",
+    "make_base_fun",
+    "safe_fit",
+    "extract_row",
+    "fit_all_estimators_once"
+  ),
+  envir = environment()
+)
+
+one_rep <- function(seed) {
   set.seed(seed)
-  dat <- generate_dualframe_population(N = 10000, Scenario = 1)
-  fits <- fit_all_estimators_once(dat = dat, Scenario = 1, K = 2, progress_each = FALSE)
+  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
+  fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
 
   rbind(
-    extract_row(fits$P,         "P",             seed, 1, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP,        "NP",            seed, 1, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P,      "NP_P",          seed, 1, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff,       "Eff",           seed, 1, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union, "Eff_union_dat", seed, 1, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S,     "Eff_S",         seed, 1, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P,     "Eff_P",         seed, 1, fits$n_np, fits$n_p, fits$n_union)
+    extract_row(fits$P,         "P",             seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,        "NP",            seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,      "NP_P",          seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff,       "Eff",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union, "Eff_union_dat", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,     "Eff_S",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,     "Eff_P",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
-}, mc.cores = max(1L, parallel::detectCores() - 1L))
+}
 
-res_par <- do.call(rbind, res_list)
+out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
+res_par <- do.call(rbind, out_list)
+
 summarize_mc(res_par, theta_true = 0)
 ```
 
 Notes: - In the parallel examples above, we run one replication per
 seed, and the progress bar is shown in the master process. - If you want
 to list optional packages in DESCRIPTION, add: - `pbapply` (progress bar
-for PSOCK clusters; works on Windows/macOS/Linux) - `pbmcapply`
-(progress bar for fork-based parallelism; macOS/Linux only)
+for PSOCK clusters; works on Windows/macOS/Linux)

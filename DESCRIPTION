@@ -33,6 +33,7 @@ Imports:
     kernlab,
     stats,
     utils,
+    pbapply,
     parallel
 Suggests:
     knitr,
