@@ -19,7 +19,7 @@ For comparison (mainly for simulations), the package also includes:
 - `df_estimate_NP`    : non-probability-only estimator (Chang & Kott-type; **requires `base_fun`**)
 - `df_estimate_NP_P`  : NP union P estimator (Chang & Kott-type; **requires `base_fun`**)
 
-All estimators return a point estimate for \\(\\theta = E(Y)\\), and sandwich-type SE/CI computed from influence-function / pseudo-outcome contributions.
+All estimators return a point estimate for \(\theta = E(Y)\), and sandwich-type SE/CI computed from influence-function / pseudo-outcome contributions.
 
 ---
 
@@ -54,28 +54,28 @@ All core functions assume a data frame `dat` that contains at least:
 - `pi_p`   : design inclusion probability for the probability sample
 - `pi_np`  : (optional; simulations only) true NP inclusion probability
 
-### Important: handling the \\((d_{np}, d_p) = (0,0)\\) pattern (`x_info`)
+### Important: handling the \((d_{np}, d_p) = (0,0)\) pattern (`x_info`)
 
-In the paper's notation, there are four response patterns \\((\\delta_{NP}, \\delta_P)\\in\\{0,1\\}^2\\).
+In the paper's notation, there are four response patterns \((\delta_{NP}, \delta_P)\in\{0,1\}^2\).
 In many *practical* data-integration tasks you only have units that appear in *either*
 the probability sample or the non-probability sample, i.e. you only observe the union sample
-\\(\\delta_{NP}\\cup\\delta_P = 1\\). In that common case, there are **no rows** with \\((d_{np}, d_p)=(0,0)\\).
+\(\delta_{NP}\cup\delta_P = 1\). In that common case, there are **no rows** with \((d_{np}, d_p)=(0,0)\).
 
-The paper also notes that the theory covers the case where \\(X\\) is unavailable when \\((\\delta_{NP},\\delta_P)=(0,0)\\);
-in that case, it suffices to set the augmentation functions \\(h_4^*(X)\\) and \\(\\eta_4^*(X)\\) to zero.
+The paper also notes that the theory covers the case where \(X\) is unavailable when \((\delta_{NP},\delta_P)=(0,0)\);
+in that case, it suffices to set the augmentation functions \(h_4^*(X)\) and \(\eta_4^*(X)\) to zero.
 
 dfSEDI exposes this choice via the flag `x_info`:
 
 - `x_info = FALSE` (**recommended for most real-data use cases**):  
-  Use the simplified formulation with \\(h_4^*(X)=\\eta_4^*(X)=0\\).  
+  Use the simplified formulation with \(h_4^*(X)=\eta_4^*(X)=0\).  
   This mode is intended for the common situation where you only have the union sample,
-  or you do not have covariates \\(X\\) for \\((0,0)\\) units. It also avoids computations
-  involving the \\((0,0)\\) pattern and can be substantially faster.
+  or you do not have covariates \(X\) for \((0,0)\) units. It also avoids computations
+  involving the \((0,0)\) pattern and can be substantially faster.
 
 - `x_info = TRUE`:  
   Use the full formulation as written in the main text of the paper.  
-  This is appropriate if you explicitly include \\((0,0)\\) units in `dat` **and** you have \\(X\\)
-  for those units (e.g., simulation studies, or settings with a population register providing \\(X\\)).
+  This is appropriate if you explicitly include \((0,0)\) units in `dat` **and** you have \(X\)
+  for those units (e.g., simulation studies, or settings with a population register providing \(X\)).
 
 
 > Note on population size `N` when `x_info = FALSE`:
@@ -96,7 +96,7 @@ dfSEDI exposes this choice via the flag `x_info`:
 
 ## Mixed continuous/discrete covariates (automatic)
 
-dfSEDI estimates nuisance functions (e.g., \\(\\mu(X)=E[Y\\mid X]\\), \\(\\pi_P\\), \\(\\eta_4^*(X)\\), \\(h_4^*(X)\\)) using kernel methods.
+dfSEDI estimates nuisance functions (e.g., \(\mu(X)=E[Y\mid X]\), \(\pi_P\), \(\eta_4^*(X)\), \(h_4^*(X)\)) using kernel methods.
 
 - If `X` is continuous-only, dfSEDI uses Gaussian/RBF kernels (via `kernlab::gausspr`).
 - If `X` contains **categorical/discrete** columns, dfSEDI automatically uses a **product kernel**:
@@ -112,7 +112,7 @@ This is equivalent to fitting separate kernel models *within each category combi
 
 **Recommended practice:** supply `X` as a `data.frame` and explicitly mark categorical variables as `factor`.
 
-> Note (parametric part for \\(\\phi\\)): If `X` is a `data.frame` with factor columns, dfSEDI internally uses dummy encoding (`model.matrix`) for the NP inclusion model so multi-level categorical variables enter as dummies automatically.
+> Note (parametric part for \(\phi\)): If `X` is a `data.frame` with factor columns, dfSEDI internally uses dummy encoding (`model.matrix`) for the NP inclusion model so multi-level categorical variables enter as dummies automatically.
 
 #### Small-cell warning (categorical cells)
 
@@ -128,14 +128,14 @@ options(dfSEDI.allow_small_cells = FALSE)          # bypass flag
 
 ## Chang & Kott-type NP estimators: specifying `base_fun` (NEW)
 
-`df_estimate_NP()` and `df_estimate_NP_P()` solve a Chang & Kott-type estimating equation for the NP propensity parameter \\(\\phi\\) using a user-supplied basis function:
+`df_estimate_NP()` and `df_estimate_NP_P()` solve a Chang & Kott-type estimating equation for the NP propensity parameter \(\phi\) using a user-supplied basis function:
 
 - `base_fun` must be a function of the form `base_fun <- function(X) { ... }`
-- `X` is the \\(n \\times p\\) design matrix extracted from `dat` (via `df_get_X(dat)`)
+- `X` is the \(n \times p\) design matrix extracted from `dat` (via `df_get_X(dat)`)
 - `base_fun(X)` must return a **numeric matrix** with shape:
 
 $$
-B = \texttt{base\\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
+B = \texttt{base\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
 $$
 ### Strict validation
 
@@ -215,7 +215,7 @@ fit_eff_union$ci
 fit_eff_union$info
 ```
 
-### Example B (simulation / full info): include \\((0,0)\\) rows (`x_info = TRUE`)
+### Example B (simulation / full info): include \((0,0)\) rows (`x_info = TRUE`)
 
 For simulation studies where you keep the full population-like data structure:
 
