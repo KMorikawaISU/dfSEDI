@@ -175,6 +175,8 @@ $$
 B = \texttt{base\\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
 $$
 
+### Strict validation
+
 dfSEDI performs strict checks for safety:
 
 - `nrow(base_fun(X))` must equal `nrow(X)`
