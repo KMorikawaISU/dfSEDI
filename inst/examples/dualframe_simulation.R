@@ -457,7 +457,7 @@ run_mc <- function(B,
       "pi_p_offset",
       "progress_each_fit"
     ),
-    envir = environment()
+    envir = environment(run_mc)
   )
 
   idxs <- seq_len(B)
