@@ -172,7 +172,7 @@ user-supplied basis function:
 - `base_fun(X)` must return a **numeric matrix** with shape:
 
 $$
-B = \texttt{base\\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
+B = \texttt{base\_fun}(X) \in \mathbb{R}^{n \times (p+2)}.
 $$
 
 dfSEDI performs strict checks for safety:
@@ -354,7 +354,10 @@ parallel::clusterExport(
     "make_base_fun",
     "safe_fit",
     "extract_row",
-    "fit_all_estimators_once"
+    "fit_all_estimators_once",
+    "N",
+    "Scenario",
+    "K"
   ),
   envir = environment()
 )
@@ -422,7 +425,10 @@ parallel::clusterExport(
     "make_base_fun",
     "safe_fit",
     "extract_row",
-    "fit_all_estimators_once"
+    "fit_all_estimators_once",
+    "N",
+    "Scenario",
+    "K"
   ),
   envir = environment()
 )
