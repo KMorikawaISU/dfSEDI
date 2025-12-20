@@ -12,6 +12,12 @@
 ## Notes:
 ## - This script defines functions only; it does NOT run MC by default.
 ## - For Windows, use parallel="snow" (multicore is not supported).
+##
+## IMPORTANT (Eff default in dfSEDI):
+## - Recent versions of dfSEDI use DML2 as the default for Eff().
+## - To make simulations reproducible across versions, this script
+##   *explicitly passes* `type = Eff_type` to Eff().
+## - The default Eff_type in this script is set to 2 (DML2).
 ############################################################
 
 # dfSEDI is the main dependency
@@ -178,13 +184,13 @@ make_base_fun <- function(Scenario) {
 #
 # Arguments:
 # - K         : #folds used inside Eff/Eff_S
-# - Eff_type  : 1 (DML1) or 2 (DML2)
+# - Eff_type  : 1 (DML1) or 2 (DML2). Default = 2 (matches current Eff default).
 # - x_info    : TRUE (full formula), FALSE (union-only formulation)
 #
 fit_all_estimators_once <- function(dat,
                                     Scenario,
                                     K = 2,
-                                    Eff_type = 1,
+                                    Eff_type = 2,
                                     x_info = TRUE,
                                     progress_each = FALSE) {
 
@@ -310,7 +316,7 @@ run_mc <- function(B,
                    N = 10000,
                    Scenario = 1,
                    K = 2,
-                   Eff_type = 1,              # 1=DML1, 2=DML2
+                   Eff_type = 2,              # 1=DML1, 2=DML2 (default)
                    x_info = TRUE,
                    seed_start = 1,
                    show_progress = TRUE,
@@ -413,7 +419,6 @@ run_mc <- function(B,
   )
 
   out_list <- parallel::parLapply(cl, seq_len(B), function(i) {
-    # call the already-exported function
     mc_one_rep_long(
       seed = seeds[i],
       rep_id = rep_ids[i],
@@ -481,7 +486,7 @@ summarize_mc <- function(res, theta_true = 0) {
 main <- function(N = 10000,
                  K = 2,
                  Scenario = 1,
-                 Eff_type = 1,
+                 Eff_type = 2,
                  x_info = TRUE,
                  pi_p_offset = 0.005) {
 
@@ -515,18 +520,18 @@ main <- function(N = 10000,
 
 # ---- Example: single run ----
 # source(system.file("examples", "dualframe_simulation.R", package="dfSEDI"))
-# out <- main(N=10000, K=2, Scenario=1, Eff_type=1, x_info=TRUE)
+# out <- main(N=10000, K=2, Scenario=1, Eff_type=2, x_info=TRUE)
 #
-# ---- Example: MC (serial) ----
-# res <- run_mc(B=100, N=10000, Scenario=1, K=2, Eff_type=1, x_info=TRUE, parallel="none")
+# ---- Example: MC (serial; default Eff_type=2 i.e. DML2) ----
+# res <- run_mc(B=100, N=10000, Scenario=1, K=2, Eff_type=2, x_info=TRUE, parallel="none")
 # summarize_mc(res, theta_true=0)
 #
 # ---- Example: MC (parallel, macOS/Linux) ----
-# res <- run_mc(B=200, N=10000, Scenario=1, K=2, Eff_type=1, x_info=TRUE,
+# res <- run_mc(B=200, N=10000, Scenario=1, K=2, Eff_type=2, x_info=TRUE,
 #               parallel="multicore", n_cores=4)
 # summarize_mc(res)
 #
 # ---- Example: MC (parallel, Windows/macOS/Linux) ----
-# res <- run_mc(B=200, N=10000, Scenario=1, K=2, Eff_type=1, x_info=TRUE,
+# res <- run_mc(B=200, N=10000, Scenario=1, K=2, Eff_type=2, x_info=TRUE,
 #               parallel="snow", n_cores=4)
 # summarize_mc(res)
