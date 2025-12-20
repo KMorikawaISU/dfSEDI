@@ -15,6 +15,15 @@
 ## - Eff_type defaults to 2 (DML2) to match the current Eff() default in dfSEDI.
 ## - The snow implementation uses internal parallel:::sendCall/recvOneResult to enable
 ##   dynamic scheduling + a progress bar. This avoids the common “idle CPU” issue.
+##
+## NEW (this revision):
+## - MC output now also includes phi estimates and (when available) their SE/CI.
+##   Columns added (fixed width up to 4 coefficients):
+##     phi_1..phi_4, phi_se_1..phi_se_4, phi_ci_l_1..phi_ci_l_4, phi_ci_u_1..phi_ci_u_4
+##   Notes:
+##   - Eff returns phi + phi_se + phi_ci (lower/upper).
+##   - NP / NP_P return phi but (currently) do not return phi_se/phi_ci -> filled with NA.
+##   - Estimators without phi -> all phi fields are NA.
 ############################################################
 
 library(dfSEDI)
@@ -38,16 +47,53 @@ safe_fit <- function(expr) {
   tryCatch(
     expr,
     error = function(e) {
-      list(theta = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_), error = e$message)
+      list(
+        theta = NA_real_,
+        se    = NA_real_,
+        ci    = c(NA_real_, NA_real_),
+        phi   = NA_real_,
+        phi_se = NA_real_,
+        phi_ci = matrix(NA_real_, nrow = 2, ncol = 1,
+                        dimnames = list(c("lower","upper"), NULL)),
+        error = e$message
+      )
     }
   )
 }
 
-extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union) {
+extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union, p_phi_max = 4L) {
   ci <- fit$ci
   if (is.null(ci) || length(ci) != 2) ci <- c(NA_real_, NA_real_)
 
-  data.frame(
+  # phi (fixed-width output up to p_phi_max)
+  phi     <- rep(NA_real_, p_phi_max)
+  phi_se  <- rep(NA_real_, p_phi_max)
+  phi_ci_l <- rep(NA_real_, p_phi_max)
+  phi_ci_u <- rep(NA_real_, p_phi_max)
+
+  if (!is.null(fit$phi)) {
+    phi0 <- as.numeric(fit$phi)
+    k <- min(length(phi0), p_phi_max)
+    if (k > 0) phi[1:k] <- phi0[1:k]
+  }
+
+  if (!is.null(fit$phi_se)) {
+    se0 <- as.numeric(fit$phi_se)
+    k <- min(length(se0), p_phi_max)
+    if (k > 0) phi_se[1:k] <- se0[1:k]
+  }
+
+  if (!is.null(fit$phi_ci) && is.matrix(fit$phi_ci) && nrow(fit$phi_ci) == 2) {
+    lo0 <- as.numeric(fit$phi_ci[1, ])
+    up0 <- as.numeric(fit$phi_ci[2, ])
+    k <- min(length(lo0), length(up0), p_phi_max)
+    if (k > 0) {
+      phi_ci_l[1:k] <- lo0[1:k]
+      phi_ci_u[1:k] <- up0[1:k]
+    }
+  }
+
+  out <- data.frame(
     Scenario  = paste0("S", normalize_scenario(Scenario)),
     rep       = rep,
     estimator = estimator,
@@ -61,6 +107,14 @@ extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union) {
     error     = if (!is.null(fit$error)) fit$error else NA_character_,
     stringsAsFactors = FALSE
   )
+
+  # Append phi columns (fixed width)
+  for (j in seq_len(p_phi_max)) out[[paste0("phi_", j)]] <- phi[j]
+  for (j in seq_len(p_phi_max)) out[[paste0("phi_se_", j)]] <- phi_se[j]
+  for (j in seq_len(p_phi_max)) out[[paste0("phi_ci_l_", j)]] <- phi_ci_l[j]
+  for (j in seq_len(p_phi_max)) out[[paste0("phi_ci_u_", j)]] <- phi_ci_u[j]
+
+  out
 }
 
 ############################################################
@@ -304,7 +358,8 @@ df_par_lapply_lb_progress <- function(cl, X, fun, show_progress = TRUE) {
 # Output:
 # - returns a data.frame in long format
 # - rows = 7 * B
-# - columns: Scenario, rep, estimator, theta, se, ci_l, ci_u, n_np, n_p, n_union, error
+# - columns (core): Scenario, rep, estimator, theta, se, ci_l, ci_u, n_np, n_p, n_union, error
+# - plus phi fields: phi_1..phi_4, phi_se_1..phi_se_4, phi_ci_l_1..phi_ci_l_4, phi_ci_u_1..phi_ci_u_4
 run_mc <- function(B,
                    N = 10000,
                    Scenario = 1,
