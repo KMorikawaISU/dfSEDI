@@ -43,11 +43,10 @@
 ##  - Sandwich variance: drop non-finite score rows; robust inversion with ridge;
 ##    theta variance fallback to contrib-based sandwich when needed
 ##
-## IMPORTANT (Median heuristic):
-##  - Default sigma rule (for kernlab::rbfdot) is:
-##      h = median(||x_i-x_j||),  sigma = 1/(2*h^2)
-##  - Revert to legacy behavior via:
-##      options(dfSEDI.sigma_rule = "legacy")  # sigma = 1/median(||x_i-x_j||)
+## IMPORTANT (Sigma rule):
+##  - RBF sigma rule (legacy / old version):
+##      sigma = 1 / median(||x_i - x_j||)
+##    where the median is taken over pairwise distances of a deterministic subsample (for speed).
 ##
 ## Output-preserving speed updates (this revision):
 ##  - Cache df_krr_mixed_prepare() per fold for eta4*/h4*
@@ -104,6 +103,94 @@ df_floor_pos <- function(x, floor = NULL) {
   x[!is.finite(x)] <- floor
   x <- pmax(x, floor)
   x
+}
+
+
+# Multi-start optimization helper
+# - Generate n_candidates initial values: center + Unif[-width, width]
+# - Evaluate objective at all candidates
+# - Try optim() from the best candidates in order (up to n_try)
+# - Stop at the first successful optimization (convergence == 0)
+df_multistart_optim <- function(obj_fun,
+                                center,
+                                n_candidates = 100L,
+                                n_try = 10L,
+                                width = 0.5,
+                                method = "Nelder-Mead",
+                                control = NULL) {
+  center <- as.numeric(center)
+  if (!all(is.finite(center))) stop("df_multistart_optim(): 'center' must be finite.")
+
+  p <- length(center)
+  n_candidates <- as.integer(n_candidates)[1]
+  if (!is.finite(n_candidates) || n_candidates < 1) n_candidates <- 100L
+  n_try <- as.integer(n_try)[1]
+  if (!is.finite(n_try) || n_try < 1) n_try <- 10L
+  n_try <- min(n_try, n_candidates)
+
+  width <- as.numeric(width)[1]
+  if (!is.finite(width) || width < 0) width <- 0.5
+  if (is.null(control)) control <- list()
+
+  # Candidate initial values: center + Unif[-width, width]
+  init_mat <- matrix(stats::runif(n_candidates * p, min = -width, max = width),
+                     nrow = n_candidates, ncol = p)
+  init_mat <- sweep(init_mat, 2, center, "+")
+
+  # Evaluate objective
+  vals <- rep(Inf, n_candidates)
+  for (i in seq_len(n_candidates)) {
+    v <- tryCatch(obj_fun(init_mat[i, ]), error = function(e) Inf)
+    if (!is.finite(v)) v <- Inf
+    vals[i] <- v
+  }
+
+  ord <- order(vals)
+
+  # Try optim() from the best starts (up to n_try)
+  for (j in seq_len(n_try)) {
+    idx <- ord[j]
+    start <- init_mat[idx, ]
+    res <- tryCatch(
+      stats::optim(par = start, fn = obj_fun, method = method, control = control),
+      error = function(e) NULL
+    )
+    if (!is.null(res) &&
+        is.list(res) &&
+        isTRUE(res$convergence == 0) &&
+        is.finite(res$value) &&
+        all(is.finite(res$par))) {
+      return(list(ok = TRUE, res = res, start = start, start_rank = j, init_vals = vals, init_order = ord))
+    }
+  }
+
+  list(ok = FALSE, res = NULL, init_vals = vals, init_order = ord)
+}
+
+# Prepare pi_p when it is observed only for d_p==1 units.
+# - For union-sample units (d_p==1 or d_np==1), pi_p must be finite (impute before if needed).
+# - For non-union units (d_p==0 & d_np==0), pi_p can be NA; we fill with a harmless value so
+#   algebraic expressions remain finite (these rows have zero influence on terms that need pi_p).
+df_prepare_pi_p <- function(pi_p, d_p, d_np, context = "dfSEDI") {
+  pi_p <- as.numeric(pi_p)
+  d_p  <- as.numeric(d_p)
+  d_np <- as.numeric(d_np)
+
+  union <- (d_p == 1 | d_np == 1)
+
+  if (any(union & !is.finite(pi_p))) {
+    stop(
+      context, ": `pi_p` is missing (NA/Inf) for some union-sample units (d_p==1 or d_np==1).\n",
+      "Impute pi_p for non-P units in the union sample first (e.g., impute_pi_p_crossfit() or a model-based imputation).",
+      call. = FALSE
+    )
+  }
+
+  fill_val <- mean(pi_p[is.finite(pi_p)], na.rm = TRUE)
+  if (!is.finite(fill_val)) fill_val <- 0.5
+
+  pi_p[!union & !is.finite(pi_p)] <- fill_val
+  df_clip_prob(pi_p)
 }
 
 # Apply x_info setting:
@@ -495,9 +582,8 @@ df_infer_categorical_cols <- function(X,
   sort(unique(c(cat_attr, cat_heur)))
 }
 
-# Deterministic subsampling for sigma estimation (reproducible)
-# Median heuristic (default): h = median(||x_i-x_j||), sigma = 1/(2*h^2)
-# Legacy option: sigma = 1/median(||x_i-x_j||)
+# Deterministic subsampling for sigma estimation (reproducible).
+# Legacy sigma rule (old version): sigma = 1 / median(||x_i-x_j||)
 df_estimate_rbf_sigma <- function(X_cont, max_n = 2000L) {
   X_cont <- as.matrix(X_cont)
   n <- nrow(X_cont)
@@ -521,15 +607,7 @@ df_estimate_rbf_sigma <- function(X_cont, max_n = 2000L) {
   med <- stats::median(dv)
   if (!is.finite(med) || med <= 0) return(1)
 
-  rule <- getOption("dfSEDI.sigma_rule", "median")
-  rule <- tolower(as.character(rule))[1]
-  if (!rule %in% c("median", "median_heuristic", "legacy")) rule <- "median"
-
-  if (rule %in% c("median", "median_heuristic")) {
-    return(1 / (2 * med^2))
-  } else {
-    return(1 / med)
-  }
+  1 / med
 }
 
 df_make_cat_key <- function(X_cat) {
@@ -1210,16 +1288,11 @@ pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
       stop("pi_np.est_simple(): `d_p` must be coded as 0/1 (or logical).", call. = FALSE)
     }
 
-    pi_p <- df_clip_prob(as.numeric(dat$pi_p))
+    # pi_p can be NA for (d_p,d_np)=(0,0); fill those to keep algebra finite.
+    # For union units (d_p==1 or d_np==1), pi_p must be finite (impute first if needed).
+    pi_p <- df_prepare_pi_p(dat$pi_p, d_p = d_p, d_np = d_np, context = "pi_np.est_simple()")
     if (length(pi_p) != n) {
       stop("pi_np.est_simple(): length(pi_p) must equal nrow(dat).", call. = FALSE)
-    }
-    if (any(!is.finite(pi_p))) {
-      stop(
-        "pi_np.est_simple(): `pi_p` contains NA/Inf.\n",
-        "Impute missing pi_p (e.g., via impute_pi_p_crossfit()) before calling pi_np.est_simple(..., p.use=TRUE).",
-        call. = FALSE
-      )
     }
   }
 
@@ -1242,7 +1315,8 @@ pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
 
     if (isTRUE(p.use)) {
       denom  <- df_clip_prob(pi_p + pi_np - pi_p * pi_np)
-      d_set4 <- 1 - (d_p + d_np - d_p * d_np) / denom
+      d_union <- d_p + d_np - d_p * d_np
+      d_set4 <- 1 - d_union / denom
     } else {
       d_set4 <- 1 - d_np / pi_np
     }
@@ -1532,7 +1606,9 @@ df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
   y1    <- as.numeric(dat1$y)
   d_p1  <- as.numeric(dat1$d_p)
   d_np1 <- as.numeric(dat1$d_np)
-  pi_p1 <- df_clip_prob(as.numeric(dat1$pi_p))
+
+  # pi_p may be NA for (d_p,d_np)=(0,0); fill those. Union rows must be finite.
+  pi_p1 <- df_prepare_pi_p(dat1$pi_p, d_p = d_p1, d_np = d_np1, context = "df_score_phi_contrib()")
 
   l1 <- as.matrix(cbind(1, X1, y1))
 
@@ -1567,7 +1643,9 @@ efficient_theta_contrib <- function(dat1, phi, h4_star_local) {
   y1    <- as.numeric(dat1$y)
   d_p1  <- as.numeric(dat1$d_p)
   d_np1 <- as.numeric(dat1$d_np)
-  pi_p1 <- df_clip_prob(as.numeric(dat1$pi_p))
+
+  # pi_p may be NA for (d_p,d_np)=(0,0); fill those. Union rows must be finite.
+  pi_p1 <- df_prepare_pi_p(dat1$pi_p, d_p = d_p1, d_np = d_np1, context = "efficient_theta_contrib()")
 
   l1 <- as.matrix(cbind(1, X1, y1))
 
@@ -1598,7 +1676,9 @@ df_score_phi_contrib_fast <- function(l1, d_p1, d_np1, pi_p1, phi, eta4_star_loc
   l1 <- as.matrix(l1)
   d_p1 <- as.numeric(d_p1)
   d_np1 <- as.numeric(d_np1)
-  pi_p1 <- df_clip_prob(as.numeric(pi_p1))
+
+  # pi_p may be NA for (d_p,d_np)=(0,0); fill those. Union rows must be finite.
+  pi_p1 <- df_prepare_pi_p(pi_p1, d_p = d_p1, d_np = d_np1, context = "df_score_phi_contrib_fast()")
 
   eta      <- as.numeric(l1 %*% phi)
   pi_np1   <- df_clip_prob(1 / (1 + exp(-eta)))
@@ -1626,7 +1706,10 @@ efficient_theta_contrib_fast <- function(l1, y1, d_p1, d_np1, pi_p1, phi, h4_sta
   y1 <- as.numeric(y1)
   d_p1 <- as.numeric(d_p1)
   d_np1 <- as.numeric(d_np1)
-  pi_p1 <- df_clip_prob(as.numeric(pi_p1))
+
+  # pi_p may be NA for (d_p,d_np)=(0,0); fill those. Union rows must be finite.
+  pi_p1 <- df_prepare_pi_p(pi_p1, d_p = d_p1, d_np = d_np1, context = "efficient_theta_contrib_fast()")
+
   h4_star_local <- as.numeric(h4_star_local)
 
   eta      <- as.numeric(l1 %*% phi)
@@ -1655,6 +1738,32 @@ efficient_theta_contrib_fast <- function(l1, y1, d_p1, d_np1, pi_p1, phi, h4_sta
 make_folds <- function(n, K) {
   fold_id <- sample(rep(1:K, length.out = n))
   split(seq_len(n), fold_id)
+}
+
+# Simple (non-crossfit) pi_p imputation for np-only union units.
+# This is used by estimators that require pi_p on the union sample but are not cross-fitted.
+impute_pi_p_simple <- function(dat, sigma = NULL) {
+  if (!is.data.frame(dat)) stop("impute_pi_p_simple(): `dat` must be a data.frame.", call. = FALSE)
+  if (!all(c("d_np", "d_p", "pi_p", "y") %in% names(dat))) {
+    miss <- setdiff(c("d_np", "d_p", "pi_p", "y"), names(dat))
+    stop("impute_pi_p_simple(): missing required columns in `dat`: ",
+         paste(miss, collapse = ", "), call. = FALSE)
+  }
+
+  d_np <- as.numeric(dat$d_np)
+  d_p  <- as.numeric(dat$d_p)
+  pi_p_raw <- as.numeric(dat$pi_p)
+
+  idx_mis <- which(d_np == 1 & d_p == 0 & !is.finite(pi_p_raw))
+  if (length(idx_mis) == 0L) return(dat)
+
+  X_all <- df_get_X(dat)
+  y_all <- as.numeric(dat$y)
+  L_all <- as.matrix(cbind(X_all, y_all))
+
+  tilde_pi <- pi_p_estimation_kernlab(dat, new_L = L_all[idx_mis, , drop = FALSE], sigma = sigma)
+  dat$pi_p[idx_mis] <- tilde_pi
+  dat
 }
 
 impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE) {
@@ -1841,13 +1950,17 @@ df_hajek_mean_with_se <- function(y, w, level = 0.95) {
 }
 
 df_estimate_P <- function(dat, N = NULL, hajek = FALSE) {
-  pi_p <- df_clip_prob(as.numeric(dat$pi_p))
   d_p  <- as.numeric(dat$d_p)
   y    <- as.numeric(dat$y)
+  pi_p_raw <- as.numeric(dat$pi_p)
 
   if (isTRUE(hajek)) {
     idx <- which(d_p == 1)
-    w <- 1 / pi_p[idx]
+    pi_use <- df_clip_prob(pi_p_raw[idx])
+    if (any(!is.finite(pi_use))) {
+      stop("df_estimate_P(): `pi_p` is missing (NA/Inf) for some d_p==1 units.", call. = FALSE)
+    }
+    w <- 1 / pi_use
     hj <- df_hajek_mean_with_se(y = y[idx], w = w)
     return(list(theta = hj$theta, var = hj$var, se = hj$se, ci = hj$ci))
   }
@@ -1858,7 +1971,15 @@ df_estimate_P <- function(dat, N = NULL, hajek = FALSE) {
     stop("df_estimate_P(): N < nrow(dat).", call. = FALSE)
   }
 
-  contrib <- d_p * y / pi_p
+  contrib <- rep(0, length(y))
+  idx <- which(d_p == 1)
+  if (length(idx) > 0L) {
+    pi_use <- df_clip_prob(pi_p_raw[idx])
+    if (any(!is.finite(pi_use))) {
+      stop("df_estimate_P(): `pi_p` is missing (NA/Inf) for some d_p==1 units.", call. = FALSE)
+    }
+    contrib[idx] <- y[idx] / pi_use
+  }
 
   theta_res <- if (n_missing == 0L) {
     df_sandwich_from_contrib(contrib)
@@ -1876,78 +1997,96 @@ df_estimate_NP <- function(dat,
                            N = NULL,
                            hajek = FALSE) {
 
-  if (missing(base_fun) || is.null(base_fun) || !is.function(base_fun)) {
-    stop("df_estimate_NP(): please supply `base_fun` (a function mapping X -> n x (p+2) basis matrix).",
-         call. = FALSE)
-  }
+  # Validate base_fun
+  if (!is.function(base_fun)) stop("df_estimate_NP(): base_fun must be a function.")
 
   X <- df_get_X(dat)
   expected_k <- ncol(X) + 2L
 
-  # Validate base_fun output early (strict)
-  b_mat <- df_eval_base_fun(
-    base_fun,
-    X,
-    expected_ncol = expected_k,
-    context = "df_estimate_NP()/base_fun"
-  )
+  # Evaluate base_fun once (also validates dimensions)
+  b_mat <- df_eval_base_fun(base_fun, X, caller = "df_estimate_NP")
+  if (ncol(b_mat) != expected_k) {
+    stop(sprintf("df_estimate_NP(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
+                 expected_k, ncol(b_mat)))
+  }
   p_phi <- ncol(b_mat)
 
-  # Default start: logit(mean(d_np)) for the first coefficient, others = 0
+  d_np <- as.numeric(dat$d_np)
+  y <- as.numeric(dat$y)
+
+  # Center for initial values
   if (is.null(phi_start)) {
-    p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
-    phi_start <- c(stats::qlogis(p0), rep(0, p_phi - 1L))
+    p0 <- df_clip_prob(mean(d_np, na.rm = TRUE))
+    phi_center <- c(stats::qlogis(p0), rep(0, p_phi - 1L))
   } else {
-    phi_start <- as.numeric(phi_start)
-    if (length(phi_start) != p_phi) {
-      stop(sprintf("df_estimate_NP(): length(phi_start)=%d but ncol(base_fun(X))=%d.",
-                   length(phi_start), p_phi),
-           call. = FALSE)
-    }
-    if (any(!is.finite(phi_start))) {
-      stop("df_estimate_NP(): `phi_start` contains NA/Inf.", call. = FALSE)
-    }
+    phi_center <- as.numeric(phi_start)
+    if (length(phi_center) != p_phi) stop("df_estimate_NP(): phi_start length mismatch.")
+    if (any(!is.finite(phi_center))) stop("df_estimate_NP(): phi_start contains NA/Inf.")
   }
 
-  ee_fun <- pi_np.est_simple(dat, base_fun, p.use = FALSE)
-
-  phi_est <- list(termcd = 99)
-  it <- 0
-  while (phi_est$termcd > 2 && it < max_iter) {
-    init <- phi_start + stats::runif(p_phi, -0.1, 0.1)
-    phi_est <- nleqslv::nleqslv(init, ee_fun)
-    it <- it + 1
+  # Estimating equation (p.use = FALSE)
+  ee_phi <- function(phi) {
+    eta <- as.numeric(b_mat %*% phi)
+    pi_np <- df_clip_prob(stats::plogis(eta))
+    d_set4 <- 1 - d_np / pi_np
+    as.numeric(crossprod(b_mat, d_set4))
   }
 
-  if (phi_est$termcd > 2) {
-    phi_hat   <- rep(NA_real_, p_phi)
+  # Objective: squared norm of estimating equations
+  big_penalty <- 1e100
+  obj_phi <- function(phi) {
+    eq <- tryCatch(ee_phi(phi), error = function(e) rep(NA_real_, p_phi))
+    if (any(!is.finite(eq))) return(big_penalty)
+    sum(eq^2)
+  }
+
+  # Generate 100 initial candidates around phi_center and try optim() up to 10 times
+  n_try <- min(10L, as.integer(max_iter))
+  ms <- df_multistart_optim(obj_fun = obj_phi,
+                            center = phi_center,
+                            n_candidates = 100L,
+                            n_try = n_try,
+                            width = 0.5,
+                            method = "Nelder-Mead",
+                            control = list(maxit = 500))
+
+  if (!isTRUE(ms$ok)) {
+    phi_hat <- rep(NA_real_, p_phi)
     theta_res <- df_sandwich_from_contrib(rep(NA_real_, nrow(dat)))
-  } else {
-    phi_hat <- as.numeric(phi_est$x)
+    return(list(phi = phi_hat,
+                theta = theta_res$theta,
+                var = theta_res$var,
+                se = theta_res$se,
+                ci = theta_res$ci))
+  }
 
-    # Use the same basis as in the estimating equation
-    eta   <- as.numeric(b_mat %*% phi_hat)
-    pi_np <- df_clip_prob(plogis(eta))
+  phi_hat <- ms$res$par
 
-    d_np <- as.numeric(dat$d_np)
-    y    <- as.numeric(dat$y)
+  # Compute pi_np under phi_hat
+  eta <- as.numeric(b_mat %*% phi_hat)
+  pi_np <- df_clip_prob(stats::plogis(eta))
 
-    if (isTRUE(hajek)) {
-      idx <- which(d_np == 1)
-      w <- 1 / pi_np[idx]
-      hj <- df_hajek_mean_with_se(y = y[idx], w = w)
-      theta_res <- hj
+  # Theta
+  if (isTRUE(hajek)) {
+    idx <- which(d_np == 1)
+    if (length(idx) == 0) {
+      theta_res <- list(theta = NA_real_, var = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_))
     } else {
-      N_total <- df_resolve_population_N(dat, N = N, require = TRUE, context = "df_estimate_NP()")
-      n_missing <- as.integer(round(N_total - nrow(dat)))
-      if (n_missing < 0L) stop("df_estimate_NP(): N < nrow(dat).", call. = FALSE)
+      w <- 1 / pi_np[idx]
+      theta_res <- df_hajek_mean_with_se(y[idx], w)
+    }
+  } else {
+    N_total <- df_resolve_population_N(dat, N = N, require = TRUE)
+    n_missing <- N_total - nrow(dat)
 
-      contrib <- d_np * y / pi_np
-      theta_res <- if (n_missing == 0L) {
-        df_sandwich_from_contrib(contrib)
-      } else {
-        df_sandwich_from_contrib_with_zeros(contrib, n_missing = n_missing)
-      }
+    contrib <- rep(0, nrow(dat))
+    idx <- which(d_np == 1)
+    if (length(idx) > 0) contrib[idx] <- y[idx] / pi_np[idx]
+
+    if (n_missing > 0) {
+      theta_res <- df_sandwich_from_contrib_with_zeros(contrib, n_missing = n_missing)
+    } else {
+      theta_res <- df_sandwich_from_contrib(contrib)
     }
   }
 
@@ -1965,91 +2104,108 @@ df_estimate_NP_P <- function(dat,
                              N = NULL,
                              hajek = FALSE) {
 
-  if (missing(base_fun) || is.null(base_fun) || !is.function(base_fun)) {
-    stop("df_estimate_NP_P(): please supply `base_fun` (a function mapping X -> n x (p+2) basis matrix).",
-         call. = FALSE)
-  }
+  # Validate base_fun
+  if (!is.function(base_fun)) stop("df_estimate_NP_P(): base_fun must be a function.")
 
   X <- df_get_X(dat)
   expected_k <- ncol(X) + 2L
 
-  # Validate base_fun output early (strict)
-  b_mat <- df_eval_base_fun(
-    base_fun,
-    X,
-    expected_ncol = expected_k,
-    context = "df_estimate_NP_P()/base_fun"
-  )
+  # Evaluate base_fun once (also validates dimensions)
+  b_mat <- df_eval_base_fun(base_fun, X, caller = "df_estimate_NP_P")
+  if (ncol(b_mat) != expected_k) {
+    stop(sprintf("df_estimate_NP_P(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
+                 expected_k, ncol(b_mat)))
+  }
   p_phi <- ncol(b_mat)
 
-  # pi_p must be fully finite for p.use=TRUE
-  pi_p <- df_clip_prob(as.numeric(dat$pi_p))
-  if (any(!is.finite(pi_p))) {
-    stop(
-      "df_estimate_NP_P(): `pi_p` contains NA/Inf.\n",
-      "Impute missing pi_p first (e.g., impute_pi_p_crossfit()) before calling df_estimate_NP_P().",
-      call. = FALSE
-    )
-  }
+  d_np <- as.numeric(dat$d_np)
+  d_p <- as.numeric(dat$d_p)
+  y <- as.numeric(dat$y)
 
+  # pi_p can be missing for d_p == 0. We only require it for union-sample units.
+  pi_p <- df_prepare_pi_p(dat)
+
+  # Center for initial values
   if (is.null(phi_start)) {
-    p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
-    phi_start <- c(stats::qlogis(p0), rep(0, p_phi - 1L))
+    p0 <- df_clip_prob(mean(d_np, na.rm = TRUE))
+    phi_center <- c(stats::qlogis(p0), rep(0, p_phi - 1L))
   } else {
-    phi_start <- as.numeric(phi_start)
-    if (length(phi_start) != p_phi) {
-      stop(sprintf("df_estimate_NP_P(): length(phi_start)=%d but ncol(base_fun(X))=%d.",
-                   length(phi_start), p_phi),
-           call. = FALSE)
-    }
-    if (any(!is.finite(phi_start))) {
-      stop("df_estimate_NP_P(): `phi_start` contains NA/Inf.", call. = FALSE)
-    }
+    phi_center <- as.numeric(phi_start)
+    if (length(phi_center) != p_phi) stop("df_estimate_NP_P(): phi_start length mismatch.")
+    if (any(!is.finite(phi_center))) stop("df_estimate_NP_P(): phi_start contains NA/Inf.")
   }
 
-  ee_fun <- pi_np.est_simple(dat, base_fun, p.use = TRUE)
+  # Estimating equation (p.use = TRUE)
+  ee_phi <- function(phi) {
+    eta <- as.numeric(b_mat %*% phi)
+    pi_np <- df_clip_prob(stats::plogis(eta))
 
-  phi_est <- list(termcd = 99)
-  it <- 0
-  while (phi_est$termcd > 2 && it < max_iter) {
-    init <- phi_start + stats::runif(p_phi, -0.1, 0.1)
-    phi_est <- nleqslv::nleqslv(init, ee_fun)
-    it <- it + 1
+    denom <- df_clip_prob(pi_p + pi_np - pi_p * pi_np)
+    d_union <- d_p + d_np - d_p * d_np
+
+    d_set4 <- 1 - d_union / denom
+    as.numeric(crossprod(b_mat, d_set4))
   }
 
-  if (phi_est$termcd > 2) {
-    phi_hat   <- rep(NA_real_, p_phi)
+  # Objective: squared norm of estimating equations
+  big_penalty <- 1e100
+  obj_phi <- function(phi) {
+    eq <- tryCatch(ee_phi(phi), error = function(e) rep(NA_real_, p_phi))
+    if (any(!is.finite(eq))) return(big_penalty)
+    sum(eq^2)
+  }
+
+  # Generate 100 initial candidates around phi_center and try optim() up to 10 times
+  n_try <- min(10L, as.integer(max_iter))
+  ms <- df_multistart_optim(obj_fun = obj_phi,
+                            center = phi_center,
+                            n_candidates = 100L,
+                            n_try = n_try,
+                            width = 0.5,
+                            method = "Nelder-Mead",
+                            control = list(maxit = 500))
+
+  if (!isTRUE(ms$ok)) {
+    phi_hat <- rep(NA_real_, p_phi)
     theta_res <- df_sandwich_from_contrib(rep(NA_real_, nrow(dat)))
-  } else {
-    phi_hat <- as.numeric(phi_est$x)
+    return(list(phi = phi_hat,
+                theta = theta_res$theta,
+                var = theta_res$var,
+                se = theta_res$se,
+                ci = theta_res$ci))
+  }
 
-    # Use the same basis as in the estimating equation
-    eta   <- as.numeric(b_mat %*% phi_hat)
-    pi_np <- df_clip_prob(plogis(eta))
+  phi_hat <- ms$res$par
 
-    d_np  <- as.numeric(dat$d_np)
-    d_p   <- as.numeric(dat$d_p)
-    y     <- as.numeric(dat$y)
+  # Compute pi_np under phi_hat
+  eta <- as.numeric(b_mat %*% phi_hat)
+  pi_np <- df_clip_prob(stats::plogis(eta))
 
-    denom <- df_clip_prob(pi_np + pi_p - pi_np * pi_p)
-    d_union <- d_np + d_p - d_np * d_p
+  # Union denominator and indicator
+  denom <- df_clip_prob(pi_p + pi_np - pi_p * pi_np)
+  d_union <- d_p + d_np - d_p * d_np
 
-    if (isTRUE(hajek)) {
-      idx <- which(d_union == 1)
-      w <- 1 / denom[idx]
-      hj <- df_hajek_mean_with_se(y = y[idx], w = w)
-      theta_res <- hj
+  # Theta
+  if (isTRUE(hajek)) {
+    idx <- which(d_union == 1)
+    if (length(idx) == 0) {
+      theta_res <- list(theta = NA_real_, var = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_))
     } else {
-      N_total <- df_resolve_population_N(dat, N = N, require = TRUE, context = "df_estimate_NP_P()")
-      n_missing <- as.integer(round(N_total - nrow(dat)))
-      if (n_missing < 0L) stop("df_estimate_NP_P(): N < nrow(dat).", call. = FALSE)
+      w <- 1 / denom[idx]
+      theta_res <- df_hajek_mean_with_se(y[idx], w)
+    }
+  } else {
+    N_total <- df_resolve_population_N(dat, N = N, require = TRUE)
+    n_missing <- N_total - nrow(dat)
 
-      contrib <- y * d_union / denom
-      theta_res <- if (n_missing == 0L) {
-        df_sandwich_from_contrib(contrib)
-      } else {
-        df_sandwich_from_contrib_with_zeros(contrib, n_missing = n_missing)
-      }
+    contrib <- rep(0, nrow(dat))
+    idx <- which(d_union == 1)
+    if (length(idx) > 0) contrib[idx] <- y[idx] / denom[idx]
+
+    if (n_missing > 0) {
+      theta_res <- df_sandwich_from_contrib_with_zeros(contrib, n_missing = n_missing)
+    } else {
+      theta_res <- df_sandwich_from_contrib(contrib)
     }
   }
 
@@ -2102,7 +2258,8 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   if (is.null(phi_start)) {
-    phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
+    p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
+    phi_start <- c(stats::qlogis(p0), rep(0, p_x), 0)
   }
 
   folds <- make_folds(n, K)
@@ -2123,7 +2280,7 @@ efficient_estimator_dml2 <- function(dat,
       y    = y_test,
       d_p  = as.numeric(dat_test$d_p),
       d_np = as.numeric(dat_test$d_np),
-      pi_p = df_clip_prob(as.numeric(dat_test$pi_p))
+      pi_p = as.numeric(dat_test$pi_p)  # allow NA for (0,0); handled in df_prepare_pi_p()
     )
 
     if (!isTRUE(x_info)) {
@@ -2227,23 +2384,53 @@ efficient_estimator_dml2 <- function(dat,
     flush.console()
   }
 
-  attempt <- 0
-  res     <- list(convergence = 1, par = phi_start)
+  # --- Multi-start phi estimation (100 candidates -> try up to 10) ---
+  n_cand <- 100L
+  cand_mat <- matrix(rep(phi_start, each = n_cand), nrow = n_cand) +
+    matrix(stats::runif(n_cand * p_phi, -0.5, 0.5), nrow = n_cand)
+  obj_vals <- apply(cand_mat, 1L, obj_phi)
+  ord <- order(obj_vals)
 
-  while (attempt < max_restart && res$convergence != 0) {
-    attempt <- attempt + 1
-    init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
+  max_try <- min(10L, as.integer(max_restart))
+  if (!is.finite(max_try) || max_try < 1L) max_try <- 10L
+  max_try <- min(max_try, 10L)
 
+  res <- NULL
+  success <- FALSE
+  for (attempt in seq_len(max_try)) {
+    init <- cand_mat[ord[attempt], ]
     res_try <- try(stats::optim(par = init, fn = obj_phi, method = "Nelder-Mead"),
                    silent = TRUE)
-    if (!inherits(res_try, "try-error")) {
-      res <- res_try
+    if (inherits(res_try, "try-error") || !is.finite(res_try$value)) {
       if (progress) {
-        cat(sprintf("  attempt %d/%d done (convergence=%d)\n", attempt, max_restart, res$convergence))
+        cat(sprintf("  attempt %d/%d: failed (error/non-finite)\n", attempt, max_try))
         flush.console()
       }
-      if (res$convergence == 0) break
+      next
     }
+    if (is.null(res) || res_try$value < res$value) res <- res_try
+    if (progress) {
+      cat(sprintf("  attempt %d/%d: done (convergence=%d, obj=%.3g)\n",
+                  attempt, max_try, res_try$convergence, res_try$value))
+      flush.console()
+    }
+    if (res_try$convergence == 0) {
+      success <- TRUE
+      res <- res_try
+      break
+    }
+  }
+
+  if (!isTRUE(success)) {
+    warning("dfSEDI: phi optimization failed after multiple starts; returning NA.", call. = FALSE)
+    return(list(
+      theta_hat = NA_real_,
+      se_hat    = NA_real_,
+      ci_hat    = matrix(NA_real_, 1L, 2L),
+      phi_hat   = rep(NA_real_, p_phi),
+      phi_se    = rep(NA_real_, p_phi),
+      phi_ci    = matrix(NA_real_, p_phi, 2L)
+    ))
   }
 
   phi_hat <- as.numeric(res$par)
@@ -2305,7 +2492,7 @@ efficient_estimator_dml2 <- function(dat,
   l_cf <- df_make_l_matrix(X_cf, y_cf)
   d_p_cf  <- as.numeric(dat_cf$d_p)
   d_np_cf <- as.numeric(dat_cf$d_np)
-  pi_p_cf <- df_clip_prob(as.numeric(dat_cf$pi_p))
+  pi_p_cf <- as.numeric(dat_cf$pi_p)  # allow NA for (0,0); handled in df_prepare_pi_p()
 
   contrib_theta <- efficient_theta_contrib_fast(l_cf, y_cf, d_p_cf, d_np_cf, pi_p_cf, phi_hat, h4_all)
 
@@ -2431,7 +2618,8 @@ efficient_estimator_dml1 <- function(dat,
   }
 
   if (is.null(phi_start)) {
-    phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
+    p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
+    phi_start <- c(stats::qlogis(p0), rep(0, p_x), 0)
   }
 
   folds <- make_folds(n, K)
@@ -2465,7 +2653,7 @@ efficient_estimator_dml1 <- function(dat,
 
     d_p_test  <- as.numeric(dat_test$d_p)
     d_np_test <- as.numeric(dat_test$d_np)
-    pi_p_test <- df_clip_prob(as.numeric(dat_test$pi_p))
+    pi_p_test <- as.numeric(dat_test$pi_p)  # allow NA for (0,0); handled in df_prepare_pi_p()
 
     # train cache for eta4/h4 (only if x_info=TRUE)
     train_cache <- NULL
@@ -2540,35 +2728,51 @@ efficient_estimator_dml1 <- function(dat,
     control_phi <- getOption("dfSEDI.phi_optim_control", list(maxit = maxit_phi))
     if (!is.list(control_phi)) control_phi <- list(maxit = maxit_phi)
     if (is.null(control_phi$maxit)) control_phi$maxit <- maxit_phi
+    # --- Multi-start phi estimation (100 candidates -> try up to 10) ---
+    n_cand <- 100L
+    cand_mat <- matrix(rep(phi_start, each = n_cand), nrow = n_cand) +
+      matrix(stats::runif(n_cand * p_phi, -0.5, 0.5), nrow = n_cand)
+    obj_vals <- apply(cand_mat, 1L, obj_k)
+    ord <- order(obj_vals)
+
+    max_try <- min(10L, as.integer(max_restart))
+    if (!is.finite(max_try) || max_try < 1L) max_try <- 10L
+    max_try <- min(max_try, 10L)
 
     best <- NULL
-
-    # 1) Try phi_start first (often good enough; big speedup vs random restarts)
-    res0 <- try(stats::optim(par = phi_start, fn = obj_k, method = method_phi, control = control_phi),
-                silent = TRUE)
-    if (!inherits(res0, "try-error") && is.finite(res0$value)) {
-      best <- res0
-    } else {
-      best <- list(value = Inf, par = phi_start, convergence = 1)
-    }
-
-    # 2) Random restarts if needed
-    if (!is.finite(best$value) || best$value > tol_obj || best$convergence != 0) {
-      for (a in seq_len(max_restart)) {
-        init <- phi_start + stats::runif(length(phi_start), -0.1, 0.1)
-        res_try <- try(stats::optim(par = init, fn = obj_k, method = method_phi, control = control_phi),
-                       silent = TRUE)
-        if (!inherits(res_try, "try-error") && is.finite(res_try$value) && res_try$value < best$value) {
-          best <- res_try
-        }
-        if (is.finite(best$value) && best$value < tol_obj) break
+    success <- FALSE
+    for (a in seq_len(max_try)) {
+      init <- cand_mat[ord[a], ]
+      res_try <- try(stats::optim(par = init, fn = obj_k, method = method_phi, control = control_phi),
+                     silent = TRUE)
+      if (inherits(res_try, "try-error") || !is.finite(res_try$value)) {
+        next
+      }
+      if (is.null(best) || res_try$value < best$value) best <- res_try
+      if (progress) {
+        cat(sprintf("  fold %d/%d: attempt %d/%d (conv=%d, obj=%.3g)\n",
+                    k, K, a, max_try, res_try$convergence, res_try$value))
+        flush.console()
+      }
+      if (res_try$convergence == 0) {
+        success <- TRUE
+        best <- res_try
+        break
       }
     }
 
+    if (!isTRUE(success) || is.null(best)) {
+      if (progress) {
+        cat(sprintf("  fold %d/%d: phi optimization failed after multiple starts.\n", k, K))
+        flush.console()
+      }
+      next
+    }
+
+
     if (!is.finite(best$value) || best$value >= 0.99 * big_penalty) {
       if (progress) {
-        cat(sprintf("  fold %d/%d: phi failed (objective non-finite).
-", k, K))
+        cat(sprintf("  fold %d/%d: phi failed (objective non-finite).\n", k, K))
         flush.console()
       } else {
         warning(sprintf("dfSEDI: fold %d/%d: phi failed (objective non-finite).", k, K),
@@ -2580,8 +2784,7 @@ efficient_estimator_dml1 <- function(dat,
     phi_k <- as.numeric(best$par)
 
     if (progress) {
-      cat(sprintf("  fold %d/%d: phi via optim (obj=%.3e).
-", k, K, best$value))
+      cat(sprintf("  fold %d/%d: phi via optim (obj=%.3e).\n", k, K, best$value))
       flush.console()
     }
 
@@ -2744,11 +2947,22 @@ subefficient_contrib <- function(dat, mu_hat) {
   d_np <- as.numeric(dat$d_np)
   d_p  <- as.numeric(dat$d_p)
   y    <- as.numeric(dat$y)
-  pi_p <- df_clip_prob(as.numeric(dat$pi_p))
   mu   <- as.numeric(mu_hat)
 
+  pi_p_raw <- as.numeric(dat$pi_p)
+
+  w_p <- rep(0, length(y))  # this equals d_p / pi_p
+  idx_p <- which(d_p == 1)
+  if (length(idx_p) > 0L) {
+    pi_use <- df_clip_prob(pi_p_raw[idx_p])
+    if (any(!is.finite(pi_use))) {
+      stop("Eff_S: `pi_p` is missing (NA/Inf) for some d_p==1 units.", call. = FALSE)
+    }
+    w_p[idx_p] <- 1 / pi_use
+  }
+
   d_np * y +
-    (1 - d_np) * (d_p / pi_p * y + (1 - d_p / pi_p) * mu)
+    (1 - d_np) * (w_p * y + (1 - w_p) * mu)
 }
 
 subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, progress = FALSE, x_info = TRUE) {
@@ -2831,6 +3045,11 @@ efficient_parametric_estimator <- function(dat,
                                            x_info    = TRUE) {
   dat <- df_apply_x_info(dat, x_info)
 
+  # If pi_p is missing for np-only union units, impute it (single fit, no cross-fitting).
+  if (any(as.numeric(dat$d_np) == 1 & as.numeric(dat$d_p) == 0 & !is.finite(as.numeric(dat$pi_p)))) {
+    dat <- impute_pi_p_simple(dat, sigma = NULL)
+  }
+
   X_all <- df_get_X(dat)
   p_x <- ncol(X_all)
   p_phi <- 1 + p_x + 1
@@ -2842,15 +3061,18 @@ efficient_parametric_estimator <- function(dat,
   }
 
   if (is.null(phi_start)) {
-    phi_start <- c(-log(1 / mean(dat$d_np) - 1), rep(0, p_x), 0)
+    p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
+    phi_start <- c(stats::qlogis(p0), rep(0, p_x), 0)
   }
+
+  # Prepare pi_p once (allows NA for (0,0) rows; union rows must be finite).
+  d_p1  <- as.numeric(dat$d_p)
+  d_np1 <- as.numeric(dat$d_np)
+  pi_p1 <- df_prepare_pi_p(dat$pi_p, d_p = d_p1, d_np = d_np1, context = "Eff_P")
 
   ee_para <- function(phi) {
     X1    <- df_get_X(dat)
     y1    <- as.numeric(dat$y)
-    d_p1  <- as.numeric(dat$d_p)
-    d_np1 <- as.numeric(dat$d_np)
-    pi_p1 <- df_clip_prob(as.numeric(dat$pi_p))
     l1    <- as.matrix(cbind(1, X1, y1))
 
     phi <- as.numeric(phi)
