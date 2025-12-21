@@ -1,8 +1,8 @@
+devtools::install_github("KMorikawaISU/dfSEDI",force=TRUE)
 # install.packages("devtools")
 library(dplyr)
 library(ggplot2)
 
-devtools::install_github("KMorikawaISU/dfSEDI")
 #install.packages(c("ggplot2", "dplyr"))
 #install.packages(c("ggthemes", "viridis"))
 
@@ -23,7 +23,7 @@ source(example_file)
 B <- 30
 N <- 10000
 Scenario <- 1
-K <- 4
+K <- 2
 
 seeds <- 1 + seq_len(B) - 1
 
