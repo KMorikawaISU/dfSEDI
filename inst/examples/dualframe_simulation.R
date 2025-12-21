@@ -194,167 +194,86 @@ make_base_fun <- function(Scenario) {
 ## 3) Fit all estimators once (single dataset)
 ############################################################
 
+
 fit_all_estimators_once <- function(dat,
                                     Scenario = 1,
                                     K = 2,
-                                    Eff_type = 2,
+                                    Eff_type = 2,      # kept for backward compatibility; ignored (we output both)
                                     x_info = TRUE,
                                     progress_each = FALSE) {
 
   Scenario <- normalize_scenario(Scenario)
 
-  # Scenario-specific basis function (for Chang & Kott-style NP/NP_P)
   base_fun <- make_base_fun(Scenario)
 
-  # "True" phi as starting values (used in the examples)
-  # - For NP/NP_P: phi corresponds to base_fun(X) (dimension p_x + 2)
-  # - For Eff: phi corresponds to L = (1, X, y) (dimension 1 + p_x + 1)
+  d_np <- as.numeric(dat$d_np)
+  d_p  <- as.numeric(dat$d_p)
+
+  n_np <- sum(d_np == 1, na.rm = TRUE)
+  n_p <- sum(d_p == 1, na.rm = TRUE)
+  n_union <- sum((d_np == 1) | (d_p == 1), na.rm = TRUE)
+
   X <- as.matrix(dat$X)
   p_x <- ncol(X)
   p_phi_np <- ncol(base_fun(X))
 
-  phi_start_NP <- rep(0, p_phi_np)
-  phi_start_Eff <- rep(0, 1 + p_x + 1)
+  # phi_start "truth" (as much as the working model allows)
+  phi_start_NP   <- rep(0, p_phi_np)
+  phi_start_NP_P <- rep(0, p_phi_np)
+  phi_start_Eff  <- rep(0, 1 + p_x + 1)
 
   if (Scenario %in% c(1, 2)) {
-    # DGP uses lin_np = -2.15 - 0.5*x - 0.75*y (Scenario 1/2)
-    # NP/NP_P base_fun does not include y, so we use the x-coefficient part as a start.
-    phi_start_NP[1] <- -2.15
+    # True NP selection model in Scenario 1/2:
+    #   logit(pi_np) = -2.15 - 0.5 * x - 0.75 * y
+    #
+    # For NP / NP_P we use base_fun(X) (no y), so we use the compatible part:
+    #   (intercept, x) and set the rest to 0.
+    if (p_phi_np >= 1) phi_start_NP[1] <- -2.15
     if (p_phi_np >= 2) phi_start_NP[2] <- -0.5
+    phi_start_NP_P <- phi_start_NP
 
-    # Eff uses (1, X, y)
-    phi_start_Eff <- c(-2.15, -0.5, -0.75)
+    # Eff uses (1, X, y) so we can pass the true value
+    if ((1 + p_x + 1) == 3) {
+      phi_start_Eff <- c(-2.15, -0.5, -0.75)
+    } else {
+      # General fallback if X has more columns than expected
+      phi_start_Eff[1] <- -2.15
+      if (p_x >= 1) phi_start_Eff[2] <- -0.5
+      phi_start_Eff[length(phi_start_Eff)] <- -0.75
+    }
   } else if (Scenario == 3) {
-    # DGP uses lin_np = -1.5 - 0.3*cos(2*y) - 0.1*(y-1)^2 (Scenario 3)
-    # As a simple start, use only the intercept.
-    phi_start_NP[1] <- -1.5
+    # Scenario 3: true pi_np is nonlinear in y and includes z;
+    # provide a mild starting value.
+    if (p_phi_np >= 1) phi_start_NP[1] <- -1.5
+    phi_start_NP_P <- phi_start_NP
     phi_start_Eff[1] <- -1.5
   }
 
-  # Safe wrapper
-  safe_fit <- function(expr) {
-    out <- try(expr, silent = TRUE)
-    if (inherits(out, "try-error")) {
-      return(list(phi = NA, theta = NA_real_, var = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_)))
-    }
-    out
+  dat_union <- dat[d_np == 1 | d_p == 1, , drop = FALSE]
+
+  # Estimators
+  fit_P   <- safe_fit(df_estimate_P(dat))
+  fit_NP  <- safe_fit(df_estimate_NP(dat, base_fun = base_fun, phi_start = phi_start_NP))
+  fit_NP_P<- safe_fit(df_estimate_NP_P(dat, base_fun = base_fun, phi_start = phi_start_NP_P))
+
+  fit_Eff_type1 <- safe_fit(Eff(dat = dat, K = K, type = 1, x_info = x_info,
+                                phi_start = phi_start_Eff, progress = progress_each))
+  fit_Eff_type2 <- safe_fit(Eff(dat = dat, K = K, type = 2, x_info = x_info,
+                                phi_start = phi_start_Eff, progress = progress_each))
+
+  eff_union_args1 <- list(dat = dat_union, K = K, type = 1, x_info = FALSE,
+                          phi_start = phi_start_Eff, progress = progress_each)
+  eff_union_args2 <- list(dat = dat_union, K = K, type = 2, x_info = FALSE,
+                          phi_start = phi_start_Eff, progress = progress_each)
+  if ("N" %in% names(formals(Eff))) {
+    eff_union_args1$N <- nrow(dat)
+    eff_union_args2$N <- nrow(dat)
   }
+  fit_Eff_union_dat_type1 <- safe_fit(do.call(Eff, eff_union_args1))
+  fit_Eff_union_dat_type2 <- safe_fit(do.call(Eff, eff_union_args2))
 
-  # Union data (only units observed in either sample)
-  dat_union <- dat[as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1, , drop = FALSE]
-
-  # --- Estimators ---
-  fit_P <- safe_fit(df_estimate_P(dat))
-
-  fit_NP <- safe_fit(df_estimate_NP(dat, base_fun = base_fun, phi_start = phi_start_NP))
-
-  # NP_P needs pi_p for union-sample units; in this simulation, pi_p is NA when d_p == 0,
-  # so we impute pi_p for (d_np == 1, d_p == 0) before calling df_estimate_NP_P.
-  dat_np_p <- dat
-
-  # NP_P needs pi_p for union-sample units; in realistic data pi_p is missing when d_p == 0.
-  # We impute pi_p for (d_np, d_p) = (1, 0) units using a simple *parametric* propensity model for d_p:
-  #   - if Y is continuous : linear regression  (LPM) for d_p ~ (X, y)
-  #   - if Y is binary     : logistic regression for d_p ~ (X, y)
-  # We do this with cross-fitting over K folds (for stability), and then fill pi_p in the target cells.
-  # If that fails, we fall back to impute_pi_p_crossfit() when available; otherwise mean imputation.
-  mis_pi_p <- which(dat_np_p$d_np == 1 & dat_np_p$d_p == 0 & !is.finite(as.numeric(dat_np_p$pi_p)))
-  if (length(mis_pi_p) > 0) {
-    imputed <- FALSE
-
-    # --- 1) Parametric cross-fit imputation ---
-    imputed <- tryCatch({
-      yv <- as.numeric(dat_np_p$y)
-      y_uniq <- sort(unique(yv[is.finite(yv)]))
-      is_bin_y <- (length(y_uniq) <= 2) && all(y_uniq %in% c(0, 1))
-
-      X <- dat_np_p$X
-      X_df <- if (is.matrix(X)) as.data.frame(X) else if (is.data.frame(X)) X else data.frame(x = X)
-      if (is.null(colnames(X_df))) colnames(X_df) <- paste0("x", seq_len(ncol(X_df)))
-      df_mod <- data.frame(d_p = as.numeric(dat_np_p$d_p), y = yv, X_df)
-
-      n <- nrow(df_mod)
-      if (!is.finite(K) || K < 2) {
-        folds <- rep(1L, n)
-      } else {
-        folds <- sample(rep(seq_len(K), length.out = n))
-      }
-
-      pred <- rep(NA_real_, n)
-      for (k in sort(unique(folds))) {
-        te <- which(folds == k)
-        tr <- which(folds != k)
-        # If K < 2, this is just the full-sample fit (tr == all, te == all).
-        fit_k <- tryCatch({
-          if (is_bin_y) {
-            suppressWarnings(stats::glm(d_p ~ ., data = df_mod[tr, , drop = FALSE], family = stats::binomial()))
-          } else {
-            stats::lm(d_p ~ ., data = df_mod[tr, , drop = FALSE])
-          }
-        }, error = function(e) NULL)
-
-        if (!is.null(fit_k)) {
-          if (is_bin_y) {
-            pred[te] <- as.numeric(stats::predict(fit_k, newdata = df_mod[te, , drop = FALSE], type = "response"))
-          } else {
-            pred[te] <- as.numeric(stats::predict(fit_k, newdata = df_mod[te, , drop = FALSE]))
-          }
-        }
-      }
-
-      # If some folds failed, fall back to a global fit for those rows.
-      bad <- which(!is.finite(pred))
-      if (length(bad) > 0) {
-        fit_g <- tryCatch({
-          if (is_bin_y) {
-            suppressWarnings(stats::glm(d_p ~ ., data = df_mod, family = stats::binomial()))
-          } else {
-            stats::lm(d_p ~ ., data = df_mod)
-          }
-        }, error = function(e) NULL)
-        if (!is.null(fit_g)) {
-          if (is_bin_y) {
-            pred[bad] <- as.numeric(stats::predict(fit_g, newdata = df_mod[bad, , drop = FALSE], type = "response"))
-          } else {
-            pred[bad] <- as.numeric(stats::predict(fit_g, newdata = df_mod[bad, , drop = FALSE]))
-          }
-        }
-      }
-
-      pred <- pmin(pmax(pred, 1e-6), 1 - 1e-6)
-      dat_np_p$pi_p[mis_pi_p] <- pred[mis_pi_p]
-      TRUE
-    }, error = function(e) FALSE)
-
-    # --- 2) Fallback: kernel cross-fit imputation (if available) ---
-    if (!imputed || any(!is.finite(as.numeric(dat_np_p$pi_p[mis_pi_p])))) {
-      if (exists("impute_pi_p_crossfit", mode = "function")) {
-        dat_np_p <- impute_pi_p_crossfit(dat_np_p, K = K, sigma = NULL)
-        imputed <- TRUE
-      }
-    }
-
-    # --- 3) Fallback: mean imputation / zero ---
-    if (any(!is.finite(as.numeric(dat_np_p$pi_p[mis_pi_p])))) {
-      mu_pi <- mean(as.numeric(dat_np_p$pi_p[is.finite(as.numeric(dat_np_p$pi_p))]), na.rm = TRUE)
-      if (!is.finite(mu_pi)) mu_pi <- 0
-      dat_np_p$pi_p[mis_pi_p] <- mu_pi
-    }
-  }
-
-  fit_NP_P <- safe_fit(df_estimate_NP_P(dat_np_p, base_fun = base_fun, phi_start = phi_start_NP_P))
-
-  # Eff: output BOTH types
-  fit_Eff_type1 <- safe_fit(Eff(dat, K = K, type = 1, x_info = x_info, phi_start = phi_start_Eff, progress = progress_each))
-  fit_Eff_type2 <- safe_fit(Eff(dat, K = K, type = 2, x_info = x_info, phi_start = phi_start_Eff, progress = progress_each))
-
-  # Eff on union-only data (x_info = FALSE)
-  fit_Eff_union_dat_type1 <- safe_fit(Eff(dat_union, K = K, type = 1, x_info = FALSE, phi_start = phi_start_Eff, progress = progress_each))
-  fit_Eff_union_dat_type2 <- safe_fit(Eff(dat_union, K = K, type = 2, x_info = FALSE, phi_start = phi_start_Eff, progress = progress_each))
-
-  # Oracles / semi-oracles
-  fit_Eff_S <- safe_fit(efficient_estimator_semioracle(dat))
-  fit_Eff_P <- safe_fit(efficient_estimator_oracle_p(dat))
+  fit_Eff_S <- safe_fit(Eff_S(dat = dat, K = K, x_info = x_info, progress = progress_each))
+  fit_Eff_P <- safe_fit(Eff_P(dat = dat, x_info = x_info, phi_start = phi_start_Eff, progress = progress_each))
 
   list(
     P = fit_P,
@@ -365,7 +284,10 @@ fit_all_estimators_once <- function(dat,
     Eff_union_dat_type1 = fit_Eff_union_dat_type1,
     Eff_union_dat_type2 = fit_Eff_union_dat_type2,
     Eff_S = fit_Eff_S,
-    Eff_P = fit_Eff_P
+    Eff_P = fit_Eff_P,
+    n_np = n_np,
+    n_p = n_p,
+    n_union = n_union
   )
 }
 

@@ -2210,7 +2210,7 @@ df_estimate_NP_P <- function(dat,
 
 
   # pi_p can be missing for d_p == 0. We only require it for union-sample units.
-  pi_p <- df_prepare_pi_p(dat)
+  pi_p <- df_prepare_pi_p(dat$pi_p, d_p = d_p, d_np = d_np, context = "df_estimate_NP_P()")
 
   # Center for initial values
   if (is.null(phi_start)) {
