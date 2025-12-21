@@ -285,7 +285,20 @@ The example script `inst/examples/dualframe_simulation.R` also defines:
 - `summarize_mc(res, theta_true = 0)`
 
 `run_mc()` returns a long-format data frame (one row per replication ×
-estimator). The typical columns are:
+estimator). With the current example script, the `estimator` column
+takes values:
+
+- `P`
+- `NP`
+- `NP_P`
+- `Eff_type1` (Eff with `type = 1`; DML1)
+- `Eff_type2` (Eff with `type = 2`; DML2)
+- `Eff_union_dat_type1` (Eff on `dat_union` with `type = 1`; DML1)
+- `Eff_union_dat_type2` (Eff on `dat_union` with `type = 2`; DML2)
+- `Eff_S`
+- `Eff_P`
+
+The typical columns are:
 
 - `Scenario`, `rep`, `estimator`
 - `theta`, `se`, `ci_l`, `ci_u`
@@ -368,13 +381,15 @@ one_rep <- function(seed) {
   fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
 
   rbind(
-    extract_row(fits$P,         "P",             seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP,        "NP",            seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P,      "NP_P",          seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff,       "Eff",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union, "Eff_union_dat", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S,     "Eff_S",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P,     "Eff_P",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    extract_row(fits$P,                   "P",                   seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,                  "NP",                  seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,                "NP_P",                seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_type1,           "Eff_type1",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_type2,           "Eff_type2",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union_dat_type1, "Eff_union_dat_type1", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union_dat_type2, "Eff_union_dat_type2", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,               "Eff_S",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,               "Eff_P",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
 }
 
@@ -439,13 +454,15 @@ one_rep <- function(seed) {
   fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
 
   rbind(
-    extract_row(fits$P,         "P",             seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP,        "NP",            seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P,      "NP_P",          seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff,       "Eff",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union, "Eff_union_dat", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S,     "Eff_S",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P,     "Eff_P",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    extract_row(fits$P,                   "P",                   seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,                  "NP",                  seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,                "NP_P",                seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_type1,           "Eff_type1",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_type2,           "Eff_type2",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union_dat_type1, "Eff_union_dat_type1", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union_dat_type2, "Eff_union_dat_type2", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,               "Eff_S",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,               "Eff_P",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
 }
 

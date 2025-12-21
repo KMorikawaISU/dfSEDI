@@ -2004,7 +2004,7 @@ df_estimate_NP <- function(dat,
   expected_k <- ncol(X) + 2L
 
   # Evaluate base_fun once (also validates dimensions)
-  b_mat <- df_eval_base_fun(base_fun, X, caller = "df_estimate_NP")
+  b_mat <- df_eval_base_fun(base_fun, X, context = "df_estimate_NP")
   if (ncol(b_mat) != expected_k) {
     stop(sprintf("df_estimate_NP(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
                  expected_k, ncol(b_mat)))
@@ -2111,7 +2111,7 @@ df_estimate_NP_P <- function(dat,
   expected_k <- ncol(X) + 2L
 
   # Evaluate base_fun once (also validates dimensions)
-  b_mat <- df_eval_base_fun(base_fun, X, caller = "df_estimate_NP_P")
+  b_mat <- df_eval_base_fun(base_fun, X, context = "df_estimate_NP_P")
   if (ncol(b_mat) != expected_k) {
     stop(sprintf("df_estimate_NP_P(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
                  expected_k, ncol(b_mat)))
