@@ -193,6 +193,90 @@ df_prepare_pi_p <- function(pi_p, d_p, d_np, context = "dfSEDI") {
   df_clip_prob(pi_p)
 }
 
+
+# Parametric (linear) imputation of pi_p for NP-only union units (d_np==1, d_p==0).
+# We mirror the *target* of the nonparametric imputer used in Eff:
+#   regress 1/pi_p on L = (X, y) using P-sample units (d_p==1), then predict for missing.
+# Cross-fitting is intentionally NOT used here (parametric model).
+df_impute_pi_p_lm <- function(dat,
+                              context = "dfSEDI",
+                              min_train = 5L) {
+  if (!is.data.frame(dat)) return(dat)
+  if (!("pi_p" %in% names(dat))) return(dat)
+  if (!("d_p" %in% names(dat))) return(dat)
+  if (!("d_np" %in% names(dat))) return(dat)
+
+  d_p  <- as.numeric(dat$d_p)
+  d_np <- as.numeric(dat$d_np)
+  pi_p <- as.numeric(dat$pi_p)
+
+  # Only need pi_p for union-sample units; in typical "pi_p observed only when d_p==1"
+  # setups, the missing cases are (d_np, d_p) = (1, 0).
+  idx_mis <- which(d_p == 0 & d_np == 1 & !is.finite(pi_p))
+  if (length(idx_mis) == 0L) return(dat)
+
+  idx_tr <- which(d_p == 1 & is.finite(pi_p))
+  if (length(idx_tr) < min_train) {
+    # Fallback: mean-impute (best-effort).
+    fill <- mean(pi_p[idx_tr], na.rm = TRUE)
+    if (!is.finite(fill)) fill <- 0.5
+    pi_p[idx_mis] <- fill
+    dat$pi_p <- pi_p
+    return(dat)
+  }
+
+  # Design matrix for regression inputs
+  X <- df_get_X(dat)
+  if (!("y" %in% names(dat))) {
+    y <- rep(0, nrow(X))
+  } else {
+    y <- as.numeric(dat$y)
+  }
+
+  # L = (X, y)
+  L <- cbind(X, y)
+
+  # Train: 1/pi_p ~ L  (linear model)
+  train_df <- as.data.frame(L[idx_tr, , drop = FALSE])
+  colnames(train_df) <- c(paste0("x", seq_len(ncol(X))), "y")
+  train_df$resp <- 1 / df_clip_prob(pi_p[idx_tr])
+
+  fit <- tryCatch(
+    stats::lm(resp ~ ., data = train_df),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+    fill <- mean(pi_p[idx_tr], na.rm = TRUE)
+    if (!is.finite(fill)) fill <- 0.5
+    pi_p[idx_mis] <- fill
+    dat$pi_p <- pi_p
+    return(dat)
+  }
+
+  new_df <- as.data.frame(L[idx_mis, , drop = FALSE])
+  colnames(new_df) <- c(paste0("x", seq_len(ncol(X))), "y")
+
+  pred_resp <- tryCatch(
+    stats::predict(fit, newdata = new_df),
+    error = function(e) rep(NA_real_, nrow(new_df))
+  )
+  pred_resp <- as.numeric(pred_resp)
+
+  # Guard: predicted 1/pi_p must be positive & finite
+  resp_bar <- mean(train_df$resp, na.rm = TRUE)
+  if (!is.finite(resp_bar) || resp_bar <= 0) resp_bar <- 1 / df_clip_prob(mean(pi_p[idx_tr], na.rm = TRUE))
+
+  pred_resp[!is.finite(pred_resp) | pred_resp <= 0] <- resp_bar
+
+  pi_hat <- 1 / pred_resp
+  pi_hat <- df_clip_prob(pi_hat)
+
+  pi_p[idx_mis] <- pi_hat
+  dat$pi_p <- pi_p
+  dat
+}
+
 # Apply x_info setting:
 #  - x_info=TRUE : keep dat as is
 #  - x_info=FALSE: drop any (d_p,d_np)=(0,0) rows (if present)
@@ -2121,6 +2205,9 @@ df_estimate_NP_P <- function(dat,
   d_np <- as.numeric(dat$d_np)
   d_p <- as.numeric(dat$d_p)
   y <- as.numeric(dat$y)
+  # If pi_p is missing for (d_np, d_p) = (1, 0), impute it via a parametric lm on 1/pi_p.
+  dat <- df_impute_pi_p_lm(dat, context = "df_estimate_NP_P()")
+
 
   # pi_p can be missing for d_p == 0. We only require it for union-sample units.
   pi_p <- df_prepare_pi_p(dat)

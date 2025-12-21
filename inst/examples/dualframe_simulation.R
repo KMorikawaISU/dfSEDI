@@ -14,7 +14,7 @@
 ## Notes
 ## - Eff_type defaults to 2 (DML2) to match the current Eff() default in dfSEDI.
 ## - The snow implementation uses internal parallel:::sendCall/recvOneResult to enable
-##   dynamic scheduling + a progress bar. This avoids the common “idle CPU” issue.
+##   dynamic scheduling + a progress bar. This avoids the common "idle CPU" issue.
 ##
 ## NEW (this revision):
 ## - MC output now also includes phi estimates and (when available) their SE/CI.
@@ -251,39 +251,98 @@ fit_all_estimators_once <- function(dat,
   # NP_P needs pi_p for union-sample units; in this simulation, pi_p is NA when d_p == 0,
   # so we impute pi_p for (d_np == 1, d_p == 0) before calling df_estimate_NP_P.
   dat_np_p <- dat
-  mis_pi_p <- which(as.numeric(dat_np_p$d_np) == 1 &
-                      as.numeric(dat_np_p$d_p) == 0 &
-                      !is.finite(as.numeric(dat_np_p$pi_p)))
 
+  # NP_P needs pi_p for union-sample units; in realistic data pi_p is missing when d_p == 0.
+  # We impute pi_p for (d_np, d_p) = (1, 0) units using a simple *parametric* propensity model for d_p:
+  #   - if Y is continuous : linear regression  (LPM) for d_p ~ (X, y)
+  #   - if Y is binary     : logistic regression for d_p ~ (X, y)
+  # We do this with cross-fitting over K folds (for stability), and then fill pi_p in the target cells.
+  # If that fails, we fall back to impute_pi_p_crossfit() when available; otherwise mean imputation.
+  mis_pi_p <- which(dat_np_p$d_np == 1 & dat_np_p$d_p == 0 & !is.finite(as.numeric(dat_np_p$pi_p)))
   if (length(mis_pi_p) > 0) {
-    # Simple folds for cross-fit imputation
-    make_folds_simple <- function(n, K) {
-      K <- max(1L, as.integer(K))
-      id <- sample(rep(seq_len(K), length.out = n))
-      split(seq_len(n), id)
-    }
-    folds <- make_folds_simple(nrow(dat_np_p), K)
+    imputed <- FALSE
 
-    impute_fun <- NULL
-    if (exists("impute_pi_p_crossfit", mode = "function", inherits = TRUE)) {
-      impute_fun <- get("impute_pi_p_crossfit", mode = "function", inherits = TRUE)
-    } else if ("dfSEDI" %in% loadedNamespaces()) {
-      impute_fun <- get("impute_pi_p_crossfit", envir = asNamespace("dfSEDI"))
+    # --- 1) Parametric cross-fit imputation ---
+    imputed <- tryCatch({
+      yv <- as.numeric(dat_np_p$y)
+      y_uniq <- sort(unique(yv[is.finite(yv)]))
+      is_bin_y <- (length(y_uniq) <= 2) && all(y_uniq %in% c(0, 1))
+
+      X <- dat_np_p$X
+      X_df <- if (is.matrix(X)) as.data.frame(X) else if (is.data.frame(X)) X else data.frame(x = X)
+      if (is.null(colnames(X_df))) colnames(X_df) <- paste0("x", seq_len(ncol(X_df)))
+      df_mod <- data.frame(d_p = as.numeric(dat_np_p$d_p), y = yv, X_df)
+
+      n <- nrow(df_mod)
+      if (!is.finite(K) || K < 2) {
+        folds <- rep(1L, n)
+      } else {
+        folds <- sample(rep(seq_len(K), length.out = n))
+      }
+
+      pred <- rep(NA_real_, n)
+      for (k in sort(unique(folds))) {
+        te <- which(folds == k)
+        tr <- which(folds != k)
+        # If K < 2, this is just the full-sample fit (tr == all, te == all).
+        fit_k <- tryCatch({
+          if (is_bin_y) {
+            suppressWarnings(stats::glm(d_p ~ ., data = df_mod[tr, , drop = FALSE], family = stats::binomial()))
+          } else {
+            stats::lm(d_p ~ ., data = df_mod[tr, , drop = FALSE])
+          }
+        }, error = function(e) NULL)
+
+        if (!is.null(fit_k)) {
+          if (is_bin_y) {
+            pred[te] <- as.numeric(stats::predict(fit_k, newdata = df_mod[te, , drop = FALSE], type = "response"))
+          } else {
+            pred[te] <- as.numeric(stats::predict(fit_k, newdata = df_mod[te, , drop = FALSE]))
+          }
+        }
+      }
+
+      # If some folds failed, fall back to a global fit for those rows.
+      bad <- which(!is.finite(pred))
+      if (length(bad) > 0) {
+        fit_g <- tryCatch({
+          if (is_bin_y) {
+            suppressWarnings(stats::glm(d_p ~ ., data = df_mod, family = stats::binomial()))
+          } else {
+            stats::lm(d_p ~ ., data = df_mod)
+          }
+        }, error = function(e) NULL)
+        if (!is.null(fit_g)) {
+          if (is_bin_y) {
+            pred[bad] <- as.numeric(stats::predict(fit_g, newdata = df_mod[bad, , drop = FALSE], type = "response"))
+          } else {
+            pred[bad] <- as.numeric(stats::predict(fit_g, newdata = df_mod[bad, , drop = FALSE]))
+          }
+        }
+      }
+
+      pred <- pmin(pmax(pred, 1e-6), 1 - 1e-6)
+      dat_np_p$pi_p[mis_pi_p] <- pred[mis_pi_p]
+      TRUE
+    }, error = function(e) FALSE)
+
+    # --- 2) Fallback: kernel cross-fit imputation (if available) ---
+    if (!imputed || any(!is.finite(as.numeric(dat_np_p$pi_p[mis_pi_p])))) {
+      if (exists("impute_pi_p_crossfit", mode = "function")) {
+        dat_np_p <- impute_pi_p_crossfit(dat_np_p, K = K, sigma = NULL)
+        imputed <- TRUE
+      }
     }
 
-    if (!is.null(impute_fun)) {
-      dat_np_p <- tryCatch(
-        impute_fun(dat_np_p, folds = folds, sigma = NULL, progress = progress_each),
-        error = function(e) dat_np_p
-      )
-    } else {
-      # Fallback: mean-impute using observed pi_p in the P sample
-      mu_pi <- mean(as.numeric(dat_np_p$pi_p[as.numeric(dat_np_p$d_p) == 1]), na.rm = TRUE)
+    # --- 3) Fallback: mean imputation / zero ---
+    if (any(!is.finite(as.numeric(dat_np_p$pi_p[mis_pi_p])))) {
+      mu_pi <- mean(as.numeric(dat_np_p$pi_p[is.finite(as.numeric(dat_np_p$pi_p))]), na.rm = TRUE)
+      if (!is.finite(mu_pi)) mu_pi <- 0
       dat_np_p$pi_p[mis_pi_p] <- mu_pi
     }
   }
 
-  fit_NP_P <- safe_fit(df_estimate_NP_P(dat_np_p, base_fun = base_fun, phi_start = phi_start_NP))
+  fit_NP_P <- safe_fit(df_estimate_NP_P(dat_np_p, base_fun = base_fun, phi_start = phi_start_NP_P))
 
   # Eff: output BOTH types
   fit_Eff_type1 <- safe_fit(Eff(dat, K = K, type = 1, x_info = x_info, phi_start = phi_start_Eff, progress = progress_each))
@@ -408,7 +467,7 @@ df_par_lapply_lb_progress <- function(cl, X, fun, show_progress = TRUE) {
 ############################################################
 # Output:
 # - returns a data.frame in long format
-# - rows = 7 * B
+# - rows = 9 * B
 # - columns (core): Scenario, rep, estimator, theta, se, ci_l, ci_u, n_np, n_p, n_union, error
 # - plus phi fields: phi_1..phi_4, phi_se_1..phi_se_4, phi_ci_l_1..phi_ci_l_4, phi_ci_u_1..phi_ci_u_4
 run_mc <- function(B,
