@@ -1273,7 +1273,7 @@ eta4_prob_numer_function <- function(pi_np, pi_p, phi, l) {
   pi_np <- df_clip_prob(pi_np)
   pi_p  <- df_clip_prob(pi_p)
   pi_np_p <- df_clip_prob(pi_p + pi_np - pi_p * pi_np)
-  - as.numeric(pi_np) * (1 - pi_np) * (1 - pi_np_p) / (pi_np_p ^ 2) * as.numeric(l)
+  - as.numeric(pi_np) * (1 - pi_np_p) / (pi_np_p ^ 2) * as.numeric(l)
 }
 
 ############################################################
@@ -1365,7 +1365,7 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
   Denom_vals <- h4_prob_denom_function(pi_np, pi_p_obs, phi)
 
   # vectorized Numer_mat: Numer_mat[i,] = -pi_np[i] * Denom_vals[i] * l_obs[i,]
-  coef <- -pi_np * (1 - pi_np) * as.numeric(Denom_vals)
+  coef <- -pi_np * as.numeric(Denom_vals)
   Numer_mat <- l_obs * coef
 
   p_dim <- length(phi)
