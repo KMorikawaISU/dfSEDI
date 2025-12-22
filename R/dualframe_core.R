@@ -176,20 +176,38 @@ df_prepare_pi_p <- function(pi_p, d_p, d_np, context = "dfSEDI") {
   d_p  <- as.numeric(d_p)
   d_np <- as.numeric(d_np)
 
-  union <- (d_p == 1 | d_np == 1)
+  if (length(pi_p) != length(d_p) || length(pi_p) != length(d_np)) {
+    stop(context, ": pi_p, d_p, d_np must have the same length.", call. = FALSE)
+  }
 
-  if (any(union & !is.finite(pi_p))) {
+  # pi_p must be known for probability-sample units.
+  need_p <- (d_p == 1)
+  if (any(need_p & !is.finite(pi_p))) {
     stop(
-      context, ": `pi_p` is missing (NA/Inf) for some union-sample units (d_p==1 or d_np==1).\n",
-      "Impute pi_p for non-P units in the union sample first (e.g., impute_pi_p_crossfit() or a model-based imputation).",
+      context, ": pi_p contains NA/Inf for some probability-sample units (d_p==1).
+",
+      "Please provide the design inclusion probabilities for the P sample.",
       call. = FALSE
     )
   }
 
-  fill_val <- mean(pi_p[is.finite(pi_p)], na.rm = TRUE)
-  if (!is.finite(fill_val)) fill_val <- 0.5
+  # For NP-only units (d_np==1 & d_p==0), pi_p may be missing in practice.
+  # It does not enter as d_p/pi_p (since d_p==0), but it can still appear inside pi_np_p.
+  # To keep the code robust, we replace missing pi_p there with 0 (then clip to eps).
+  idx_np_only <- (d_p == 0 & d_np == 1 & !is.finite(pi_p))
+  if (any(idx_np_only)) {
+    pi_p[idx_np_only] <- 0
+  }
 
-  pi_p[!union & !is.finite(pi_p)] <- fill_val
+  # Remaining non-finite values typically come from (0,0) units; fill with a safe mean.
+  idx_mis <- !is.finite(pi_p)
+  if (any(idx_mis)) {
+    mu <- mean(pi_p[is.finite(pi_p) & need_p])
+    if (!is.finite(mu)) mu <- mean(pi_p[is.finite(pi_p)])
+    if (!is.finite(mu)) mu <- 0.5
+    pi_p[idx_mis] <- mu
+  }
+
   df_clip_prob(pi_p)
 }
 
@@ -1470,7 +1488,7 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   X_obs    <- X_all[idx, , drop = FALSE]
   y_obs    <- as.numeric(dat$y[idx])
   L_obs    <- cbind(X_obs, y_obs)
-  pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
+  pi_p_obs <- df_prepare_pi_p(as.numeric(dat$pi_p[idx]), d_p = as.numeric(dat$d_p[idx]), d_np = as.numeric(dat$d_np[idx]), context = "dfSEDI")
 
   if (length(pi_p_obs) < 1L) return(rep(NA_real_, nrow(new_L)))
   if (length(pi_p_obs) < 2L) return(rep(mean(pi_p_obs), nrow(new_L)))
@@ -1619,7 +1637,7 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma 
 
   X_obs    <- X_all[idx, , drop = FALSE]
   y_obs    <- as.numeric(dat$y[idx])
-  pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
+  pi_p_obs <- df_prepare_pi_p(as.numeric(dat$pi_p[idx]), d_p = as.numeric(dat$d_p[idx]), d_np = as.numeric(dat$d_np[idx]), context = "dfSEDI")
 
   l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
   storage.mode(l_obs) <- "numeric"
@@ -1652,7 +1670,7 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigm
 
   X_obs    <- X_all[idx, , drop = FALSE]
   y_obs    <- as.numeric(dat$y[idx])
-  pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
+  pi_p_obs <- df_prepare_pi_p(as.numeric(dat$pi_p[idx]), d_p = as.numeric(dat$d_p[idx]), d_np = as.numeric(dat$d_np[idx]), context = "dfSEDI")
 
   l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
   storage.mode(l_obs) <- "numeric"
@@ -1872,12 +1890,32 @@ impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE) {
 
     pi_p_mis <- which(d_np_f == 1 & d_p_f == 0 & !is.finite(as.numeric(dat_fold$pi_p)))
     if (length(pi_p_mis) > 0) {
-      tilde_pi <- pi_p_estimation_kernlab(
-        dat_train,
-        new_L = L_f[pi_p_mis, , drop = FALSE],
-        sigma = sigma
+      # Try kernel regression; if it fails (e.g., too few P-sample units in training),
+      # fall back to a simple mean imputation so downstream phi optimization does not break.
+      tilde_pi <- tryCatch(
+        pi_p_estimation_kernlab(
+          dat_train,
+          new_L = L_f[pi_p_mis, , drop = FALSE],
+          sigma = sigma
+        ),
+        error = function(e) rep(NA_real_, length(pi_p_mis))
       )
-      dat_cf$pi_p[idx_k[pi_p_mis]] <- tilde_pi
+      tilde_pi <- as.numeric(tilde_pi)
+
+      if (any(!is.finite(tilde_pi))) {
+        pi_obs_train <- as.numeric(dat_train$pi_p)
+        pi_obs_train <- pi_obs_train[as.numeric(dat_train$d_p) == 1 & is.finite(pi_obs_train)]
+        fallback <- if (length(pi_obs_train) > 0) {
+          mean(pi_obs_train)
+        } else {
+          pi_obs_all <- as.numeric(dat_cf$pi_p)
+          pi_obs_all <- pi_obs_all[as.numeric(dat_cf$d_p) == 1 & is.finite(pi_obs_all)]
+          if (length(pi_obs_all) > 0) mean(pi_obs_all) else 0.5
+        }
+        tilde_pi[!is.finite(tilde_pi)] <- fallback
+      }
+
+      dat_cf$pi_p[idx_k[pi_p_mis]] <- df_clip_prob(tilde_pi)
     }
 
     if (progress) utils::setTxtProgressBar(pb, k)
@@ -2121,7 +2159,7 @@ df_estimate_NP <- function(dat,
   obj_phi <- function(phi) {
     eq <- tryCatch(ee_phi(phi), error = function(e) rep(NA_real_, p_phi))
     if (any(!is.finite(eq))) return(big_penalty)
-    sum(eq^2)
+    sum((eq / nrow(b_mat))^2)
   }
 
   # Generate 100 initial candidates around phi_center and try optim() up to 10 times
@@ -2210,7 +2248,7 @@ df_estimate_NP_P <- function(dat,
 
 
   # pi_p can be missing for d_p == 0. We only require it for union-sample units.
-  pi_p <- df_prepare_pi_p(dat)
+  pi_p <- df_prepare_pi_p(as.numeric(dat$pi_p), d_p = d_p, d_np = d_np, context = "df_estimate_NP_P()")
 
   # Center for initial values
   if (is.null(phi_start)) {
@@ -2239,7 +2277,7 @@ df_estimate_NP_P <- function(dat,
   obj_phi <- function(phi) {
     eq <- tryCatch(ee_phi(phi), error = function(e) rep(NA_real_, p_phi))
     if (any(!is.finite(eq))) return(big_penalty)
-    sum(eq^2)
+    sum((eq / nrow(b_mat))^2)
   }
 
   # Generate 100 initial candidates around phi_center and try optim() up to 10 times
@@ -2386,7 +2424,7 @@ efficient_estimator_dml2 <- function(dat,
 
     X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
     y_obs    <- as.numeric(dat_train$y[idx_obs])
-    pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
+    pi_p_obs <- df_prepare_pi_p(as.numeric(dat_train$pi_p[idx_obs]), d_p = as.numeric(dat_train$d_p[idx_obs]), d_np = as.numeric(dat_train$d_np[idx_obs]), context = "dfSEDI")
     l_obs    <- df_make_l_matrix(X_obs, y_obs)
 
     prep_eta4 <- df_krr_mixed_prepare(
@@ -2750,7 +2788,7 @@ efficient_estimator_dml1 <- function(dat,
 
       X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
       y_obs    <- as.numeric(dat_train$y[idx_obs])
-      pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
+      pi_p_obs <- df_prepare_pi_p(as.numeric(dat_train$pi_p[idx_obs]), d_p = as.numeric(dat_train$d_p[idx_obs]), d_np = as.numeric(dat_train$d_np[idx_obs]), context = "dfSEDI")
       l_obs    <- df_make_l_matrix(X_obs, y_obs)
 
       prep_eta4 <- df_krr_mixed_prepare(
