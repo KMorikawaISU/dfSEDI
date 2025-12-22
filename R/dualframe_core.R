@@ -177,20 +177,29 @@ df_prepare_pi_p <- function(pi_p, d_p, d_np, context = "dfSEDI") {
   d_np <- as.numeric(d_np)
 
   union <- (d_p == 1 | d_np == 1)
+  union[is.na(union)] <- FALSE
 
-  if (any(union & !is.finite(pi_p))) {
-    stop(
-      context, ": `pi_p` is missing (NA/Inf) for some union-sample units (d_p==1 or d_np==1).\n",
-      "Impute pi_p for non-P units in the union sample first (e.g., impute_pi_p_crossfit() or a model-based imputation).",
-      call. = FALSE
-    )
+  mis <- !is.finite(pi_p)
+  if (!any(mis)) {
+    return(df_clip_prob(pi_p))
   }
 
-  fill_val <- mean(pi_p[is.finite(pi_p)], na.rm = TRUE)
-  if (!is.finite(fill_val)) fill_val <- 0.5
+  # Fill missing pi_p with a sensible finite value to avoid NA propagation.
+  # Primary choice: mean among observed P-sample units (d_p==1).
+  obs_p <- which(d_p == 1 & is.finite(pi_p))
+  if (length(obs_p) >= 1L) {
+    fill <- mean(pi_p[obs_p], na.rm = TRUE)
+  } else if (any(is.finite(pi_p))) {
+    fill <- mean(pi_p[is.finite(pi_p)], na.rm = TRUE)
+  } else {
+    fill <- 0.5
+  }
+  if (!is.finite(fill)) fill <- 0.5
 
-  pi_p[!union & !is.finite(pi_p)] <- fill_val
-  df_clip_prob(pi_p)
+  pi_p_filled <- pi_p
+  pi_p_filled[mis] <- fill
+
+  df_clip_prob(pi_p_filled)
 }
 
 
@@ -291,7 +300,20 @@ df_apply_x_info <- function(dat, x_info = TRUE) {
     dat$X <- x0
   }
 
-  if (isTRUE(x_info)) return(dat)
+  if (isTRUE(x_info)) {
+    # If Y is unavailable for (d_np, d_p) = (0, 0) units (common in practice),
+    # replace missing Y by a finite dummy value to avoid NA propagation.
+    if (all(c("d_p", "d_np", "y") %in% names(dat))) {
+      d_p0  <- as.numeric(dat$d_p)
+      d_np0 <- as.numeric(dat$d_np)
+      y0    <- suppressWarnings(as.numeric(dat$y))
+      idx00 <- which(d_p0 == 0 & d_np0 == 0 & !is.finite(y0))
+      if (length(idx00) > 0L) {
+        dat$y[idx00] <- 0
+      }
+    }
+    return(dat)
+  }
   if (!all(c("d_p", "d_np") %in% names(dat))) return(dat)
 
   d_p  <- as.numeric(dat$d_p)
@@ -2212,7 +2234,7 @@ df_estimate_NP_P <- function(dat,
 
 
   # pi_p can be missing for d_p == 0. We only require it for union-sample units.
-  pi_p <- df_prepare_pi_p(dat)
+  pi_p <- df_prepare_pi_p(as.numeric(dat$pi_p), d_p = d_p, d_np = d_np, context = "df_estimate_NP_P")
 
   # Center for initial values
   if (is.null(phi_start)) {

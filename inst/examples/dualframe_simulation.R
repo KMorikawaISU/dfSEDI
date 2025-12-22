@@ -262,20 +262,44 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
 ## 4) One MC replication -> long-format rows
 ############################################################
 
-mc_one_rep_long <- function(rep_id, N, Scenario, K = 2, progress_each = FALSE) {
-  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
-  fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress_each)
+mc_one_rep_long <- function(
+    seed,
+    rep_id,
+    N,
+    Scenario,
+    K = 2,
+    Eff_type = 2,
+    x_info = TRUE,
+    pi_p_offset = 0.005,
+    progress_each_fit = FALSE
+) {
+  # Eff_type is kept for backward compatibility; we return both Eff1 and Eff2.
+  set.seed(seed)
+
+  dat <- generate_dualframe_population(
+    N = N,
+    Scenario = Scenario,
+    pi_p_offset = pi_p_offset
+  )
+
+  fits <- fit_all_estimators_once(
+    dat = dat,
+    Scenario = Scenario,
+    K = K,
+    x_info = x_info,
+    progress_each = progress_each_fit
+  )
 
   rbind(
-    extract_row(fits$P,          "P",          rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP,         "NP",         rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P,       "NP_P",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S,      "Eff_S",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P,      "Eff_P",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff1_union, "Eff1_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff2_union, "Eff2_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff1,       "Eff1",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff2,       "Eff2",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    extract_row(fits$P,         "P",          rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,        "NP",         rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,      "NP_P",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,     "Eff_S",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,     "Eff_P",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1_union,"Eff1_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2_union,"Eff2_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1,      "Eff1",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2,      "Eff2",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
 }
 
