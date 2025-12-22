@@ -312,11 +312,18 @@ fit_all_estimators_once <- function(dat,
   fit_Eff_union_dat_type1 <- safe_fit(Eff(dat_union, K = K, type = 1, x_info = FALSE, N = nrow(dat), phi_start = phi_start_Eff, progress = progress_each))
   fit_Eff_union_dat_type2 <- safe_fit(Eff(dat_union, K = K, type = 2, x_info = FALSE, N = nrow(dat), phi_start = phi_start_Eff, progress = progress_each))
 
-  # Oracles / semi-oracles
-  fit_Eff_S <- safe_fit(efficient_estimator_semioracle(dat))
-  fit_Eff_P <- safe_fit(efficient_estimator_oracle_p(dat))
+  # Oracles / semi-oracles (sub-efficient / parametric efficient)
+  fit_Eff_S <- safe_fit(Eff_S(dat = dat, K = K, x_info = x_info, progress = progress_each))
+  fit_Eff_P <- safe_fit(Eff_P(dat = dat, phi_start = phi_start_Eff, eta4_star = 0, max_iter = 20, x_info = x_info, progress = progress_each))
+
+  n_np <- sum(dat$d_np == 1)
+  n_p <- sum(dat$d_p == 1)
+  n_union <- sum(dat$d_np == 1 | dat$d_p == 1)
 
   list(
+    n_np = n_np,
+    n_p = n_p,
+    n_union = n_union,
     P = fit_P,
     NP = fit_NP,
     NP_P = fit_NP_P,
@@ -548,7 +555,7 @@ run_mc <- function(B,
       "pi_p_offset",
       "progress_each_fit"
     ),
-    envir = environment(run_mc)
+    envir = environment()
   )
 
   idxs <- seq_len(B)

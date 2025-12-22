@@ -117,54 +117,73 @@ df_multistart_optim <- function(obj_fun,
                                 n_try = 10L,
                                 width = 0.5,
                                 method = "Nelder-Mead",
-                                control = NULL) {
+                                control = NULL,
+                                obj_tol = 1e-6) {
   center <- as.numeric(center)
   if (!all(is.finite(center))) stop("df_multistart_optim(): 'center' must be finite.")
 
   p <- length(center)
-  n_candidates <- as.integer(n_candidates)[1]
-  if (!is.finite(n_candidates) || n_candidates < 1) n_candidates <- 100L
-  n_try <- as.integer(n_try)[1]
-  if (!is.finite(n_try) || n_try < 1) n_try <- 10L
-  n_try <- min(n_try, n_candidates)
+  n_candidates <- as.integer(n_candidates)
+  n_try <- as.integer(n_try)
+  if (n_candidates <= 0L) stop("df_multistart_optim(): 'n_candidates' must be positive.")
+  if (n_try <= 0L) stop("df_multistart_optim(): 'n_try' must be positive.")
 
-  width <- as.numeric(width)[1]
-  if (!is.finite(width) || width < 0) width <- 0.5
-  if (is.null(control)) control <- list()
+  width <- as.numeric(width)
+  if (!is.finite(width) || width <= 0) stop("df_multistart_optim(): 'width' must be positive finite.")
 
-  # Candidate initial values: center + Unif[-width, width]
-  init_mat <- matrix(stats::runif(n_candidates * p, min = -width, max = width),
-                     nrow = n_candidates, ncol = p)
-  init_mat <- sweep(init_mat, 2, center, "+")
+  obj_tol <- as.numeric(obj_tol)[1]
+  if (!is.finite(obj_tol) || obj_tol <= 0) stop("df_multistart_optim(): 'obj_tol' must be positive finite.")
 
-  # Evaluate objective
-  vals <- rep(Inf, n_candidates)
-  for (i in seq_len(n_candidates)) {
-    v <- tryCatch(obj_fun(init_mat[i, ]), error = function(e) Inf)
-    if (!is.finite(v)) v <- Inf
-    vals[i] <- v
+  if (is.null(control)) {
+    control <- list(maxit = as.integer(getOption("dfSEDI.phi_optim_maxit", 500L)))
   }
 
-  ord <- order(vals)
+  # 100 random initial candidates around `center`
+  cand <- center + matrix(runif(n_candidates * p, min = -width, max = width),
+                          nrow = n_candidates, ncol = p, byrow = TRUE)
 
-  # Try optim() from the best starts (up to n_try)
-  for (j in seq_len(n_try)) {
-    idx <- ord[j]
-    start <- init_mat[idx, ]
+  # Evaluate objective for the candidates
+  vals <- vapply(seq_len(n_candidates), function(i) {
+    v <- tryCatch(obj_fun(cand[i, ]), error = function(e) NA_real_)
+    as.numeric(v)[1]
+  }, numeric(1))
+
+  # Treat non-finite values as huge (so they will be ranked last)
+  big_penalty <- 1e12
+  vals[!is.finite(vals)] <- big_penalty
+
+  # Take up to `n_try` best candidates (smallest objective)
+  ord <- order(vals)
+  top_idx <- ord[seq_len(min(n_try, n_candidates))]
+
+  best_res <- NULL
+  best_init <- NULL
+
+  for (idx in top_idx) {
+    init <- cand[idx, ]
+
     res <- tryCatch(
-      stats::optim(par = start, fn = obj_fun, method = method, control = control),
+      optim(par = init, fn = obj_fun, method = method, control = control),
       error = function(e) NULL
     )
-    if (!is.null(res) &&
-        is.list(res) &&
-        isTRUE(res$convergence == 0) &&
-        is.finite(res$value) &&
-        all(is.finite(res$par))) {
-      return(list(ok = TRUE, res = res, start = start, start_rank = j, init_vals = vals, init_order = ord))
+
+    if (is.null(res)) next
+
+    # Track the best attempt for debugging
+    if (is.finite(res$value) && (is.null(best_res) || res$value < best_res$value)) {
+      best_res <- res
+      best_init <- init
+    }
+
+    # "Success" criterion:
+    # - objective must be finite and sufficiently small (<= obj_tol)
+    # - (convergence==0 is nice but not strictly required if objective is already tiny)
+    if (is.finite(res$value) && res$value <= obj_tol) {
+      return(list(ok = TRUE, res = res, init = init))
     }
   }
 
-  list(ok = FALSE, res = NULL, init_vals = vals, init_order = ord)
+  return(list(ok = FALSE, res = best_res, init = best_init))
 }
 
 # Prepare pi_p when it is observed only for d_p==1 units.
