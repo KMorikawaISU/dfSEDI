@@ -61,108 +61,89 @@ safe_fit <- function(expr) {
   )
 }
 
-extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union, p_phi_max = 4L) {
-  ci <- fit$ci
-  if (is.null(ci) || length(ci) != 2) ci <- c(NA_real_, NA_real_)
+extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union) {
+  # Robust row extractor: always returns a 1-row data.frame even if `fit` is NULL/partial
+  scalar_num <- function(x) {
+    if (is.null(x) || length(x) == 0L) return(NA_real_)
+    suppressWarnings(as.numeric(x)[1])
+  }
+  scalar_int <- function(x) {
+    v <- scalar_num(x)
+    if (!is.finite(v)) return(NA_integer_)
+    as.integer(round(v))
+  }
+  scalar_chr <- function(x) {
+    if (is.null(x) || length(x) == 0L) return(NA_character_)
+    as.character(x)[1]
+  }
 
-  # phi (fixed-width output up to p_phi_max)
-  phi     <- rep(NA_real_, p_phi_max)
-  phi_se  <- rep(NA_real_, p_phi_max)
+  if (is.null(fit) || !is.list(fit)) {
+    fit <- list(
+      theta = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_),
+      phi = NULL, phi_se = NULL, phi_ci = NULL,
+      error = "fit is NULL or not a list"
+    )
+  }
+
+  ci <- fit$ci
+  if (is.null(ci) || length(ci) < 2L) ci <- c(NA_real_, NA_real_)
+
+  # Always output up to 6 phi components (unused ones are NA)
+  p_phi_max <- 6L
+
+  phi <- fit$phi
+  phi_vec <- rep(NA_real_, p_phi_max)
+  if (!is.null(phi) && length(phi) > 0L) {
+    p_here <- min(length(phi), p_phi_max)
+    phi_vec[seq_len(p_here)] <- as.numeric(phi)[seq_len(p_here)]
+  }
+
+  phi_se <- fit$phi_se
+  phi_se_vec <- rep(NA_real_, p_phi_max)
+  if (!is.null(phi_se) && length(phi_se) > 0L) {
+    p_here <- min(length(phi_se), p_phi_max)
+    phi_se_vec[seq_len(p_here)] <- as.numeric(phi_se)[seq_len(p_here)]
+  }
+
+  phi_ci <- fit$phi_ci
   phi_ci_l <- rep(NA_real_, p_phi_max)
   phi_ci_u <- rep(NA_real_, p_phi_max)
-
-  if (!is.null(fit$phi)) {
-    phi0 <- as.numeric(fit$phi)
-    k <- min(length(phi0), p_phi_max)
-    if (k > 0) phi[1:k] <- phi0[1:k]
-  }
-
-  if (!is.null(fit$phi_se)) {
-    se0 <- as.numeric(fit$phi_se)
-    k <- min(length(se0), p_phi_max)
-    if (k > 0) phi_se[1:k] <- se0[1:k]
-  }
-
-  if (!is.null(fit$phi_ci) && is.matrix(fit$phi_ci) && nrow(fit$phi_ci) == 2) {
-    lo0 <- as.numeric(fit$phi_ci[1, ])
-    up0 <- as.numeric(fit$phi_ci[2, ])
-    k <- min(length(lo0), length(up0), p_phi_max)
-    if (k > 0) {
-      phi_ci_l[1:k] <- lo0[1:k]
-      phi_ci_u[1:k] <- up0[1:k]
-    }
+  if (!is.null(phi_ci) && is.matrix(phi_ci) && nrow(phi_ci) >= 2L && ncol(phi_ci) >= 1L) {
+    p_here <- min(ncol(phi_ci), p_phi_max)
+    phi_ci_l[seq_len(p_here)] <- as.numeric(phi_ci[1, seq_len(p_here)])
+    phi_ci_u[seq_len(p_here)] <- as.numeric(phi_ci[2, seq_len(p_here)])
   }
 
   out <- data.frame(
     Scenario  = paste0("S", normalize_scenario(Scenario)),
-    rep       = rep,
-    estimator = estimator,
-    theta     = as.numeric(fit$theta),
-    se        = as.numeric(fit$se),
-    ci_l      = as.numeric(ci[1]),
-    ci_u      = as.numeric(ci[2]),
-    n_np      = n_np,
-    n_p       = n_p,
-    n_union   = n_union,
-    error     = if (!is.null(fit$error)) fit$error else NA_character_,
+    rep       = scalar_int(rep),
+    estimator = as.character(estimator),
+    theta     = scalar_num(fit$theta),
+    se        = scalar_num(fit$se),
+    ci_l      = scalar_num(ci[1]),
+    ci_u      = scalar_num(ci[2]),
+    n_np      = scalar_int(n_np),
+    n_p       = scalar_int(n_p),
+    n_union   = scalar_int(n_union),
+
+    phi_1 = phi_vec[1], phi_2 = phi_vec[2], phi_3 = phi_vec[3],
+    phi_4 = phi_vec[4], phi_5 = phi_vec[5], phi_6 = phi_vec[6],
+
+    phi_se_1 = phi_se_vec[1], phi_se_2 = phi_se_vec[2], phi_se_3 = phi_se_vec[3],
+    phi_se_4 = phi_se_vec[4], phi_se_5 = phi_se_vec[5], phi_se_6 = phi_se_vec[6],
+
+    phi_ci_l_1 = phi_ci_l[1], phi_ci_l_2 = phi_ci_l[2], phi_ci_l_3 = phi_ci_l[3],
+    phi_ci_l_4 = phi_ci_l[4], phi_ci_l_5 = phi_ci_l[5], phi_ci_l_6 = phi_ci_l[6],
+
+    phi_ci_u_1 = phi_ci_u[1], phi_ci_u_2 = phi_ci_u[2], phi_ci_u_3 = phi_ci_u[3],
+    phi_ci_u_4 = phi_ci_u[4], phi_ci_u_5 = phi_ci_u[5], phi_ci_u_6 = phi_ci_u[6],
+
+    error     = scalar_chr(fit$error),
     stringsAsFactors = FALSE
   )
-
-  # Append phi columns (fixed width)
-  for (j in seq_len(p_phi_max)) out[[paste0("phi_", j)]] <- phi[j]
-  for (j in seq_len(p_phi_max)) out[[paste0("phi_se_", j)]] <- phi_se[j]
-  for (j in seq_len(p_phi_max)) out[[paste0("phi_ci_l_", j)]] <- phi_ci_l[j]
-  for (j in seq_len(p_phi_max)) out[[paste0("phi_ci_u_", j)]] <- phi_ci_u[j]
-
   out
 }
 
-
-# Create a "failed replication" long-format data.frame (all NA rows),
-# used as a robust fallback in parallel execution when a worker crashes.
-make_na_fit <- function(msg = NA_character_, p_phi_max = 4L) {
-  list(
-    theta  = NA_real_,
-    se     = NA_real_,
-    ci     = c(NA_real_, NA_real_),
-    phi    = rep(NA_real_, p_phi_max),
-    phi_se = rep(NA_real_, p_phi_max),
-    phi_ci = matrix(NA_real_, nrow = 2, ncol = p_phi_max,
-                    dimnames = list(c("lower","upper"), NULL)),
-    error  = msg
-  )
-}
-
-make_na_rep_long <- function(rep_id,
-                             Scenario,
-                             n_np = NA_integer_,
-                             n_p = NA_integer_,
-                             n_union = NA_integer_,
-                             p_phi_max = 4L,
-                             err = NA_character_) {
-
-  ests <- c(
-    "P",
-    "NP",
-    "NP_P",
-    "Eff_type1",
-    "Eff_type2",
-    "Eff_union_dat_type1",
-    "Eff_union_dat_type2",
-    "Eff_S",
-    "Eff_P"
-  )
-
-  fits <- lapply(ests, function(e) make_na_fit(msg = err, p_phi_max = p_phi_max))
-  names(fits) <- ests
-
-  do.call(
-    rbind,
-    lapply(ests, function(e) {
-      extract_row(fits[[e]], e, rep_id, Scenario, n_np, n_p, n_union, p_phi_max = p_phi_max)
-    })
-  )
-}
 
 
 ############################################################
@@ -245,177 +226,229 @@ make_base_fun <- function(Scenario) {
 fit_all_estimators_once <- function(dat,
                                     Scenario = 1,
                                     K = 2,
+                                    phi_start_true = TRUE,
                                     Eff_type = 2,
-                                    x_info = TRUE,
                                     progress_each = FALSE) {
 
-  Scenario <- normalize_scenario(Scenario)
+  # --- choose phi_start (examples: provide "true" / near-true starts) ---
+  if (isTRUE(phi_start_true)) {
+    Scenario <- normalize_scenario(Scenario)
 
-  # Scenario-specific basis function (for Chang & Kott-style NP/NP_P)
+    if (Scenario == 1) {
+      phi_start_NP   <- c(-2.15, -0.5, 0)              # for Chang-Kott base_fun (X only)
+      phi_start_NP_P <- phi_start_NP
+      phi_start_Eff  <- c(-2.15, -0.5, -0.75)          # true for Scenario 1 (L = (1, X, y))
+    } else if (Scenario == 2) {
+      phi_start_NP   <- c(-2.15, -0.5, 0)
+      phi_start_NP_P <- phi_start_NP
+      phi_start_Eff  <- c(-2.15, -0.5, -0.75)          # true for Scenario 2 (same NP model)
+    } else if (Scenario == 3) {
+      phi_start_NP   <- c(-1.5, 0, 0, 0)               # (not "true" in Scenario 3; just stable)
+      phi_start_NP_P <- phi_start_NP
+      phi_start_Eff  <- c(-1.5, 0, 0, 0)               # (not "true" in Scenario 3; just stable)
+    }
+  } else {
+    phi_start_NP   <- NULL
+    phi_start_NP_P <- NULL
+    phi_start_Eff  <- NULL
+  }
+
+  # --- sample sizes ---
+  n_np    <- sum(dat$d_np == 1, na.rm = TRUE)
+  n_p     <- sum(dat$d_p == 1,  na.rm = TRUE)
+  n_union <- sum((dat$d_np == 1 | dat$d_p == 1), na.rm = TRUE)
+
+  # --- basis function for Chang & Kott-type estimators ---
   base_fun <- make_base_fun(Scenario)
 
-  # "True" phi as starting values (used in the examples)
-  # - For NP/NP_P: phi corresponds to base_fun(X) (dimension p_x + 2)
-  # - For Eff: phi corresponds to L = (1, X, y) (dimension 1 + p_x + 1)
-  X <- as.matrix(dat$X)
-  p_x <- ncol(X)
-  p_phi_np <- ncol(base_fun(X))
+  # --- P only ---
+  fit_P <- safe_fit(
+    df_estimate_P(dat = dat)
+  )
 
-  phi_start_NP <- rep(0, p_phi_np)
-  phi_start_Eff <- rep(0, 1 + p_x + 1)
+  # --- NP only (Chang & Kott type) ---
+  fit_NP <- safe_fit(
+    df_estimate_NP(
+      dat      = dat,
+      base_fun = base_fun,
+      phi_start = phi_start_NP
+    )
+  )
 
-  if (Scenario %in% c(1, 2)) {
-    # DGP uses lin_np = -2.15 - 0.5*x - 0.75*y (Scenario 1/2)
-    # NP/NP_P base_fun does not include y, so we use the x-coefficient part as a start.
-    phi_start_NP[1] <- -2.15
-    if (p_phi_np >= 2) phi_start_NP[2] <- -0.5
-
-    # Eff uses (1, X, y)
-    phi_start_Eff <- c(-2.15, -0.5, -0.75)
-  } else if (Scenario == 3) {
-    # DGP uses lin_np = -1.5 - 0.3*cos(2*y) - 0.1*(y-1)^2 (Scenario 3)
-    # As a simple start, use only the intercept.
-    phi_start_NP[1] <- -1.5
-    phi_start_Eff[1] <- -1.5
-  }
-
-  # Safe wrapper
-  safe_fit <- function(expr) {
-    out <- try(expr, silent = TRUE)
-    if (inherits(out, "try-error")) {
-      return(list(phi = NA, theta = NA_real_, var = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_)))
-    }
-    out
-  }
-
-  # Union data (only units observed in either sample)
-  dat_union <- dat[as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1, , drop = FALSE]
-
-  # --- Estimators ---
-  fit_P <- safe_fit(df_estimate_P(dat))
-
-  fit_NP <- safe_fit(df_estimate_NP(dat, base_fun = base_fun, phi_start = phi_start_NP))
-
-  # NP_P needs pi_p for union-sample units; in this simulation, pi_p is NA when d_p == 0,
-  # so we impute pi_p for (d_np == 1, d_p == 0) before calling df_estimate_NP_P.
+  # --- NP_P (Chang & Kott type) ---
+  # In the example DGP we set pi_p = NA when d_p == 0. For NP_P we need finite pi_p to compute the union probability.
+  # Here we impute pi_p by a simple *parametric* linear regression of 1/pi_p on L=(X, y) using P-sample units.
   dat_np_p <- dat
 
-  # NP_P needs pi_p for union-sample units; in realistic data pi_p is missing when d_p == 0.
-  # We impute pi_p for (d_np, d_p) = (1, 0) units using a simple *parametric* propensity model for d_p:
-  #   - if Y is continuous : linear regression  (LPM) for d_p ~ (X, y)
-  #   - if Y is binary     : logistic regression for d_p ~ (X, y)
-  # We do this with cross-fitting over K folds (for stability), and then fill pi_p in the target cells.
-  # If that fails, we fall back to impute_pi_p_crossfit() when available; otherwise mean imputation.
-  mis_pi_p <- which(dat_np_p$d_np == 1 & dat_np_p$d_p == 0 & !is.finite(as.numeric(dat_np_p$pi_p)))
-  if (length(mis_pi_p) > 0) {
-    imputed <- FALSE
+  if (any(!is.finite(dat_np_p$pi_p))) {
 
-    # --- 1) Parametric cross-fit imputation ---
-    imputed <- tryCatch({
-      yv <- as.numeric(dat_np_p$y)
-      y_uniq <- sort(unique(yv[is.finite(yv)]))
-      is_bin_y <- (length(y_uniq) <= 2) && all(y_uniq %in% c(0, 1))
-
-      X <- dat_np_p$X
-      X_df <- if (is.matrix(X)) as.data.frame(X) else if (is.data.frame(X)) X else data.frame(x = X)
-      if (is.null(colnames(X_df))) colnames(X_df) <- paste0("x", seq_len(ncol(X_df)))
-      df_mod <- data.frame(d_p = as.numeric(dat_np_p$d_p), y = yv, X_df)
-
-      n <- nrow(df_mod)
-      if (!is.finite(K) || K < 2) {
-        folds <- rep(1L, n)
+    get_X_mat <- function(dat_local) {
+      if ("X" %in% names(dat_local)) {
+        Xraw <- dat_local$X
+      } else if ("x" %in% names(dat_local)) {
+        Xraw <- dat_local$x
       } else {
-        folds <- sample(rep(seq_len(K), length.out = n))
+        stop("dat must contain column 'X' (matrix/data.frame) or 'x' (numeric vector).")
       }
 
-      pred <- rep(NA_real_, n)
-      for (k in sort(unique(folds))) {
-        te <- which(folds == k)
-        tr <- which(folds != k)
-        # If K < 2, this is just the full-sample fit (tr == all, te == all).
-        fit_k <- tryCatch({
-          if (is_bin_y) {
-            suppressWarnings(stats::glm(d_p ~ ., data = df_mod[tr, , drop = FALSE], family = stats::binomial()))
-          } else {
-            stats::lm(d_p ~ ., data = df_mod[tr, , drop = FALSE])
-          }
-        }, error = function(e) NULL)
+      # strip AsIs if present
+      if (inherits(Xraw, "AsIs")) class(Xraw) <- setdiff(class(Xraw), "AsIs")
 
-        if (!is.null(fit_k)) {
-          if (is_bin_y) {
-            pred[te] <- as.numeric(stats::predict(fit_k, newdata = df_mod[te, , drop = FALSE], type = "response"))
-          } else {
-            pred[te] <- as.numeric(stats::predict(fit_k, newdata = df_mod[te, , drop = FALSE]))
-          }
+      if (is.data.frame(Xraw)) {
+        mm <- stats::model.matrix(~ ., data = Xraw)
+        if ("(Intercept)" %in% colnames(mm)) {
+          mm <- mm[, colnames(mm) != "(Intercept)", drop = FALSE]
         }
+        Xmat <- mm
+      } else if (is.matrix(Xraw)) {
+        Xmat <- Xraw
+      } else {
+        Xmat <- matrix(as.numeric(Xraw), ncol = 1)
       }
 
-      # If some folds failed, fall back to a global fit for those rows.
-      bad <- which(!is.finite(pred))
-      if (length(bad) > 0) {
-        fit_g <- tryCatch({
-          if (is_bin_y) {
-            suppressWarnings(stats::glm(d_p ~ ., data = df_mod, family = stats::binomial()))
+      Xmat <- as.matrix(Xmat)
+      storage.mode(Xmat) <- "numeric"
+      Xmat
+    }
+
+    X_all <- get_X_mat(dat_np_p)
+    L_all <- cbind(X_all, y = as.numeric(dat_np_p$y))
+    colnames(L_all) <- c(paste0("x", seq_len(ncol(L_all) - 1L)), "y")
+
+    idx_obs <- which(dat_np_p$d_p == 1 & is.finite(dat_np_p$pi_p))
+    idx_mis <- which(!is.finite(dat_np_p$pi_p))
+
+    pi_obs <- dat_np_p$pi_p[idx_obs]
+    mean_pi <- mean(pi_obs, na.rm = TRUE)
+    if (!is.finite(mean_pi) || mean_pi <= 0 || mean_pi >= 1) mean_pi <- 1e-3
+
+    if (length(idx_mis) > 0L) {
+      if (length(idx_obs) >= 5L) {
+        df_obs <- as.data.frame(L_all[idx_obs, , drop = FALSE])
+        df_obs$inv_pi <- 1 / pmax(pi_obs, 1e-8)
+
+        lm_fit <- try(stats::lm(inv_pi ~ ., data = df_obs), silent = TRUE)
+        if (!inherits(lm_fit, "try-error")) {
+          df_mis <- as.data.frame(L_all[idx_mis, , drop = FALSE])
+          inv_hat <- try(stats::predict(lm_fit, newdata = df_mis), silent = TRUE)
+
+          if (!inherits(inv_hat, "try-error")) {
+            pi_hat <- 1 / inv_hat
+            bad <- !is.finite(pi_hat) | pi_hat <= 0 | pi_hat >= 1
+            pi_hat[bad] <- mean_pi
+            pi_hat <- pmin(pmax(pi_hat, 1e-8), 1 - 1e-8)
+            dat_np_p$pi_p[idx_mis] <- pi_hat
           } else {
-            stats::lm(d_p ~ ., data = df_mod)
+            dat_np_p$pi_p[idx_mis] <- mean_pi
           }
-        }, error = function(e) NULL)
-        if (!is.null(fit_g)) {
-          if (is_bin_y) {
-            pred[bad] <- as.numeric(stats::predict(fit_g, newdata = df_mod[bad, , drop = FALSE], type = "response"))
-          } else {
-            pred[bad] <- as.numeric(stats::predict(fit_g, newdata = df_mod[bad, , drop = FALSE]))
-          }
+        } else {
+          dat_np_p$pi_p[idx_mis] <- mean_pi
         }
-      }
-
-      pred <- pmin(pmax(pred, 1e-6), 1 - 1e-6)
-      dat_np_p$pi_p[mis_pi_p] <- pred[mis_pi_p]
-      TRUE
-    }, error = function(e) FALSE)
-
-    # --- 2) Fallback: kernel cross-fit imputation (if available) ---
-    if (!imputed || any(!is.finite(as.numeric(dat_np_p$pi_p[mis_pi_p])))) {
-      if (exists("impute_pi_p_crossfit", mode = "function")) {
-        dat_np_p <- impute_pi_p_crossfit(dat_np_p, K = K, sigma = NULL)
-        imputed <- TRUE
+      } else {
+        # Not enough P-sample units to fit a regression; fallback (user said 0 is OK).
+        dat_np_p$pi_p[idx_mis] <- mean_pi
       }
     }
 
-    # --- 3) Fallback: mean imputation / zero ---
-    if (any(!is.finite(as.numeric(dat_np_p$pi_p[mis_pi_p])))) {
-      mu_pi <- mean(as.numeric(dat_np_p$pi_p[is.finite(as.numeric(dat_np_p$pi_p))]), na.rm = TRUE)
-      if (!is.finite(mu_pi)) mu_pi <- 0
-      dat_np_p$pi_p[mis_pi_p] <- mu_pi
-    }
+    # final safety
+    dat_np_p$pi_p[!is.finite(dat_np_p$pi_p)] <- mean_pi
+    dat_np_p$pi_p <- pmin(pmax(as.numeric(dat_np_p$pi_p), 1e-8), 1 - 1e-8)
   }
 
-  fit_NP_P <- safe_fit(df_estimate_NP_P(dat_np_p, base_fun = base_fun, phi_start = phi_start_NP_P))
+  fit_NP_P <- safe_fit(
+    df_estimate_NP_P(
+      dat      = dat_np_p,
+      base_fun = base_fun,
+      phi_start = phi_start_NP_P
+    )
+  )
 
-  # Eff: output BOTH types
-  fit_Eff_type1 <- safe_fit(Eff(dat, K = K, type = 1, x_info = x_info, phi_start = phi_start_Eff, progress = progress_each))
-  fit_Eff_type2 <- safe_fit(Eff(dat, K = K, type = 2, x_info = x_info, phi_start = phi_start_Eff, progress = progress_each))
+  # --- Efficient (Eff): output both type=1 and type=2 ---
+  fit_Eff_type1 <- safe_fit(
+    Eff(
+      dat      = dat,
+      K        = K,
+      type     = 1,
+      phi_start = phi_start_Eff,
+      x_info   = TRUE,
+      progress = progress_each
+    )
+  )
 
-  # Eff on union-only data (x_info = FALSE)
-  fit_Eff_union_dat_type1 <- safe_fit(Eff(dat_union, K = K, type = 1, x_info = FALSE, phi_start = phi_start_Eff, progress = progress_each))
-  fit_Eff_union_dat_type2 <- safe_fit(Eff(dat_union, K = K, type = 2, x_info = FALSE, phi_start = phi_start_Eff, progress = progress_each))
+  fit_Eff_type2 <- safe_fit(
+    Eff(
+      dat      = dat,
+      K        = K,
+      type     = 2,
+      phi_start = phi_start_Eff,
+      x_info   = TRUE,
+      progress = progress_each
+    )
+  )
 
-  # Oracles / semi-oracles
-  fit_Eff_S <- safe_fit(efficient_estimator_semioracle(dat))
-  fit_Eff_P <- safe_fit(efficient_estimator_oracle_p(dat))
+  # --- Efficient on union-only data (x_info=FALSE) ---
+  dat_union <- subset(dat, d_np == 1 | d_p == 1)
+
+  eff_union_args <- list(
+    dat      = dat_union,
+    K        = K,
+    phi_start = phi_start_Eff,
+    x_info   = FALSE,
+    progress = progress_each
+  )
+  if ("N" %in% names(formals(Eff))) eff_union_args$N <- nrow(dat)
+
+  eff_union_args$type <- 1
+  fit_Eff_union_type1 <- safe_fit(do.call(Eff, eff_union_args))
+
+  eff_union_args$type <- 2
+  fit_Eff_union_type2 <- safe_fit(do.call(Eff, eff_union_args))
+
+  # --- Sub-efficient + parametric efficient ---
+  fit_EffS <- safe_fit(
+    Eff_S(
+      dat      = dat,
+      K        = K,
+      x_info   = TRUE,
+      progress = progress_each
+    )
+  )
+
+  fit_EffP <- safe_fit(
+    Eff_P(
+      dat    = dat,
+      x_info = TRUE
+    )
+  )
+
+  # Backward-compatible aliases (so older example code using fits$Eff / fits$Eff_union still works)
+  fit_Eff_default <- if (isTRUE(Eff_type == 1)) fit_Eff_type1 else fit_Eff_type2
+  fit_Eff_union_default <- if (isTRUE(Eff_type == 1)) fit_Eff_union_type1 else fit_Eff_union_type2
 
   list(
-    P = fit_P,
-    NP = fit_NP,
-    NP_P = fit_NP_P,
+    P         = fit_P,
+    NP        = fit_NP,
+    NP_P      = fit_NP_P,
+
+    Eff       = fit_Eff_default,
+    Eff_union = fit_Eff_union_default,
+
     Eff_type1 = fit_Eff_type1,
     Eff_type2 = fit_Eff_type2,
-    Eff_union_dat_type1 = fit_Eff_union_dat_type1,
-    Eff_union_dat_type2 = fit_Eff_union_dat_type2,
-    Eff_S = fit_Eff_S,
-    Eff_P = fit_Eff_P
+
+    Eff_union_type1 = fit_Eff_union_type1,
+    Eff_union_type2 = fit_Eff_union_type2,
+
+    Eff_S     = fit_EffS,
+    Eff_P     = fit_EffP,
+
+    n_np      = n_np,
+    n_p       = n_p,
+    n_union   = n_union
   )
 }
+
+
 
 ############################################################
 ## 4) One MC replication -> long-format rows
@@ -518,208 +551,141 @@ df_par_lapply_lb_progress <- function(cl, X, fun, show_progress = TRUE) {
 # - rows = 9 * B
 # - columns (core): Scenario, rep, estimator, theta, se, ci_l, ci_u, n_np, n_p, n_union, error
 # - plus phi fields: phi_1..phi_4, phi_se_1..phi_se_4, phi_ci_l_1..phi_ci_l_4, phi_ci_u_1..phi_ci_u_4
-run_mc <- function(B,
-                   N = 10000,
-                   Scenario = 1,
-                   K = 2,
-                   Eff_type = 2,              # 2=DML2 (default), 1=DML1
-                   x_info = TRUE,
-                   seed_start = 1,
-                   show_progress = TRUE,
-                   progress_each_fit = FALSE,
-                   pi_p_offset = 0.005,
-                   parallel = c("none", "multicore", "snow"),
-                   n_cores = NULL) {
+run_mc <- function(
+    B = 100,
+    N = 10000,
+    Scenario = 1,
+    K = 2,
+    seed_start = 1,
+    show_progress = TRUE,
+    progress_each_fit = FALSE,
+    pi_p_offset = 0.005,
+    parallel = c("none", "multicore", "snow"),
+    n_cores = max(1L, parallel::detectCores() - 1L),
+    ...
+) {
 
   parallel <- match.arg(parallel)
-
-  B <- as.integer(B)
-  if (!is.finite(B) || B < 1L) stop("B must be a positive integer.")
-
   sc <- normalize_scenario(Scenario)
 
-  seeds <- seed_start + seq_len(B) - 1L
+  seeds   <- seed_start + seq_len(B) - 1L
   rep_ids <- seq_len(B)
 
-  worker_i <- function(i) {
-    tryCatch(
-      mc_one_rep_long(
-        seed = seeds[i],
-        rep_id = rep_ids[i],
-        N = N,
-        Scenario = sc,
-        K = K,
-        Eff_type = Eff_type,
-        x_info = x_info,
-        pi_p_offset = pi_p_offset,
-        progress_each_fit = progress_each_fit
-      ),
-      error = function(e) {
-        make_na_rep_long(
-          rep_id   = rep_ids[i],
-          Scenario = sc,
-          p_phi_max = 4L,
-          err = paste0("MC replication failed: ", conditionMessage(e))
-        )
-      }
+  estimators_all <- c(
+    "P", "NP", "NP_P",
+    "Eff_type1", "Eff_type2",
+    "Eff_union_dat_type1", "Eff_union_dat_type2",
+    "Eff_S", "Eff_P"
+  )
+
+  make_error_fit <- function(msg) {
+    list(
+      theta = NA_real_,
+      se    = NA_real_,
+      ci    = c(NA_real_, NA_real_),
+      phi   = NULL,
+      phi_se = NULL,
+      phi_ci = NULL,
+      error = msg
     )
   }
 
+  make_error_rows <- function(rep_id, sc, msg) {
+    do.call(rbind, lapply(estimators_all, function(est) {
+      extract_row(make_error_fit(msg), est, rep_id, sc, NA_real_, NA_real_, NA_real_)
+    }))
+  }
+
+  worker_i <- function(i) {
+    tryCatch({
+      mc_one_rep_long(
+        rep_id        = rep_ids[i],
+        seed          = seeds[i],
+        N             = N,
+        Scenario      = sc,
+        K             = K,
+        progress_each = progress_each_fit,
+        pi_p_offset   = pi_p_offset,
+        ...
+      )
+    }, error = function(e) {
+      make_error_rows(rep_ids[i], sc, conditionMessage(e))
+    })
+  }
+
+  idxs <- seq_len(B)
+
   if (parallel == "none") {
-    out_list <- vector("list", B)
-    pb <- NULL
     if (isTRUE(show_progress)) {
       pb <- utils::txtProgressBar(min = 0, max = B, style = 3)
-      on.exit(try(close(pb), silent = TRUE), add = TRUE)
+      on.exit(close(pb), add = TRUE)
     }
-    for (b in seq_len(B)) {
-      out_list[[b]] <- worker_i(b)
-      if (!is.null(pb)) utils::setTxtProgressBar(pb, b)
+
+    out_list <- vector("list", B)
+    for (i in idxs) {
+      out_list[[i]] <- worker_i(i)
+      if (isTRUE(show_progress)) utils::setTxtProgressBar(pb, i)
     }
-    return(do.call(rbind, out_list))
-  }
 
-  if (!requireNamespace("parallel", quietly = TRUE)) {
-    stop("Package 'parallel' is required for parallel != 'none'.", call. = FALSE)
-  }
+  } else if (parallel == "multicore") {
 
-  if (is.null(n_cores)) {
-    n_cores <- parallel::detectCores(logical = TRUE)
-    if (!is.finite(n_cores) || n_cores < 1L) n_cores <- 1L
-    n_cores <- max(1L, as.integer(n_cores) - 1L)
-  }
-  n_cores <- as.integer(n_cores)
-  if (!is.finite(n_cores) || n_cores < 1L) n_cores <- 1L
-  n_cores <- min(n_cores, B)
-
-  if (parallel == "multicore") {
-    if (isTRUE(show_progress)) {
-      message("parallel='multicore': show_progress is ignored (no progress bar in base R for mclapply).")
-    }
+    message("parallel='multicore': show_progress is ignored (no progress bar in base R for mclapply).")
 
     out_list <- parallel::mclapply(
-      X = seq_len(B),
-      FUN = worker_i,
+      idxs,
+      worker_i,
       mc.cores = n_cores,
       mc.preschedule = FALSE
     )
 
-    # Robust fallback: if a forked worker crashes, mclapply can return NULL elements
-    # and emit "jobs did not deliver results". Replace such elements by NA rows
-    # so downstream code (summarize_mc) still works.
-    if (length(out_list) < B) {
-      if (length(out_list) == 0L) {
-        out_list <- vector("list", B)
-      }
-      if ((length(out_list) + 1L) <= B) {
-        for (i in (length(out_list) + 1L):B) {
-          out_list[[i]] <- make_na_rep_long(
-            rep_id   = rep_ids[i],
-            Scenario = sc,
-            p_phi_max = 4L,
-            err = "multicore job did not deliver results"
-          )
-        }
-      }
+  } else if (parallel == "snow") {
+
+    n_workers <- max(1L, as.integer(n_cores))
+    cl <- parallel::makeCluster(n_workers)
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+
+    parallel::clusterEvalQ(cl, library(dfSEDI))
+
+    # Export everything needed by `worker_i()` and its callees
+    parallel::clusterExport(
+      cl,
+      varlist = c(
+        "normalize_scenario",
+        "generate_dualframe_population",
+        "make_base_fun",
+        "safe_fit",
+        "extract_row",
+        "fit_all_estimators_once",
+        "mc_one_rep_long",
+        "seeds",
+        "rep_ids",
+        "N",
+        "sc",
+        "K",
+        "progress_each_fit",
+        "pi_p_offset",
+        "estimators_all",
+        "make_error_fit",
+        "make_error_rows",
+        "worker_i"
+      ),
+      envir = environment()
+    )
+
+    if (isTRUE(show_progress)) {
+      out_list <- df_par_lapply_lb_progress(cl, idxs, worker_i)
+    } else {
+      out_list <- parallel::parLapplyLB(cl, idxs, worker_i)
     }
 
-    for (i in seq_len(B)) {
-      if (is.null(out_list[[i]]) || !is.data.frame(out_list[[i]]) || nrow(out_list[[i]]) == 0L) {
-        # Try re-running this replication serially on the master process.
-        # This often succeeds when the failure was specific to fork-based parallelism.
-        out_i <- tryCatch(worker_i(i), error = function(e) NULL)
-
-        if (!is.null(out_i) && is.data.frame(out_i) && nrow(out_i) > 0L) {
-          out_list[[i]] <- out_i
-        } else {
-          out_list[[i]] <- make_na_rep_long(
-            rep_id   = rep_ids[i],
-            Scenario = sc,
-            p_phi_max = 4L,
-            err = "multicore job did not deliver results"
-          )
-        }
-      }
-    }
-
-    return(do.call(rbind, out_list))
   }
 
-  cl <- parallel::makeCluster(n_cores)
-  on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
-
-  parallel::clusterEvalQ(cl, library(dfSEDI))
-
-  parallel::clusterExport(
-    cl,
-    varlist = c(
-      "normalize_scenario",
-      "generate_dualframe_population",
-      "make_base_fun",
-      "safe_fit",
-      "extract_row",
-      "make_na_fit",
-      "make_na_rep_long",
-      "fit_all_estimators_once",
-      "mc_one_rep_long",
-      "seeds",
-      "rep_ids",
-      "N",
-      "sc",
-      "K",
-      "Eff_type",
-      "x_info",
-      "pi_p_offset",
-      "progress_each_fit"
-    ),
-    envir = environment()
-  )
-
-  idxs <- seq_len(B)
-  out_list <- df_par_lapply_lb_progress(
-    cl = cl,
-    X = idxs,
-    fun = worker_i,
-    show_progress = show_progress
-  )
-
-  # Robust fallback: if a worker dies, fill its result with NA rows
-  if (length(out_list) < B) {
-    if (length(out_list) == 0L) {
-      out_list <- vector("list", B)
-    }
-    if ((length(out_list) + 1L) <= B) {
-      for (i in (length(out_list) + 1L):B) {
-        out_list[[i]] <- make_na_rep_long(
-          rep_id   = rep_ids[i],
-          Scenario = sc,
-          p_phi_max = 4L,
-          err = "snow worker did not deliver results"
-        )
-      }
-    }
-  }
-
-  for (i in seq_len(B)) {
-    if (is.null(out_list[[i]]) || !is.data.frame(out_list[[i]]) || nrow(out_list[[i]]) == 0L) {
-      # Try re-running serially on the master process (PSOCK workers can still die).
-      out_i <- tryCatch(worker_i(i), error = function(e) NULL)
-
-      if (!is.null(out_i) && is.data.frame(out_i) && nrow(out_i) > 0L) {
-        out_list[[i]] <- out_i
-      } else {
-        out_list[[i]] <- make_na_rep_long(
-          rep_id   = rep_ids[i],
-          Scenario = sc,
-          p_phi_max = 4L,
-          err = "snow worker did not deliver results"
-        )
-      }
-    }
-  }
-
-  do.call(rbind, out_list)
+  res <- do.call(rbind, out_list)
+  rownames(res) <- NULL
+  res
 }
+
+
 
 ############################################################
 ## 7) MC summary
