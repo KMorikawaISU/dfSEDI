@@ -250,10 +250,10 @@ With the current example script, the `estimator` column takes values:
 - `P`
 - `NP`
 - `NP_P`
-- `Eff_type1` (Eff with `type = 1`; DML1)
-- `Eff_type2` (Eff with `type = 2`; DML2)
-- `Eff_union_dat_type1` (Eff on `dat_union` with `type = 1`; DML1)
-- `Eff_union_dat_type2` (Eff on `dat_union` with `type = 2`; DML2)
+- `Eff1` (Eff with `type = 1`; DML1)
+- `Eff2` (Eff with `type = 2`; DML2)
+- `Eff1_union` (Eff on `dat_union` with `type = 1`; DML1)
+- `Eff2_union` (Eff on `dat_union` with `type = 2`; DML2)
 - `Eff_S`
 - `Eff_P`
 
@@ -337,17 +337,16 @@ one_rep <- function(seed) {
   set.seed(seed)
   dat <- generate_dualframe_population(N = N, Scenario = Scenario)
   fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
-
   rbind(
-    extract_row(fits$P,                   "P",                   seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP,                  "NP",                  seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P,                "NP_P",                seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_type1,           "Eff_type1",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_type2,           "Eff_type2",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union_dat_type1, "Eff_union_dat_type1", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union_dat_type2, "Eff_union_dat_type2", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S,               "Eff_S",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P,               "Eff_P",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    extract_row(fits$P,          "P",          seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,         "NP",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,       "NP_P",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,      "Eff_S",      seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,      "Eff_P",      seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1_union, "Eff1_union", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2_union, "Eff2_union", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1,       "Eff1",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2,       "Eff2",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
 }
 
@@ -410,17 +409,16 @@ one_rep <- function(seed) {
   set.seed(seed)
   dat <- generate_dualframe_population(N = N, Scenario = Scenario)
   fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
-
   rbind(
-    extract_row(fits$P,                   "P",                   seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP,                  "NP",                  seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P,                "NP_P",                seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_type1,           "Eff_type1",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_type2,           "Eff_type2",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union_dat_type1, "Eff_union_dat_type1", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union_dat_type2, "Eff_union_dat_type2", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S,               "Eff_S",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P,               "Eff_P",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    extract_row(fits$P,          "P",          seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,         "NP",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,       "NP_P",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,      "Eff_S",      seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,      "Eff_P",      seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1_union, "Eff1_union", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2_union, "Eff2_union", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1,       "Eff1",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2,       "Eff2",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
 }
 

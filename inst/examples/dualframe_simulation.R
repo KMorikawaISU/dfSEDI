@@ -4,7 +4,7 @@
 ## Dual-frame simulation + MC runner for dfSEDI
 ##
 ## - Scenarios S1/S2/S3 (paper-style DGP)
-## - Fit: P / NP / NP_P / Eff / Eff_union_dat / Eff_S / Eff_P
+## - Fit: P / NP / NP_P / Eff1 / Eff2 / Eff1_union / Eff2_union / Eff_S / Eff_P
 ## - MC: run_mc(B=..., ...) returns long-format results
 ## - Summary: summarize_mc(res, theta_true=...)
 ## - Parallel:
@@ -61,108 +61,58 @@ safe_fit <- function(expr) {
   )
 }
 
-extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union) {
-  # Robust row extractor:
-  # - always returns a 1-row data.frame
-  # - never errors if some fields are NULL / length-0 / malformed
-  scalar_num <- function(x) {
-    if (is.null(x) || length(x) < 1L) return(NA_real_)
-    as.numeric(x)[1]
-  }
-  scalar_chr <- function(x) {
-    if (is.null(x) || length(x) < 1L) return(NA_character_)
-    as.character(x)[1]
-  }
-
+extract_row <- function(fit, estimator, rep_id, Scenario, n_np, n_p, n_union) {
   ci <- fit$ci
-  if (is.null(ci) || length(ci) < 2L) {
-    ci <- c(NA_real_, NA_real_)
-  } else {
-    ci <- tryCatch(as.numeric(ci), error = function(e) c(NA_real_, NA_real_))
-    if (length(ci) < 2L) ci <- c(NA_real_, NA_real_)
-    ci <- ci[1:2]
-  }
+  if (is.null(ci) || length(ci) != 2) ci <- c(NA_real_, NA_real_)
+
+  scenario_lab <- tryCatch(
+    paste0("S", normalize_scenario(Scenario)),
+    error = function(e) NA_character_
+  )
+
+  theta_val <- if (!is.null(fit$theta) && length(fit$theta) == 1) as.numeric(fit$theta) else NA_real_
+  se_val    <- if (!is.null(fit$se)   && length(fit$se)   == 1) as.numeric(fit$se)   else NA_real_
 
   out <- data.frame(
-    Scenario   = paste0("S", normalize_scenario(Scenario)),
-    rep        = rep,
-    estimator  = estimator,
-    theta      = scalar_num(fit$theta),
-    se         = scalar_num(fit$se),
-    ci_l       = scalar_num(ci[1]),
-    ci_u       = scalar_num(ci[2]),
-    n_np       = scalar_num(n_np),
-    n_p        = scalar_num(n_p),
-    n_union    = scalar_num(n_union),
-    error      = scalar_chr(fit$error),
+    Scenario  = scenario_lab,
+    rep       = as.integer(rep_id),
+    estimator = as.character(estimator),
+    theta     = theta_val,
+    se        = se_val,
+    ci_l      = as.numeric(ci[1]),
+    ci_u      = as.numeric(ci[2]),
+    n_np      = as.integer(n_np),
+    n_p       = as.integer(n_p),
+    n_union   = as.integer(n_union),
+    error     = if (!is.null(fit$error) && length(fit$error) > 0) as.character(fit$error)[1] else NA_character_,
     stringsAsFactors = FALSE
   )
 
-  # phi (fixed-width outputs up to 4 dims)
-  p_phi_max <- 4
+  p_phi_max <- 4L
+
+  phi    <- if (!is.null(fit$phi))    as.numeric(fit$phi)    else numeric(0)
+  phi_se <- if (!is.null(fit$phi_se)) as.numeric(fit$phi_se) else numeric(0)
+
+  phi    <- c(phi,    rep(NA_real_, p_phi_max))[seq_len(p_phi_max)]
+  phi_se <- c(phi_se, rep(NA_real_, p_phi_max))[seq_len(p_phi_max)]
+
+  phi_ci_l <- rep(NA_real_, p_phi_max)
+  phi_ci_u <- rep(NA_real_, p_phi_max)
+  if (!is.null(fit$phi_ci) && is.matrix(fit$phi_ci) && nrow(fit$phi_ci) == 2) {
+    phi_ci_l <- c(as.numeric(fit$phi_ci[1, ]), rep(NA_real_, p_phi_max))[seq_len(p_phi_max)]
+    phi_ci_u <- c(as.numeric(fit$phi_ci[2, ]), rep(NA_real_, p_phi_max))[seq_len(p_phi_max)]
+  }
+
   for (j in seq_len(p_phi_max)) {
-    out[[paste0("phi_", j)]]      <- NA_real_
-    out[[paste0("phi_se_", j)]]   <- NA_real_
-    out[[paste0("phi_ci_l_", j)]] <- NA_real_
-    out[[paste0("phi_ci_u_", j)]] <- NA_real_
+    out[[paste0("phi_",      j)]] <- phi[j]
+    out[[paste0("phi_se_",   j)]] <- phi_se[j]
+    out[[paste0("phi_ci_l_", j)]] <- phi_ci_l[j]
+    out[[paste0("phi_ci_u_", j)]] <- phi_ci_u[j]
   }
-
-  phi0 <- tryCatch(as.numeric(fit$phi), error = function(e) numeric(0))
-  if (length(phi0) > 0L) {
-    k <- min(length(phi0), p_phi_max)
-    for (j in seq_len(k)) out[[paste0("phi_", j)]] <- phi0[j]
-  }
-
-  phi_se0 <- tryCatch(as.numeric(fit$phi_se), error = function(e) numeric(0))
-  if (length(phi_se0) > 0L) {
-    k <- min(length(phi_se0), p_phi_max)
-    for (j in seq_len(k)) out[[paste0("phi_se_", j)]] <- phi_se0[j]
-  }
-
-  # phi CI: expected 2 x p matrix, but may be missing or malformed
-  if (!is.null(fit$phi_ci) && is.matrix(fit$phi_ci) && nrow(fit$phi_ci) == 2L && ncol(fit$phi_ci) > 0L) {
-    lo0 <- tryCatch(as.numeric(fit$phi_ci[1, ]), error = function(e) numeric(0))
-    up0 <- tryCatch(as.numeric(fit$phi_ci[2, ]), error = function(e) numeric(0))
-    k <- min(length(lo0), length(up0), p_phi_max)
-    if (k > 0L) {
-      for (j in seq_len(k)) {
-        out[[paste0("phi_ci_l_", j)]] <- lo0[j]
-        out[[paste0("phi_ci_u_", j)]] <- up0[j]
-      }
-    }
-  }
-
-  # Convenience: last phi component (phi_y) depends on Scenario dimensionality.
-  # Scenario 1-2: p_phi=3 -> use phi_3; Scenario 3: p_phi=4 -> use phi_4.
-  phi_last <- NA_real_
-  phi_last_se <- NA_real_
-  phi_last_ci_l <- NA_real_
-  phi_last_ci_u <- NA_real_
-
-  # infer which column is "last" from availability
-  # (prefer 4 if present, otherwise 3)
-  if (is.finite(out$phi_4)) {
-    k_last <- 4L
-  } else if (is.finite(out$phi_3)) {
-    k_last <- 3L
-  } else {
-    k_last <- NA_integer_
-  }
-
-  if (!is.na(k_last)) {
-    phi_last <- out[[paste0("phi_", k_last)]]
-    phi_last_se <- out[[paste0("phi_se_", k_last)]]
-    phi_last_ci_l <- out[[paste0("phi_ci_l_", k_last)]]
-    phi_last_ci_u <- out[[paste0("phi_ci_u_", k_last)]]
-  }
-
-  out$phi_last <- phi_last
-  out$phi_last_se <- phi_last_se
-  out$phi_last_ci_l <- phi_last_ci_l
-  out$phi_last_ci_u <- phi_last_ci_u
 
   out
 }
+
 
 ############################################################
 ## 1) Data generating process (paper-style scenarios)
@@ -241,144 +191,94 @@ make_base_fun <- function(Scenario) {
 ## 3) Fit all estimators once (single dataset)
 ############################################################
 
-fit_all_estimators_once <- function(dat,
-                                    Scenario = 1,
-                                    K = 2,
-                                    Eff_type = 2,
-                                    x_info = TRUE,
-                                    progress_each = FALSE) {
+fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE) {
+  sc <- normalize_scenario(Scenario)
+  base_fun <- make_base_fun(sc)
 
-  Scenario <- normalize_scenario(Scenario)
-
-  # Scenario-specific basis function (for Chang & Kott-style NP/NP_P)
-  base_fun <- make_base_fun(Scenario)
-
-  # "True" phi as starting values (used in the examples)
-  # - For NP/NP_P: phi corresponds to base_fun(X) (dimension p_x + 2)
-  # - For Eff: phi corresponds to L = (1, X, y) (dimension 1 + p_x + 1)
-  X <- as.matrix(dat$X)
-  p_x <- ncol(X)
-  p_phi_np <- ncol(base_fun(X))
-
-  phi_start_NP <- rep(0, p_phi_np)
-  phi_start_Eff <- rep(0, 1 + p_x + 1)
-
-  if (Scenario %in% c(1, 2)) {
-    # DGP uses lin_np = -2.15 - 0.5*x - 0.75*y (Scenario 1/2)
-    # NP/NP_P base_fun does not include y, so we use the x-coefficient part as a start.
-    phi_start_NP[1] <- -2.15
-    if (p_phi_np >= 2) phi_start_NP[2] <- -0.5
-
-    # Eff uses (1, X, y)
-    phi_start_Eff <- c(-2.15, -0.5, -0.75)
-  } else if (Scenario == 3) {
-    # DGP uses lin_np = -1.5 - 0.3*cos(2*y) - 0.1*(y-1)^2 (Scenario 3)
-    # As a simple start, use only the intercept.
-    phi_start_NP[1] <- -1.5
-    phi_start_Eff[1] <- -1.5
-  }
-
-  # For NP_P, use the same initial value as NP (same parameter dimension)
-  phi_start_NP_P <- phi_start_NP
-
-  # Safe wrapper
-  safe_fit <- function(expr) {
-    out <- try(expr, silent = TRUE)
-    if (inherits(out, "try-error")) {
-      return(list(phi = NA, theta = NA_real_, var = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_)))
-    }
-    out
-  }
-
-  # Union data (only units observed in either sample)
-  dat_union <- dat[as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1, , drop = FALSE]
-
-  # --- Estimators ---
-  fit_P <- safe_fit(df_estimate_P(dat))
-
-  fit_NP <- safe_fit(df_estimate_NP(dat, base_fun = base_fun, phi_start = phi_start_NP))
-
-  # NP_P needs pi_p for union-sample units; in this simulation, pi_p is NA when d_p == 0,
-  # so we impute pi_p for (d_np == 1, d_p == 0) before calling df_estimate_NP_P.
-  # NP_P: pi_p imputation is handled internally by df_estimate_NP_P()
-
-  fit_NP_P <- safe_fit(df_estimate_NP_P(dat = dat, base_fun = base_fun, phi_start = phi_start_NP_P))
-
-  # Eff: output BOTH types
-  fit_Eff_type1 <- safe_fit(Eff(dat, K = K, type = 1, x_info = x_info, phi_start = phi_start_Eff, progress = progress_each))
-  fit_Eff_type2 <- safe_fit(Eff(dat, K = K, type = 2, x_info = x_info, phi_start = phi_start_Eff, progress = progress_each))
-
-  # Eff on union-only data (x_info = FALSE)
-  fit_Eff_union_dat_type1 <- safe_fit(Eff(dat_union, K = K, type = 1, x_info = FALSE, N = nrow(dat), phi_start = phi_start_Eff, progress = progress_each))
-  fit_Eff_union_dat_type2 <- safe_fit(Eff(dat_union, K = K, type = 2, x_info = FALSE, N = nrow(dat), phi_start = phi_start_Eff, progress = progress_each))
-
-  # Oracles / semi-oracles (sub-efficient / parametric efficient)
-  fit_Eff_S <- safe_fit(Eff_S(dat = dat, K = K, x_info = x_info, progress = progress_each))
-  fit_Eff_P <- safe_fit(Eff_P(dat = dat, phi_start = phi_start_Eff, eta4_star = 0, max_iter = 20, x_info = x_info, progress = progress_each))
-
-  n_np <- sum(dat$d_np == 1)
-  n_p <- sum(dat$d_p == 1)
+  n_np    <- sum(dat$d_np == 1)
+  n_p     <- sum(dat$d_p == 1)
   n_union <- sum(dat$d_np == 1 | dat$d_p == 1)
 
+  # Initialization for pi_np = expit((1, X, y)' phi)
+  if (sc %in% c(1, 2)) {
+    phi_start_true <- c(-2.15, -0.5, -0.75)
+  } else {
+    # Scenario 3 uses a nonlinear pi_np DGP; use a simple finite start.
+    phi_start_true <- c(-1.5, 0, 0, 0)
+  }
+
+  phi_start_NP    <- phi_start_true
+  phi_start_NP_P  <- phi_start_true
+  phi_start_Eff1  <- phi_start_true
+  phi_start_Eff2  <- phi_start_true
+
+  fit_P   <- safe_fit(df_estimate_P(dat))
+  fit_NP  <- safe_fit(df_estimate_NP(dat, base_fun = base_fun, phi_start = phi_start_NP))
+  fit_NP_P <- safe_fit(df_estimate_NP_P(dat, base_fun = base_fun, phi_start = phi_start_NP_P))
+
+  fit_Eff1 <- safe_fit(Eff(dat = dat, K = K, x_info = TRUE, type = 1, phi_start = phi_start_Eff1, progress = progress_each))
+  fit_Eff2 <- safe_fit(Eff(dat = dat, K = K, x_info = TRUE, type = 2, phi_start = phi_start_Eff2, progress = progress_each))
+
+  dat_union <- subset(dat, d_np == 1 | d_p == 1)
+
+  eff_union_args <- list(
+    dat       = dat_union,
+    K         = K,
+    x_info    = FALSE,
+    progress  = progress_each,
+    type      = 1,
+    phi_start = phi_start_Eff1
+  )
+  if ("N" %in% names(formals(Eff))) {
+    eff_union_args$N <- nrow(dat)
+  }
+  fit_Eff1_union <- safe_fit(do.call(Eff, eff_union_args))
+
+  eff_union_args$type      <- 2
+  eff_union_args$phi_start <- phi_start_Eff2
+  fit_Eff2_union <- safe_fit(do.call(Eff, eff_union_args))
+
+  fit_Eff_S <- safe_fit(Eff_S(dat = dat, K = K, x_info = TRUE, progress = progress_each))
+  fit_Eff_P <- safe_fit(Eff_P(dat = dat, x_info = TRUE, phi_start = phi_start_true, progress = progress_each))
+
   list(
-    n_np = n_np,
-    n_p = n_p,
-    n_union = n_union,
-    P = fit_P,
-    NP = fit_NP,
-    NP_P = fit_NP_P,
-    Eff_type1 = fit_Eff_type1,
-    Eff_type2 = fit_Eff_type2,
-    Eff_union_dat_type1 = fit_Eff_union_dat_type1,
-    Eff_union_dat_type2 = fit_Eff_union_dat_type2,
-    Eff_S = fit_Eff_S,
-    Eff_P = fit_Eff_P
+    P          = fit_P,
+    NP         = fit_NP,
+    NP_P       = fit_NP_P,
+    Eff1       = fit_Eff1,
+    Eff2       = fit_Eff2,
+    Eff1_union = fit_Eff1_union,
+    Eff2_union = fit_Eff2_union,
+    Eff_S      = fit_Eff_S,
+    Eff_P      = fit_Eff_P,
+    n_np       = n_np,
+    n_p        = n_p,
+    n_union    = n_union
   )
 }
+
 
 ############################################################
 ## 4) One MC replication -> long-format rows
 ############################################################
 
-mc_one_rep_long <- function(seed,
-                            rep_id,
-                            N,
-                            Scenario,
-                            K,
-                            Eff_type,
-                            x_info,
-                            pi_p_offset,
-                            progress_each_fit = FALSE) {
-
-  set.seed(seed)
-
-  dat <- generate_dualframe_population(
-    N = N,
-    Scenario = Scenario,
-    pi_p_offset = pi_p_offset
-  )
-
-  fits <- fit_all_estimators_once(
-    dat = dat,
-    Scenario = Scenario,
-    K = K,
-    Eff_type = Eff_type,
-    x_info = x_info,
-    progress_each = progress_each_fit
-  )
+mc_one_rep_long <- function(rep_id, N, Scenario, K = 2, progress_each = FALSE) {
+  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
+  fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress_each)
 
   rbind(
-    extract_row(fits$P, "P", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP, "NP", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P, "NP_P", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_type1, "Eff_type1", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_type2, "Eff_type2", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union_dat_type1, "Eff_union_dat_type1", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union_dat_type2, "Eff_union_dat_type2", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S, "Eff_S", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P, "Eff_P", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    extract_row(fits$P,          "P",          rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,         "NP",         rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,       "NP_P",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,      "Eff_S",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,      "Eff_P",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1_union, "Eff1_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2_union, "Eff2_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1,       "Eff1",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2,       "Eff2",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
 }
+
 
 ############################################################
 ## 5) Snow helper: dynamic scheduling + progress bar
@@ -460,38 +360,17 @@ run_mc <- function(B,
   seeds <- seed_start + seq_len(B) - 1L
   rep_ids <- seq_len(B)
 
-
   worker_i <- function(i) {
-    # Always return a data.frame (even if something goes wrong inside one replication).
-    # This prevents "scheduled cores ... did not deliver results" (multicore) and
-    # "checkForRemoteErrors" (snow/PSOCK) from aborting the whole simulation.
-    tryCatch(
-      mc_one_rep_long(
-        seed = seeds[i],
-        rep_id = rep_ids[i],
-        N = N,
-        Scenario = sc,
-        K = K,
-        Eff_type = Eff_type,
-        x_info = x_info,
-        pi_p_offset = pi_p_offset,
-        progress_each_fit = progress_each_fit
-      ),
-      error = function(e) {
-        err_msg <- paste0("replication_failed: ", conditionMessage(e))
-        na_fit <- list(theta = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_), error = err_msg)
-        rbind(
-          extract_row(na_fit, "P",                   rep_ids[i], sc, NA, NA, NA),
-          extract_row(na_fit, "NP",                  rep_ids[i], sc, NA, NA, NA),
-          extract_row(na_fit, "NP_P",                rep_ids[i], sc, NA, NA, NA),
-          extract_row(na_fit, "Eff_type1",           rep_ids[i], sc, NA, NA, NA),
-          extract_row(na_fit, "Eff_type2",           rep_ids[i], sc, NA, NA, NA),
-          extract_row(na_fit, "Eff_union_dat_type1", rep_ids[i], sc, NA, NA, NA),
-          extract_row(na_fit, "Eff_union_dat_type2", rep_ids[i], sc, NA, NA, NA),
-          extract_row(na_fit, "Eff_S",               rep_ids[i], sc, NA, NA, NA),
-          extract_row(na_fit, "Eff_P",               rep_ids[i], sc, NA, NA, NA)
-        )
-      }
+    mc_one_rep_long(
+      seed = seeds[i],
+      rep_id = rep_ids[i],
+      N = N,
+      Scenario = sc,
+      K = K,
+      Eff_type = Eff_type,
+      x_info = x_info,
+      pi_p_offset = pi_p_offset,
+      progress_each_fit = progress_each_fit
     )
   }
 
@@ -555,7 +434,7 @@ run_mc <- function(B,
       "pi_p_offset",
       "progress_each_fit"
     ),
-    envir = environment()
+    envir = environment(run_mc)
   )
 
   idxs <- seq_len(B)
