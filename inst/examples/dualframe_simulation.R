@@ -61,80 +61,105 @@ safe_fit <- function(expr) {
   )
 }
 
-extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union, p_phi_max = 4L) {
+extract_row <- function(fit, estimator, rep, Scenario, n_np, n_p, n_union) {
+  # Robust row extractor:
+  # - always returns a 1-row data.frame
+  # - never errors if some fields are NULL / length-0 / malformed
+  scalar_num <- function(x) {
+    if (is.null(x) || length(x) < 1L) return(NA_real_)
+    as.numeric(x)[1]
+  }
+  scalar_chr <- function(x) {
+    if (is.null(x) || length(x) < 1L) return(NA_character_)
+    as.character(x)[1]
+  }
+
   ci <- fit$ci
-  if (is.null(ci) || length(ci) != 2) ci <- c(NA_real_, NA_real_)
-
-  # phi (fixed-width output up to p_phi_max)
-  phi     <- rep(NA_real_, p_phi_max)
-  phi_se  <- rep(NA_real_, p_phi_max)
-  phi_ci_l <- rep(NA_real_, p_phi_max)
-  phi_ci_u <- rep(NA_real_, p_phi_max)
-
-  if (!is.null(fit$phi)) {
-    phi0 <- as.numeric(fit$phi)
-    k <- min(length(phi0), p_phi_max)
-    if (k > 0) phi[1:k] <- phi0[1:k]
-  }
-
-  if (!is.null(fit$phi_se)) {
-    se0 <- as.numeric(fit$phi_se)
-    k <- min(length(se0), p_phi_max)
-    if (k > 0) phi_se[1:k] <- se0[1:k]
-  }
-
-  if (!is.null(fit$phi_ci) && is.matrix(fit$phi_ci) && nrow(fit$phi_ci) == 2) {
-    lo0 <- as.numeric(fit$phi_ci[1, ])
-    up0 <- as.numeric(fit$phi_ci[2, ])
-    k <- min(length(lo0), length(up0), p_phi_max)
-    if (k > 0) {
-      phi_ci_l[1:k] <- lo0[1:k]
-      phi_ci_u[1:k] <- up0[1:k]
-    }
+  if (is.null(ci) || length(ci) < 2L) {
+    ci <- c(NA_real_, NA_real_)
+  } else {
+    ci <- tryCatch(as.numeric(ci), error = function(e) c(NA_real_, NA_real_))
+    if (length(ci) < 2L) ci <- c(NA_real_, NA_real_)
+    ci <- ci[1:2]
   }
 
   out <- data.frame(
-    Scenario  = paste0("S", normalize_scenario(Scenario)),
-    rep       = rep,
-    estimator = estimator,
-    theta     = as.numeric(fit$theta),
-    se        = as.numeric(fit$se),
-    ci_l      = as.numeric(ci[1]),
-    ci_u      = as.numeric(ci[2]),
-    n_np      = n_np,
-    n_p       = n_p,
-    n_union   = n_union,
-    error     = if (!is.null(fit$error)) fit$error else NA_character_,
+    Scenario   = paste0("S", normalize_scenario(Scenario)),
+    rep        = rep,
+    estimator  = estimator,
+    theta      = scalar_num(fit$theta),
+    se         = scalar_num(fit$se),
+    ci_l       = scalar_num(ci[1]),
+    ci_u       = scalar_num(ci[2]),
+    n_np       = scalar_num(n_np),
+    n_p        = scalar_num(n_p),
+    n_union    = scalar_num(n_union),
+    error      = scalar_chr(fit$error),
     stringsAsFactors = FALSE
   )
 
-  # Append phi columns (fixed width)
-  for (j in seq_len(p_phi_max)) out[[paste0("phi_", j)]] <- phi[j]
-  for (j in seq_len(p_phi_max)) out[[paste0("phi_se_", j)]] <- phi_se[j]
-  for (j in seq_len(p_phi_max)) out[[paste0("phi_ci_l_", j)]] <- phi_ci_l[j]
-  for (j in seq_len(p_phi_max)) out[[paste0("phi_ci_u_", j)]] <- phi_ci_u[j]
-
-  # Convenience: last phi element (phi_3 for S1/S2, phi_4 for S3) and its CI
-  phi_last <- NA_real_
-  phi_last_ci_l <- NA_real_
-  phi_last_ci_u <- NA_real_
-  if (!is.null(fit$phi)) {
-    phi0 <- as.numeric(fit$phi)
-    if (length(phi0) > 0) phi_last <- phi0[length(phi0)]
+  # phi (fixed-width outputs up to 4 dims)
+  p_phi_max <- 4
+  for (j in seq_len(p_phi_max)) {
+    out[[paste0("phi_", j)]]      <- NA_real_
+    out[[paste0("phi_se_", j)]]   <- NA_real_
+    out[[paste0("phi_ci_l_", j)]] <- NA_real_
+    out[[paste0("phi_ci_u_", j)]] <- NA_real_
   }
-  if (!is.null(fit$phi_ci) && is.matrix(fit$phi_ci) && nrow(fit$phi_ci) == 2) {
-    lo0 <- as.numeric(fit$phi_ci[1, ])
-    up0 <- as.numeric(fit$phi_ci[2, ])
-    if (length(lo0) > 0 && length(up0) > 0) {
-      k_last <- min(length(lo0), length(up0))
-      phi_last_ci_l <- lo0[k_last]
-      phi_last_ci_u <- up0[k_last]
+
+  phi0 <- tryCatch(as.numeric(fit$phi), error = function(e) numeric(0))
+  if (length(phi0) > 0L) {
+    k <- min(length(phi0), p_phi_max)
+    for (j in seq_len(k)) out[[paste0("phi_", j)]] <- phi0[j]
+  }
+
+  phi_se0 <- tryCatch(as.numeric(fit$phi_se), error = function(e) numeric(0))
+  if (length(phi_se0) > 0L) {
+    k <- min(length(phi_se0), p_phi_max)
+    for (j in seq_len(k)) out[[paste0("phi_se_", j)]] <- phi_se0[j]
+  }
+
+  # phi CI: expected 2 x p matrix, but may be missing or malformed
+  if (!is.null(fit$phi_ci) && is.matrix(fit$phi_ci) && nrow(fit$phi_ci) == 2L && ncol(fit$phi_ci) > 0L) {
+    lo0 <- tryCatch(as.numeric(fit$phi_ci[1, ]), error = function(e) numeric(0))
+    up0 <- tryCatch(as.numeric(fit$phi_ci[2, ]), error = function(e) numeric(0))
+    k <- min(length(lo0), length(up0), p_phi_max)
+    if (k > 0L) {
+      for (j in seq_len(k)) {
+        out[[paste0("phi_ci_l_", j)]] <- lo0[j]
+        out[[paste0("phi_ci_u_", j)]] <- up0[j]
+      }
     }
   }
+
+  # Convenience: last phi component (phi_y) depends on Scenario dimensionality.
+  # Scenario 1-2: p_phi=3 -> use phi_3; Scenario 3: p_phi=4 -> use phi_4.
+  phi_last <- NA_real_
+  phi_last_se <- NA_real_
+  phi_last_ci_l <- NA_real_
+  phi_last_ci_u <- NA_real_
+
+  # infer which column is "last" from availability
+  # (prefer 4 if present, otherwise 3)
+  if (is.finite(out$phi_4)) {
+    k_last <- 4L
+  } else if (is.finite(out$phi_3)) {
+    k_last <- 3L
+  } else {
+    k_last <- NA_integer_
+  }
+
+  if (!is.na(k_last)) {
+    phi_last <- out[[paste0("phi_", k_last)]]
+    phi_last_se <- out[[paste0("phi_se_", k_last)]]
+    phi_last_ci_l <- out[[paste0("phi_ci_l_", k_last)]]
+    phi_last_ci_u <- out[[paste0("phi_ci_u_", k_last)]]
+  }
+
   out$phi_last <- phi_last
+  out$phi_last_se <- phi_last_se
   out$phi_last_ci_l <- phi_last_ci_l
   out$phi_last_ci_u <- phi_last_ci_u
-
 
   out
 }
@@ -428,17 +453,38 @@ run_mc <- function(B,
   seeds <- seed_start + seq_len(B) - 1L
   rep_ids <- seq_len(B)
 
+
   worker_i <- function(i) {
-    mc_one_rep_long(
-      seed = seeds[i],
-      rep_id = rep_ids[i],
-      N = N,
-      Scenario = sc,
-      K = K,
-      Eff_type = Eff_type,
-      x_info = x_info,
-      pi_p_offset = pi_p_offset,
-      progress_each_fit = progress_each_fit
+    # Always return a data.frame (even if something goes wrong inside one replication).
+    # This prevents "scheduled cores ... did not deliver results" (multicore) and
+    # "checkForRemoteErrors" (snow/PSOCK) from aborting the whole simulation.
+    tryCatch(
+      mc_one_rep_long(
+        seed = seeds[i],
+        rep_id = rep_ids[i],
+        N = N,
+        Scenario = sc,
+        K = K,
+        Eff_type = Eff_type,
+        x_info = x_info,
+        pi_p_offset = pi_p_offset,
+        progress_each_fit = progress_each_fit
+      ),
+      error = function(e) {
+        err_msg <- paste0("replication_failed: ", conditionMessage(e))
+        na_fit <- list(theta = NA_real_, se = NA_real_, ci = c(NA_real_, NA_real_), error = err_msg)
+        rbind(
+          extract_row(na_fit, "P",                   rep_ids[i], sc, NA, NA, NA),
+          extract_row(na_fit, "NP",                  rep_ids[i], sc, NA, NA, NA),
+          extract_row(na_fit, "NP_P",                rep_ids[i], sc, NA, NA, NA),
+          extract_row(na_fit, "Eff_type1",           rep_ids[i], sc, NA, NA, NA),
+          extract_row(na_fit, "Eff_type2",           rep_ids[i], sc, NA, NA, NA),
+          extract_row(na_fit, "Eff_union_dat_type1", rep_ids[i], sc, NA, NA, NA),
+          extract_row(na_fit, "Eff_union_dat_type2", rep_ids[i], sc, NA, NA, NA),
+          extract_row(na_fit, "Eff_S",               rep_ids[i], sc, NA, NA, NA),
+          extract_row(na_fit, "Eff_P",               rep_ids[i], sc, NA, NA, NA)
+        )
+      }
     )
   }
 

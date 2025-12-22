@@ -309,6 +309,46 @@ df_apply_x_info <- function(dat, x_info = TRUE) {
     dat$X <- x0
   }
 
+  # If (d_np,d_p)=(0,0) rows have missing y, replace with a finite dummy value.
+  # This avoids NA propagation in terms that mathematically do not depend on y when (0,0).
+  if (all(c("y", "d_p", "d_np") %in% names(dat))) {
+    d_p0  <- as.numeric(dat$d_p)
+    d_np0 <- as.numeric(dat$d_np)
+    idx00 <- (d_p0 == 0 & d_np0 == 0)
+    if (any(idx00, na.rm = TRUE)) {
+      y0 <- dat$y
+      if (is.numeric(y0) || is.integer(y0)) {
+        miss <- idx00 & !is.finite(as.numeric(y0))
+        if (any(miss, na.rm = TRUE)) {
+          y0[miss] <- 0
+          dat$y <- y0
+        }
+      } else if (is.logical(y0)) {
+        miss <- idx00 & is.na(y0)
+        if (any(miss, na.rm = TRUE)) {
+          y0[miss] <- FALSE
+          dat$y <- y0
+        }
+      } else if (is.factor(y0)) {
+        miss <- idx00 & is.na(y0)
+        if (any(miss, na.rm = TRUE)) {
+          if ("0" %in% levels(y0)) {
+            y0[miss] <- "0"
+          } else {
+            y0[miss] <- levels(y0)[1]
+          }
+          dat$y <- y0
+        }
+      } else if (is.character(y0)) {
+        miss <- idx00 & is.na(y0)
+        if (any(miss, na.rm = TRUE)) {
+          y0[miss] <- "0"
+          dat$y <- y0
+        }
+      }
+    }
+  }
+
   if (isTRUE(x_info)) return(dat)
   if (!all(c("d_p", "d_np") %in% names(dat))) return(dat)
 
