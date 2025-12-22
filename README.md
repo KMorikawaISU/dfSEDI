@@ -8,7 +8,7 @@ dual-frame sampling (Morikawa & Kim, 202x).
 
 Main user-facing estimators:
 
-- `Eff` : semiparametric efficient estimator (**default: DML2**,
+- `Eff` : semiparametric efficient estimator (**default: DML1**,
   supports DML1 / DML2, K-fold)
 - `Eff_S` : sub-efficient estimator (Remark 6-type, K-fold)
 - `Eff_P` : parametric efficient estimator (working model)
@@ -55,16 +55,10 @@ All core functions assume a data frame `dat` that contains at least:
   - a **data.frame** (recommended if you have categorical variables)  
   - alternatively, a numeric vector `x` can be provided (1D covariate
   case)
-- `y` : outcome variable (continuous or binary).  
-  In the paper-style observation pattern (Table 1), `y` can be missing
-  (`NA`) for $(d_{np},d_p)=(0,0)$. dfSEDI does **not** use `y` from
-  $(0,0)$ units for the main (leading) terms; the implementation avoids
-  NA propagation internally.
+- `y` : outcome variable (continuous or binary)
 - `d_np` : indicator for inclusion in the non-probability sample (0/1)
 - `d_p` : indicator for inclusion in the probability sample (0/1)
-- `pi_p` : design inclusion probability for the probability sample.  
-  In Table 1 style data, `pi_p` is observed only when `d_p==1` (else
-  `NA`).
+- `pi_p` : design inclusion probability for the probability sample
 - `pi_np` : (optional; simulations only) true NP inclusion probability
 
 ### Important: handling the $(d_{np}, d_p) = (0,0)$ pattern (`x_info`)
@@ -109,7 +103,7 @@ dfSEDI exposes this choice via the flag `x_info`:
 > average over the observed union sample. In that case, you can recover
 > the population-mean scale by multiplying `theta`, `se`, and `ci` by
 > `nrow(dat_union) / N`.
->
+
 > Practical tip: If your input data include only sampled units (union
 > sample), you can create it as:
 >
@@ -165,7 +159,7 @@ options(dfSEDI.allow_small_cells = FALSE)          # bypass flag
 
 ------------------------------------------------------------------------
 
-## Chang & Kott-type NP estimators: specifying `base_fun`
+## Chang & Kott-type NP estimators: specifying `base_fun` (NEW)
 
 `df_estimate_NP()` and `df_estimate_NP_P()` solve a Chang & Kott-type
 estimating equation for the NP propensity parameter $\phi$ using a
@@ -212,18 +206,12 @@ The package ships an example script in `inst/examples`:
 
 - `inst/examples/dualframe_simulation.R`
 
-This example script uses the **paper-style observation pattern**:
-
-- $(d_{np},d_p)=(0,0)$: `y` is `NA`
-- `pi_p` is observed only when `d_p==1` (else `NA`)
-- Complete-data values are kept as `y_true` and `pi_p_true` in the
-  simulated dataset
-
 Example:
 
 ``` r
 library(dfSEDI)
 
+# Load the bundled example script (defines generate_dualframe_population)
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
@@ -252,10 +240,10 @@ observe the union sample:
 ``` r
 dat_union <- subset(dat, d_np == 1 | d_p == 1)
 
+# Eff uses DML1 by default (faster).
 fit_eff_union <- Eff(
   dat         = dat_union,
   K           = 2,
-  type        = 1,      # DML1 (faster). Use type=2 for DML2.
   x_info      = FALSE,
   N           = N,      # population size (frame size)
   progress    = TRUE
@@ -273,10 +261,10 @@ For simulation studies where you keep the full population-like data
 structure:
 
 ``` r
+# Eff uses DML1 by default (faster).
 fit_eff_full <- Eff(
   dat         = dat,
   K           = 2,
-  type        = 1,      # DML1 (faster). Use type=2 for DML2.
   x_info      = TRUE,
   progress    = TRUE
 )
@@ -293,7 +281,7 @@ fit_eff_full$info
 
 The example script `inst/examples/dualframe_simulation.R` also defines:
 
-- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, parallel, n_cores)`
+- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, ...)`
 - `summarize_mc(res, theta_true = 0)`
 
 `run_mc()` returns a long-format data frame (one row per replication ×
@@ -310,6 +298,13 @@ takes values:
 - `Eff_S`
 - `Eff_P`
 
+The typical columns are:
+
+- `Scenario`, `rep`, `estimator`
+- `theta`, `se`, `ci_l`, `ci_u`
+- `n_np`, `n_p`, `n_union`
+- `error`
+
 ### Serial MC (built-in progress bar)
 
 ``` r
@@ -325,89 +320,159 @@ res <- run_mc(
   K = 2,
   seed_start = 1,
   show_progress = TRUE,
-  progress_each_fit = FALSE,
-  parallel = "none"
+  progress_each_fit = FALSE
 )
 
 summarize_mc(res, theta_true = 0)
 ```
 
-### Parallel MC (Windows): PSOCK cluster + progress bar
+### Parallel MC with a progress bar (Windows)
 
-Windows does not support fork-based parallelism (`mclapply`). Use
-`parallel="snow"`.
+Windows does not support fork-based parallelism (`mclapply`). Use a
+PSOCK cluster with `pbapply`:
+
+Needed packages (Suggests): `pbapply` (and base R `parallel`)
 
 ``` r
+# install.packages("pbapply")  # if needed
+
 library(dfSEDI)
+library(parallel)
+library(pbapply)
 
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
-res <- run_mc(
-  B = 200,
-  N = 10000,
-  Scenario = 1,
-  K = 2,
-  seed_start = 1,
-  show_progress = TRUE,
-  parallel = "snow",     # PSOCK + built-in progress bar
-  n_cores = NULL          # default: detectCores()-1
+B <- 200
+N <- 10000
+Scenario <- 1
+K <- 2
+
+seeds <- 1 + seq_len(B) - 1
+
+n_workers <- max(1L, parallel::detectCores() - 1L)
+cl <- parallel::makeCluster(n_workers)
+on.exit(parallel::stopCluster(cl), add = TRUE)
+
+pbapply::pboptions(type = "txt")
+
+parallel::clusterEvalQ(cl, library(dfSEDI))
+
+# Export the functions defined by the example script
+parallel::clusterExport(
+  cl,
+  varlist = c(
+    "normalize_scenario",
+    "generate_dualframe_population",
+    "make_base_fun",
+    "safe_fit",
+    "extract_row",
+    "fit_all_estimators_once",
+    "N",
+    "Scenario",
+    "K"
+  ),
+  envir = environment()
 )
 
-summarize_mc(res, theta_true = 0)
+one_rep <- function(seed) {
+  set.seed(seed)
+  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
+  fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
+
+  rbind(
+    extract_row(fits$P,                   "P",                   seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,                  "NP",                  seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,                "NP_P",                seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_type1,           "Eff_type1",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_type2,           "Eff_type2",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union_dat_type1, "Eff_union_dat_type1", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union_dat_type2, "Eff_union_dat_type2", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,               "Eff_S",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,               "Eff_P",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
+  )
+}
+
+out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
+res_par <- do.call(rbind, out_list)
+
+summarize_mc(res_par, theta_true = 0)
 ```
 
-### Parallel MC (macOS / Linux)
+### Parallel MC with a progress bar (macOS / Linux)
 
-Option A (fastest): fork-based parallelism via `parallel="multicore"`.
-Note: base R does not show a progress bar for `mclapply`.
+We recommend using the same PSOCK + `pbapply` approach as in the Windows
+section. This is more robust than fork-based parallelism and avoids the
+common `scheduled cores ... did not deliver results` issue.
+
+Needed packages (Suggests): `pbapply` (and base R `parallel`)
 
 ``` r
+# install.packages("pbapply")  # if needed
+
 library(dfSEDI)
+library(parallel)
+library(pbapply)
 
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
-res <- run_mc(
-  B = 200,
-  N = 10000,
-  Scenario = 1,
-  K = 2,
-  seed_start = 1,
-  show_progress = TRUE,   # ignored under multicore
-  parallel = "multicore",
-  n_cores = NULL
+B <- 200
+N <- 10000
+Scenario <- 1
+K <- 2
+
+seeds <- 1 + seq_len(B) - 1
+
+n_workers <- max(1L, parallel::detectCores() - 1L)
+cl <- parallel::makeCluster(n_workers)
+on.exit(parallel::stopCluster(cl), add = TRUE)
+
+pbapply::pboptions(type = "txt")
+
+parallel::clusterEvalQ(cl, library(dfSEDI))
+
+parallel::clusterExport(
+  cl,
+  varlist = c(
+    "normalize_scenario",
+    "generate_dualframe_population",
+    "make_base_fun",
+    "safe_fit",
+    "extract_row",
+    "fit_all_estimators_once",
+    "N",
+    "Scenario",
+    "K"
+  ),
+  envir = environment()
 )
 
-summarize_mc(res, theta_true = 0)
+one_rep <- function(seed) {
+  set.seed(seed)
+  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
+  fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
+
+  rbind(
+    extract_row(fits$P,                   "P",                   seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,                  "NP",                  seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,                "NP_P",                seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_type1,           "Eff_type1",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_type2,           "Eff_type2",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union_dat_type1, "Eff_union_dat_type1", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_union_dat_type2, "Eff_union_dat_type2", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,               "Eff_S",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,               "Eff_P",               seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
+  )
+}
+
+out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
+res_par <- do.call(rbind, out_list)
+
+summarize_mc(res_par, theta_true = 0)
 ```
 
-Option B (portable + progress bar): use `parallel="snow"` (works on
-Windows/macOS/Linux).
-
-``` r
-library(dfSEDI)
-
-example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
-source(example_file)
-
-res <- run_mc(
-  B = 200,
-  N = 10000,
-  Scenario = 1,
-  K = 2,
-  seed_start = 1,
-  show_progress = TRUE,
-  parallel = "snow",
-  n_cores = NULL
-)
-
-summarize_mc(res, theta_true = 0)
-```
-
-Notes:
-
-- `parallel="snow"` uses a PSOCK cluster with load balancing and a
-  progress bar in the master process.
-- If you are running inside RStudio on macOS/Linux and see issues with
-  forking, prefer `parallel="snow"`.
+Notes: - In the parallel examples above, we run one replication per
+seed, and the progress bar is shown in the master process. - If you want
+to list optional packages in DESCRIPTION, add: - `pbapply` (progress bar
+for PSOCK clusters; works on Windows/macOS/Linux)
