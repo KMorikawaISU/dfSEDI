@@ -1,6 +1,12 @@
 ############################################################
 ## dualframe_core.R
 ##
+## Semiparametric Efficient Data Integration using Dual Frame
+## Sampling (dfSEDI) - core estimators and simulation helpers
+##
+## This file is intended to be *sourced* (or used as package source),
+## and contains full function definitions (not patches).
+##
 ## Mixed continuous/discrete covariates:
 ##  - Nonparametric nuisances use delta x RBF (mixed-type KRR)
 ##  - Small categorical cell warning / ask-to-continue (English)
@@ -9,12 +15,18 @@
 ##  - If X is a data.frame with categorical columns, we use model.matrix(~ .)
 ##    (drop intercept) so categorical vars enter as L-1 dummies
 ##
-## Binary Y support (requested):
+## Binary Y support:
 ##  - Eff     : unchanged (still uses Gaussian / mixed kernel regression for eta4*, h4*)
 ##  - Eff_S   : if y is binary and logit=TRUE (or logit=NULL auto-detect), mu(X)=P(Y=1|X)
 ##              is estimated by kernel logistic regression (RBF + ridge, IRLS)
 ##  - Eff_P   : if y is binary and logit=TRUE (or logit=NULL auto-detect), mu(X) is estimated
 ##              by parametric logistic regression (glm binomial)
+##
+## NEW (bugfix for (d_np,d_p)=(0,0) with missing Y):
+##  - When y is missing for non-union units (d_np=0 & d_p=0), we replace those NA values
+##    with 0 *inside df_apply_x_info()* so score contributions remain finite and (0,0) units
+##    are not silently dropped from sample means via na.rm=TRUE.
+##  - If y is missing on union units (d_np=1 or d_p=1), we stop with an error.
 ##
 ## NEW: x_info flag (speed / (0,0)-absent setting)
 ##  - x_info=TRUE  (default): keep the original behavior (estimate h4*, eta4* by KRR for Eff)
@@ -47,13 +59,6 @@
 ##  - RBF sigma rule (legacy / old version):
 ##      sigma = 1 / median(||x_i - x_j||)
 ##    where the median is taken over pairwise distances of a deterministic subsample (for speed).
-##
-## Output-preserving speed updates (this revision):
-##  - Cache df_krr_mixed_prepare() per fold for eta4*/h4*
-##  - Vectorize Numer_mat construction in eta4*(X;phi)
-##  - Faster mixed prediction: pre-split indices; fit global model only if needed
-##  - df_get_X fast-path for numeric matrices
-##  - Internal fast score evaluators for DML objectives/jacobians (avoid repeated df_get_X)
 ##
 ## Hotfix (Scenario S1/S2 gausspr failure):
 ##  - If dat is created by data.frame(X = I(matrix(...))), then dat$X has class "AsIs".
@@ -193,7 +198,6 @@ df_prepare_pi_p <- function(pi_p, d_p, d_np, context = "dfSEDI") {
   df_clip_prob(pi_p)
 }
 
-
 # Parametric (linear) imputation of pi_p for NP-only union units (d_np==1, d_p==0).
 # We mirror the *target* of the nonparametric imputer used in Eff:
 #   regress 1/pi_p on L = (X, y) using P-sample units (d_p==1), then predict for missing.
@@ -280,6 +284,9 @@ df_impute_pi_p_lm <- function(dat,
 # Apply x_info setting:
 #  - x_info=TRUE : keep dat as is
 #  - x_info=FALSE: drop any (d_p,d_np)=(0,0) rows (if present)
+#
+# Also (bugfix): if y is missing for (0,0) rows, replace those NA with 0 so score contributions
+# remain finite. Missing y on union rows triggers an error.
 df_apply_x_info <- function(dat, x_info = TRUE) {
   if (!is.data.frame(dat)) return(dat)
 
@@ -291,20 +298,21 @@ df_apply_x_info <- function(dat, x_info = TRUE) {
     dat$X <- x0
   }
 
-  if (isTRUE(x_info)) return(dat)
-  if (!all(c("d_p", "d_np") %in% names(dat))) return(dat)
+  if (!isTRUE(x_info)) {
+    if (all(c("d_p", "d_np") %in% names(dat))) {
+      d_p  <- as.numeric(dat$d_p)
+      d_np <- as.numeric(dat$d_np)
+      keep <- !(d_p == 0 & d_np == 0)
 
-  d_p  <- as.numeric(dat$d_p)
-  d_np <- as.numeric(dat$d_np)
-  keep <- !(d_p == 0 & d_np == 0)
-
-  if (any(!keep, na.rm = TRUE)) {
-    # silent by default (speed path); set option to warn if desired
-    if (isTRUE(getOption("dfSEDI.warn_drop_00", FALSE))) {
-      warning(sprintf("dfSEDI: x_info=FALSE dropped %d rows with (d_p,d_np)=(0,0).",
-                      sum(!keep, na.rm = TRUE)), call. = FALSE)
+      if (any(!keep, na.rm = TRUE)) {
+        # silent by default (speed path); set option to warn if desired
+        if (isTRUE(getOption("dfSEDI.warn_drop_00", FALSE))) {
+          warning(sprintf("dfSEDI: x_info=FALSE dropped %d rows with (d_p,d_np)=(0,0).",
+                          sum(!keep, na.rm = TRUE)), call. = FALSE)
+        }
+        dat <- dat[keep, , drop = FALSE]
+      }
     }
-    dat <- dat[keep, , drop = FALSE]
   }
 
   # (After subsetting, ensure AsIs didn't persist)
@@ -312,6 +320,50 @@ df_apply_x_info <- function(dat, x_info = TRUE) {
     x0 <- dat$X
     class(x0) <- setdiff(class(x0), "AsIs")
     dat$X <- x0
+  }
+
+  # --- BUGFIX: handle missing y for (0,0) rows ---
+  if (("y" %in% names(dat)) && all(c("d_p", "d_np") %in% names(dat))) {
+    d_p  <- as.numeric(dat$d_p)
+    d_np <- as.numeric(dat$d_np)
+    union <- (d_p == 1 | d_np == 1)
+
+    y <- dat$y
+    if (is.factor(y)) {
+      # Union must be observed
+      if (any(union & is.na(y))) {
+        stop("dfSEDI: y has NA on union units (d_np==1 or d_p==1). Please provide observed y for union sample.",
+             call. = FALSE)
+      }
+      # For non-union NA, set to first level (arbitrary placeholder; will not affect terms because d_p=d_np=0)
+      idx_mis <- which(!union & is.na(y))
+      if (length(idx_mis) > 0L) {
+        lev <- levels(y)
+        if (length(lev) >= 1L) {
+          y[idx_mis] <- lev[1]
+          dat$y <- y
+        }
+      }
+    } else if (is.logical(y)) {
+      # Union must be observed
+      if (any(union & is.na(y))) {
+        stop("dfSEDI: y has NA on union units (d_np==1 or d_p==1). Please provide observed y for union sample.",
+             call. = FALSE)
+      }
+      idx_mis <- which(!union & is.na(y))
+      if (length(idx_mis) > 0L) {
+        y[idx_mis] <- FALSE
+        dat$y <- y
+      }
+    } else {
+      y_num <- suppressWarnings(as.numeric(y))
+      if (any(union & !is.finite(y_num))) {
+        stop("dfSEDI: y is missing/non-finite on union units (d_np==1 or d_p==1). Please provide observed y for union sample.",
+             call. = FALSE)
+      }
+      y_num[!union & !is.finite(y_num)] <- 0
+      dat$y <- y_num
+    }
   }
 
   dat
@@ -1504,7 +1556,7 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   df_clip_prob(pi_hat)
 }
 
-# --- NEW: core evaluators that accept pre-extracted (X_obs, l_obs, pi_p_obs, prep) ---
+# --- core evaluators that accept pre-extracted (X_obs, l_obs, pi_p_obs, prep) ---
 estimate_conditional_expectation_kernlab_phi_core <- function(phi,
                                                               new_X,
                                                               X_obs,
@@ -1611,7 +1663,7 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
   as.numeric(numer_pred / denom_pred)
 }
 
-# Backward-compatible wrappers (same outputs as before)
+# Backward-compatible wrappers
 estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma = NULL, prep = NULL) {
   phi <- as.numeric(phi)
   X_all <- df_get_X(dat)
@@ -1631,7 +1683,6 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma 
       context = "eta4*(X;phi) nuisance regression"
     )
   } else {
-    # keep cat/cont from prep; override sigma if explicitly provided
     if (!is.null(sigma)) prep$sigma <- sigma
   }
 
@@ -1682,7 +1733,6 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigm
 ## 5. Scores
 ############################################################
 
-# Original versions (kept for compatibility)
 df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
   phi <- as.numeric(phi)
 
@@ -1915,7 +1965,7 @@ df_sandwich_from_contrib <- function(contrib, level = 0.95) {
   list(theta = theta_hat, var = var_hat, se = se_hat, ci = ci, n_eff = n)
 }
 
-# --- NEW: population size + Hajek helpers (used only when N is supplied or hajek=TRUE) ---
+# --- population size + Hajek helpers ---
 
 df_parse_population_N <- function(N) {
   if (is.null(N)) return(NULL)
@@ -2034,6 +2084,8 @@ df_hajek_mean_with_se <- function(y, w, level = 0.95) {
 }
 
 df_estimate_P <- function(dat, N = NULL, hajek = FALSE) {
+  dat <- df_apply_x_info(dat, x_info = TRUE)
+
   d_p  <- as.numeric(dat$d_p)
   y    <- as.numeric(dat$y)
   pi_p_raw <- as.numeric(dat$pi_p)
@@ -2080,6 +2132,8 @@ df_estimate_NP <- function(dat,
                            max_iter = 20,
                            N = NULL,
                            hajek = FALSE) {
+
+  dat <- df_apply_x_info(dat, x_info = TRUE)
 
   # Validate base_fun
   if (!is.function(base_fun)) stop("df_estimate_NP(): base_fun must be a function.")
@@ -2188,6 +2242,8 @@ df_estimate_NP_P <- function(dat,
                              N = NULL,
                              hajek = FALSE) {
 
+  dat <- df_apply_x_info(dat, x_info = TRUE)
+
   # Validate base_fun
   if (!is.function(base_fun)) stop("df_estimate_NP_P(): base_fun must be a function.")
 
@@ -2207,7 +2263,6 @@ df_estimate_NP_P <- function(dat,
   y <- as.numeric(dat$y)
   # If pi_p is missing for (d_np, d_p) = (1, 0), impute it via a parametric lm on 1/pi_p.
   dat <- df_impute_pi_p_lm(dat, context = "df_estimate_NP_P()")
-
 
   # pi_p can be missing for d_p == 0. We only require it for union-sample units.
   pi_p <- df_prepare_pi_p(dat$pi_p, d_p = d_p, d_np = d_np, context = "df_estimate_NP_P()")
@@ -2352,7 +2407,7 @@ efficient_estimator_dml2 <- function(dat,
   folds <- make_folds(n, K)
   dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress)
 
-  # Build fold caches (output-preserving): precompute X_test/l_test and train prep for eta4*/h4*
+  # Build fold caches
   make_fold_cache <- function(idx_test, idx_train) {
     dat_test  <- dat_cf[idx_test,  , drop = FALSE]
     dat_train <- dat_cf[idx_train, , drop = FALSE]
@@ -2471,7 +2526,7 @@ efficient_estimator_dml2 <- function(dat,
     flush.console()
   }
 
-  # --- Multi-start phi estimation (100 candidates -> try up to 10) ---
+  # Multi-start phi estimation
   n_cand <- 100L
   cand_mat <- matrix(rep(phi_start, each = n_cand), nrow = n_cand) +
     matrix(stats::runif(n_cand * p_phi, -0.5, 0.5), nrow = n_cand)
@@ -2573,7 +2628,7 @@ efficient_estimator_dml2 <- function(dat,
     }
   }
 
-  # Precompute l for full sample for score/jacobian (fast path; output-identical)
+  # Precompute l for full sample for score/jacobian
   X_cf <- df_get_X(dat_cf)
   y_cf <- as.numeric(dat_cf$y)
   l_cf <- df_make_l_matrix(X_cf, y_cf)
@@ -2629,7 +2684,7 @@ efficient_estimator_dml2 <- function(dat,
     theta_var_method <- "contrib_sandwich_fallback"
   }
 
-  # Apply population scaling for theta when x_info=FALSE and N is available (or full frame was provided)
+  # Apply population scaling for theta when x_info=FALSE and N is available
   theta_hat <- theta_hat_n * theta_scale
   th_var    <- th_var_n * (theta_scale^2)
   th_se     <- th_se_n * theta_scale
@@ -2664,7 +2719,7 @@ efficient_estimator_dml2 <- function(dat,
 }
 
 ############################################################
-## 9. Efficient estimator Eff (DML1) with safe fallback
+## 9. Efficient estimator Eff (DML1)
 ############################################################
 
 efficient_estimator_dml1 <- function(dat,
@@ -2791,9 +2846,7 @@ efficient_estimator_dml1 <- function(dat,
       colMeans(df_score_phi_contrib_fast(l_test, d_p_test, d_np_test, pi_p_test, phi, eta4_k), na.rm = TRUE)
     }
 
-    # --- phi estimation (optim only) ---
-    # We solve for phi on this fold by minimizing || mean(score_phi) ||^2.
-    # This avoids nleqslv (which can be slow/unstable in small samples).
+    # Solve for phi by minimizing || mean(score_phi) ||^2.
     obj_k <- function(phi) {
       eq <- ee_fun_k(phi)
       if (any(!is.finite(eq))) return(big_penalty)
@@ -2808,14 +2861,11 @@ efficient_estimator_dml1 <- function(dat,
     maxit_phi <- as.integer(maxit_phi)[1]
     if (!is.finite(maxit_phi) || maxit_phi < 1L) maxit_phi <- 500L
 
-    tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-8)
-    tol_obj <- as.numeric(tol_obj)[1]
-    if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
-
     control_phi <- getOption("dfSEDI.phi_optim_control", list(maxit = maxit_phi))
     if (!is.list(control_phi)) control_phi <- list(maxit = maxit_phi)
     if (is.null(control_phi$maxit)) control_phi$maxit <- maxit_phi
-    # --- Multi-start phi estimation (100 candidates -> try up to 10) ---
+
+    # Multi-start per fold
     n_cand <- 100L
     cand_mat <- matrix(rep(phi_start, each = n_cand), nrow = n_cand) +
       matrix(stats::runif(n_cand * p_phi, -0.5, 0.5), nrow = n_cand)
@@ -2855,7 +2905,6 @@ efficient_estimator_dml1 <- function(dat,
       }
       next
     }
-
 
     if (!is.finite(best$value) || best$value >= 0.99 * big_penalty) {
       if (progress) {
@@ -3027,7 +3076,7 @@ efficient_estimator_dml1 <- function(dat,
 }
 
 ############################################################
-## 10. Sub-efficient estimator Eff_S (now supports binary via kernel logistic)
+## 10. Sub-efficient estimator Eff_S
 ############################################################
 
 subefficient_contrib <- function(dat, mu_hat) {
@@ -3120,7 +3169,7 @@ subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, progress = FAL
 }
 
 ############################################################
-## 11. Parametric efficient estimator Eff_P (now supports binary via logistic glm)
+## 11. Parametric efficient estimator Eff_P
 ############################################################
 
 efficient_parametric_estimator <- function(dat,
