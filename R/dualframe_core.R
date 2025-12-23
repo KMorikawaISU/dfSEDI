@@ -119,6 +119,9 @@ df_multistart_optim <- function(obj_fun,
                                 method = "Nelder-Mead",
                                 control = NULL) {
   center <- as.numeric(center)
+  tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-4)
+  if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-4
+
   if (!all(is.finite(center))) stop("df_multistart_optim(): 'center' must be finite.")
 
   p <- length(center)
@@ -157,9 +160,9 @@ df_multistart_optim <- function(obj_fun,
     )
     if (!is.null(res) &&
         is.list(res) &&
-        isTRUE(res$convergence == 0) &&
         is.finite(res$value) &&
-        all(is.finite(res$par))) {
+        all(is.finite(res$par)) &&
+        (isTRUE(res$convergence == 0) || res$value <= tol_obj)) {
       return(list(ok = TRUE, res = res, start = start, start_rank = j, init_vals = vals, init_order = ord))
     }
   }
@@ -191,6 +194,90 @@ df_prepare_pi_p <- function(pi_p, d_p, d_np, context = "dfSEDI") {
 
   pi_p[!union & !is.finite(pi_p)] <- fill_val
   df_clip_prob(pi_p)
+}
+
+
+# Parametric (linear) imputation of pi_p for NP-only union units (d_np==1, d_p==0).
+# We mirror the *target* of the nonparametric imputer used in Eff:
+#   regress 1/pi_p on L = (X, y) using P-sample units (d_p==1), then predict for missing.
+# Cross-fitting is intentionally NOT used here (parametric model).
+df_impute_pi_p_lm <- function(dat,
+                              context = "dfSEDI",
+                              min_train = 5L) {
+  if (!is.data.frame(dat)) return(dat)
+  if (!("pi_p" %in% names(dat))) return(dat)
+  if (!("d_p" %in% names(dat))) return(dat)
+  if (!("d_np" %in% names(dat))) return(dat)
+
+  d_p  <- as.numeric(dat$d_p)
+  d_np <- as.numeric(dat$d_np)
+  pi_p <- as.numeric(dat$pi_p)
+
+  # Only need pi_p for union-sample units; in typical "pi_p observed only when d_p==1"
+  # setups, the missing cases are (d_np, d_p) = (1, 0).
+  idx_mis <- which(d_p == 0 & d_np == 1 & !is.finite(pi_p))
+  if (length(idx_mis) == 0L) return(dat)
+
+  idx_tr <- which(d_p == 1 & is.finite(pi_p))
+  if (length(idx_tr) < min_train) {
+    # Fallback: mean-impute (best-effort).
+    fill <- mean(pi_p[idx_tr], na.rm = TRUE)
+    if (!is.finite(fill)) fill <- 0.5
+    pi_p[idx_mis] <- fill
+    dat$pi_p <- pi_p
+    return(dat)
+  }
+
+  # Design matrix for regression inputs
+  X <- df_get_X(dat)
+  if (!("y" %in% names(dat))) {
+    y <- rep(0, nrow(X))
+  } else {
+    y <- as.numeric(dat$y)
+  }
+
+  # L = (X, y)
+  L <- cbind(X, y)
+
+  # Train: 1/pi_p ~ L  (linear model)
+  train_df <- as.data.frame(L[idx_tr, , drop = FALSE])
+  colnames(train_df) <- c(paste0("x", seq_len(ncol(X))), "y")
+  train_df$resp <- 1 / df_clip_prob(pi_p[idx_tr])
+
+  fit <- tryCatch(
+    stats::lm(resp ~ ., data = train_df),
+    error = function(e) NULL
+  )
+
+  if (is.null(fit)) {
+    fill <- mean(pi_p[idx_tr], na.rm = TRUE)
+    if (!is.finite(fill)) fill <- 0.5
+    pi_p[idx_mis] <- fill
+    dat$pi_p <- pi_p
+    return(dat)
+  }
+
+  new_df <- as.data.frame(L[idx_mis, , drop = FALSE])
+  colnames(new_df) <- c(paste0("x", seq_len(ncol(X))), "y")
+
+  pred_resp <- tryCatch(
+    stats::predict(fit, newdata = new_df),
+    error = function(e) rep(NA_real_, nrow(new_df))
+  )
+  pred_resp <- as.numeric(pred_resp)
+
+  # Guard: predicted 1/pi_p must be positive & finite
+  resp_bar <- mean(train_df$resp, na.rm = TRUE)
+  if (!is.finite(resp_bar) || resp_bar <= 0) resp_bar <- 1 / df_clip_prob(mean(pi_p[idx_tr], na.rm = TRUE))
+
+  pred_resp[!is.finite(pred_resp) | pred_resp <= 0] <- resp_bar
+
+  pi_hat <- 1 / pred_resp
+  pi_hat <- df_clip_prob(pi_hat)
+
+  pi_p[idx_mis] <- pi_hat
+  dat$pi_p <- pi_p
+  dat
 }
 
 # Apply x_info setting:
@@ -2004,7 +2091,7 @@ df_estimate_NP <- function(dat,
   expected_k <- ncol(X) + 2L
 
   # Evaluate base_fun once (also validates dimensions)
-  b_mat <- df_eval_base_fun(base_fun, X, caller = "df_estimate_NP")
+  b_mat <- df_eval_base_fun(base_fun, X, context = "df_estimate_NP")
   if (ncol(b_mat) != expected_k) {
     stop(sprintf("df_estimate_NP(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
                  expected_k, ncol(b_mat)))
@@ -2013,6 +2100,7 @@ df_estimate_NP <- function(dat,
 
   d_np <- as.numeric(dat$d_np)
   y <- as.numeric(dat$y)
+  l_mat <- df_make_l_matrix(X, y)
 
   # Center for initial values
   if (is.null(phi_start)) {
@@ -2026,7 +2114,7 @@ df_estimate_NP <- function(dat,
 
   # Estimating equation (p.use = FALSE)
   ee_phi <- function(phi) {
-    eta <- as.numeric(b_mat %*% phi)
+    eta <- as.numeric(l_mat %*% phi)
     pi_np <- df_clip_prob(stats::plogis(eta))
     d_set4 <- 1 - d_np / pi_np
     as.numeric(crossprod(b_mat, d_set4))
@@ -2063,7 +2151,7 @@ df_estimate_NP <- function(dat,
   phi_hat <- ms$res$par
 
   # Compute pi_np under phi_hat
-  eta <- as.numeric(b_mat %*% phi_hat)
+  eta <- as.numeric(l_mat %*% phi_hat)
   pi_np <- df_clip_prob(stats::plogis(eta))
 
   # Theta
@@ -2111,7 +2199,7 @@ df_estimate_NP_P <- function(dat,
   expected_k <- ncol(X) + 2L
 
   # Evaluate base_fun once (also validates dimensions)
-  b_mat <- df_eval_base_fun(base_fun, X, caller = "df_estimate_NP_P")
+  b_mat <- df_eval_base_fun(base_fun, X, context = "df_estimate_NP_P")
   if (ncol(b_mat) != expected_k) {
     stop(sprintf("df_estimate_NP_P(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
                  expected_k, ncol(b_mat)))
@@ -2121,6 +2209,10 @@ df_estimate_NP_P <- function(dat,
   d_np <- as.numeric(dat$d_np)
   d_p <- as.numeric(dat$d_p)
   y <- as.numeric(dat$y)
+  l_mat <- df_make_l_matrix(X, y)
+  # If pi_p is missing for (d_np, d_p) = (1, 0), impute it via a parametric lm on 1/pi_p.
+  dat <- df_impute_pi_p_lm(dat, context = "df_estimate_NP_P()")
+
 
   # pi_p can be missing for d_p == 0. We only require it for union-sample units.
   pi_p <- df_prepare_pi_p(dat)
@@ -2137,7 +2229,7 @@ df_estimate_NP_P <- function(dat,
 
   # Estimating equation (p.use = TRUE)
   ee_phi <- function(phi) {
-    eta <- as.numeric(b_mat %*% phi)
+    eta <- as.numeric(l_mat %*% phi)
     pi_np <- df_clip_prob(stats::plogis(eta))
 
     denom <- df_clip_prob(pi_p + pi_np - pi_p * pi_np)
@@ -2178,7 +2270,7 @@ df_estimate_NP_P <- function(dat,
   phi_hat <- ms$res$par
 
   # Compute pi_np under phi_hat
-  eta <- as.numeric(b_mat %*% phi_hat)
+  eta <- as.numeric(l_mat %*% phi_hat)
   pi_np <- df_clip_prob(stats::plogis(eta))
 
   # Union denominator and indicator
@@ -2385,6 +2477,11 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   # --- Multi-start phi estimation (100 candidates -> try up to 10) ---
+  tol_obj   <- getOption("dfSEDI.phi_obj_tol", 1e-4)
+  maxit_phi <- as.integer(getOption("dfSEDI.phi_maxit", 2000L))
+  if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-4
+  if (!is.finite(maxit_phi) || maxit_phi < 200L) maxit_phi <- 2000L
+
   n_cand <- 100L
   cand_mat <- matrix(rep(phi_start, each = n_cand), nrow = n_cand) +
     matrix(stats::runif(n_cand * p_phi, -0.5, 0.5), nrow = n_cand)
@@ -2397,39 +2494,86 @@ efficient_estimator_dml2 <- function(dat,
 
   res <- NULL
   success <- FALSE
+  best <- NULL
+  res  <- NULL
   for (attempt in seq_len(max_try)) {
-    init <- cand_mat[ord[attempt], ]
-    res_try <- try(stats::optim(par = init, fn = obj_phi, method = "Nelder-Mead"),
-                   silent = TRUE)
-    if (inherits(res_try, "try-error") || !is.finite(res_try$value)) {
+    init <- as.numeric(cand_mat[ord[attempt], ])
+    res_try <- tryCatch(
+      stats::optim(
+        par     = init,
+        fn      = obj_phi,
+        method  = "Nelder-Mead",
+        control = list(maxit = maxit_phi)
+      ),
+      error = function(e) NULL
+    )
+
+    if (is.null(res_try) || !is.finite(res_try$value)) {
       if (progress) {
         cat(sprintf("  attempt %d/%d: failed (error/non-finite)\n", attempt, max_try))
-        flush.console()
       }
       next
     }
-    if (is.null(res) || res_try$value < res$value) res <- res_try
+
     if (progress) {
-      cat(sprintf("  attempt %d/%d: done (convergence=%d, obj=%.3g)\n",
+      cat(sprintf("  attempt %d/%d: convergence=%d, obj=%.6g\n",
                   attempt, max_try, res_try$convergence, res_try$value))
-      flush.console()
     }
-    if (res_try$convergence == 0) {
-      success <- TRUE
+
+    if (is.null(best) || res_try$value < best$value) {
+      best <- res_try
+    }
+
+    if (isTRUE(res_try$convergence == 0) || res_try$value <= tol_obj) {
       res <- res_try
+      success <- TRUE
       break
     }
   }
 
-  if (!isTRUE(success)) {
-    warning("dfSEDI: phi optimization failed after multiple starts; returning NA.", call. = FALSE)
+  if (!isTRUE(success) && !is.null(best) && is.finite(best$value) && best$value <= tol_obj) {
+    res <- best
+    success <- TRUE
+  }
+
+  if (!isTRUE(success) || is.null(res) || !is.finite(res$value) || res$value >= 0.99 * big_penalty) {
+    if (progress) {
+      cat("  phi optimization did not reach the tolerance; returning NA.\n")
+    } else {
+      warning("Eff(): phi optimization did not reach the tolerance; returning NA.")
+    }
+
     return(list(
-      theta_hat = NA_real_,
-      se_hat    = NA_real_,
-      ci_hat    = matrix(NA_real_, 1L, 2L),
-      phi_hat   = rep(NA_real_, p_phi),
-      phi_se    = rep(NA_real_, p_phi),
-      phi_ci    = matrix(NA_real_, p_phi, 2L)
+      phi      = rep(NA_real_, p_phi),
+      phi_var  = matrix(NA_real_, nrow = p_phi, ncol = p_phi),
+      phi_se   = rep(NA_real_, p_phi),
+      phi_ci   = matrix(
+        NA_real_,
+        nrow = 2L,
+        ncol = p_phi,
+        dimnames = list(c("l", "u"), paste0("phi_", seq_len(p_phi)))
+      ),
+      theta    = NA_real_,
+      var      = NA_real_,
+      se       = NA_real_,
+      ci       = c(NA_real_, NA_real_),
+      info     = list(
+        type            = "Eff",
+        dml_type         = "DML2",
+        K                = K,
+        phi_start        = phi_start,
+        max_restart      = max_restart,
+        progress         = progress,
+        x_info           = isTRUE(x_info),
+        aug_terms        = if (isTRUE(x_info)) "estimated" else "fixed_zero",
+        convergence      = if (!is.null(best)) best$convergence else NA_integer_,
+        phi_obj          = if (!is.null(best)) best$value else NA_real_,
+        theta_var_method = theta_var_method,
+        sandwich_n_eff   = n,
+        population_N     = N_total,
+        n_obs            = n,
+        theta_scale      = theta_scale
+      )
     ))
   }
 
@@ -2721,9 +2865,9 @@ efficient_estimator_dml1 <- function(dat,
     maxit_phi <- as.integer(maxit_phi)[1]
     if (!is.finite(maxit_phi) || maxit_phi < 1L) maxit_phi <- 500L
 
-    tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-8)
+    tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-4)
     tol_obj <- as.numeric(tol_obj)[1]
-    if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
+    if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-4
 
     control_phi <- getOption("dfSEDI.phi_optim_control", list(maxit = maxit_phi))
     if (!is.list(control_phi)) control_phi <- list(maxit = maxit_phi)
@@ -2754,7 +2898,7 @@ efficient_estimator_dml1 <- function(dat,
                     k, K, a, max_try, res_try$convergence, res_try$value))
         flush.console()
       }
-      if (res_try$convergence == 0) {
+      if (isTRUE(res_try$convergence == 0) || (is.finite(res_try$value) && res_try$value <= tol_obj)) {
         success <- TRUE
         best <- res_try
         break
