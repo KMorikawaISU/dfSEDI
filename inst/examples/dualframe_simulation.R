@@ -262,22 +262,65 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
 ## 4) One MC replication -> long-format rows
 ############################################################
 
-mc_one_rep_long <- function(rep_id, N, Scenario, K = 2, progress_each = FALSE) {
-  dat <- generate_dualframe_population(N = N, Scenario = Scenario)
-  fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress_each)
+mc_one_rep_long <- function(seed,
+                            rep_id,
+                            N,
+                            Scenario,
+                            K = 2,
+                            Eff_type = c("DML1", "DML2"),
+                            x_info = TRUE,
+                            pi_p_offset = 0,
+                            progress_each_fit = FALSE) {
 
-  rbind(
-    extract_row(fits$P,          "P",          rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP,         "NP",         rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P,       "NP_P",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S,      "Eff_S",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P,      "Eff_P",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff1_union, "Eff1_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff2_union, "Eff2_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff1,       "Eff1",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff2,       "Eff2",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union)
-  )
+  Eff_type <- match.arg(Eff_type)
+
+  tryCatch({
+    set.seed(seed)
+    dat <- generate_dualframe_population(N = N, Scenario = Scenario, pi_p_offset = pi_p_offset)
+
+    fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress_each_fit)
+
+    rbind(
+      extract_row(fits$P,          "P",          rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$NP,         "NP",         rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$NP_P,       "NP_P",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$Eff_S,      "Eff_S",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$Eff_P,      "Eff_P",      rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$Eff1_union, "Eff1_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$Eff2_union, "Eff2_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$Eff1,       "Eff1",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$Eff2,       "Eff2",       rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    )
+  }, error = function(e) {
+    # Return a consistent 9-row result (one row per estimator) with NA values.
+    blank <- list(
+      theta = NA_real_,
+      se = NA_real_,
+      ci = c(NA_real_, NA_real_),
+      phi = NA_real_,
+      phi_se = NA_real_,
+      phi_ci = matrix(NA_real_, nrow = 2, ncol = 1),
+      error = paste0("mc_one_rep_long error: ", conditionMessage(e))
+    )
+
+    n_np <- NA_integer_
+    n_p <- NA_integer_
+    n_union <- NA_integer_
+
+    rbind(
+      extract_row(blank, "P",          rep_id, Scenario, n_np, n_p, n_union),
+      extract_row(blank, "NP",         rep_id, Scenario, n_np, n_p, n_union),
+      extract_row(blank, "NP_P",       rep_id, Scenario, n_np, n_p, n_union),
+      extract_row(blank, "Eff_S",      rep_id, Scenario, n_np, n_p, n_union),
+      extract_row(blank, "Eff_P",      rep_id, Scenario, n_np, n_p, n_union),
+      extract_row(blank, "Eff1_union", rep_id, Scenario, n_np, n_p, n_union),
+      extract_row(blank, "Eff2_union", rep_id, Scenario, n_np, n_p, n_union),
+      extract_row(blank, "Eff1",       rep_id, Scenario, n_np, n_p, n_union),
+      extract_row(blank, "Eff2",       rep_id, Scenario, n_np, n_p, n_union)
+    )
+  })
 }
+
 
 
 ############################################################
@@ -434,7 +477,7 @@ run_mc <- function(B,
       "pi_p_offset",
       "progress_each_fit"
     ),
-    envir = environment(run_mc)
+    envir = environment()
   )
 
   idxs <- seq_len(B)
