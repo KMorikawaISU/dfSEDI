@@ -1,17 +1,34 @@
-devtools::install_github("KMorikawaISU/dfSEDI",force=TRUE)
+
+# mc_run.R
+#
+# Monte Carlo run (PSOCK + pbapply) and boxplots for theta and phi.
+# This script assumes dfSEDI is installed and that the bundled example script
+# 'inst/examples/dualframe_simulation.R' is available in the package.
+
 # install.packages("devtools")
-library(dplyr)
-library(ggplot2)
-
-#install.packages(c("ggplot2", "dplyr"))
-#install.packages(c("ggthemes", "viridis"))
-
-base_fun <- function(X) {
-  cbind(1, X, X[, 1]^2)
-}
-
+# devtools::install_github("KMorikawaISU/dfSEDI")
 
 # install.packages("pbapply")  # if needed
+
+# mc_run.R
+#
+# Monte Carlo run (PSOCK + pbapply) and boxplots for theta and phi.
+# This script assumes dfSEDI is installed and that the bundled example script
+# 'inst/examples/dualframe_simulation.R' is available in the package.
+
+# install.packages("devtools")
+# devtools::install_github("KMorikawaISU/dfSEDI")
+
+# install.packages("pbapply")  # if needed
+
+# mc_run.R
+#
+# Monte Carlo run (PSOCK + pbapply), save results, then load and plot.
+# This script assumes dfSEDI is installed and that the bundled example script
+# 'inst/examples/dualframe_simulation.R' is available in the package.
+devtools::install_github("KMorikawaISU/dfSEDI")
+
+
 
 library(dfSEDI)
 library(parallel)
@@ -20,12 +37,20 @@ library(pbapply)
 example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
 source(example_file)
 
-B <- 30
+B <- 3
 N <- 10000
 Scenario <- 1
 K <- 2
 
-seeds <- 1 + seq_len(B) - 1
+set.seed(18)
+N <- 10000
+dat <- generate_dualframe_population(N = N)
+
+base_fun <- function(X) {
+  cbind(1, X, X[, 1]^2)
+}
+
+seeds <- seed_start <- 1 + seq_len(B) - 1
 
 n_workers <- max(1L, parallel::detectCores() - 1L)
 cl <- parallel::makeCluster(n_workers)
@@ -35,6 +60,7 @@ pbapply::pboptions(type = "txt")
 
 parallel::clusterEvalQ(cl, library(dfSEDI))
 
+# Export the functions defined by the example script
 parallel::clusterExport(
   cl,
   varlist = c(
@@ -57,61 +83,76 @@ one_rep <- function(seed) {
   fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = FALSE)
 
   rbind(
-    extract_row(fits$P,         "P",             seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP,        "NP",            seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$NP_P,      "NP_P",          seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff,       "Eff",           seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_union, "Eff_union_dat", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_S,     "Eff_S",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
-    extract_row(fits$Eff_P,     "Eff_P",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    extract_row(fits$P,          "P",          seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP,         "NP",         seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$NP_P,       "NP_P",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_S,      "Eff_S",      seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff_P,      "Eff_P",      seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1_union, "Eff1_union", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2_union, "Eff2_union", seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff1,       "Eff1",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union),
+    extract_row(fits$Eff2,       "Eff2",       seed, Scenario, fits$n_np, fits$n_p, fits$n_union)
   )
 }
 
-systime <- system.time(
-  out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
-)
+out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
 res_par <- do.call(rbind, out_list)
 
 summarize_mc(res_par, theta_true = 0)
 
 
+# ------------------------
+# Boxplots (theta, phi)
+# ------------------------
 
+library(dplyr)
+library(ggplot2)
 
+est_order <- c(
+  "P", "NP", "NP_P",
+  "Eff_S", "Eff_P",
+  "Eff1_union", "Eff2_union",
+  "Eff1", "Eff2"
+)
 
-
-
-#====theta plot====#
-
-
-have_ggthemes <- requireNamespace("ggthemes", quietly = TRUE)
-have_viridis  <- requireNamespace("viridis", quietly = TRUE)
-
-df_theta <- res_par %>%
-  filter(is.finite(theta)) %>%
-  mutate(estimator = factor(estimator))
-
-p_theta_jitter <- ggplot(df_theta, aes(x = estimator, y = theta, fill = estimator)) +
-  geom_boxplot(outlier.shape = NA, width = 0.65, alpha = 0.85) +
-  geom_jitter(aes(color = estimator), width = 0.15, alpha = 0.25, size = 1.2) +
-  geom_hline(yintercept = 0, linetype = "dashed") +
-  labs(x = NULL, y = "theta") +
-  theme_minimal(base_size = 13) +
-  theme(
-    legend.position = "none",
-    axis.text.x = element_text(angle = 30, hjust = 1)
+res_plot <- res_par %>%
+  mutate(
+    Scenario = toupper(as.character(Scenario)),
+    Scenario = ifelse(grepl("^S", Scenario), Scenario, paste0("S", Scenario)),
+    estimator = factor(as.character(estimator), levels = est_order),
+    Scenario  = factor(Scenario)
   )
 
-if (have_ggthemes) p_theta_jitter <- p_theta_jitter + ggthemes::theme_few()
-if (have_viridis) {
-  p_theta_jitter <- p_theta_jitter +
-    scale_fill_viridis_d(option = "C") +
-    scale_color_viridis_d(option = "C")
-}
-
-p_theta_jitter
-
-
+# Theta boxplot
+ggplot(res_plot, aes(x = estimator, y = theta)) +
+  geom_boxplot(na.rm = TRUE, outlier.alpha = 0.4) +
+  geom_jitter(width = 0.15, alpha = 0.25, na.rm = TRUE) +
+  facet_wrap(~ Scenario, ncol = 1) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = expression(hat(theta)))
 
 
+# Phi (y-coefficient): S1/S2 -> phi_3, S3 -> phi_4
+res_phi <- res_plot %>%
+  mutate(
+    phi_target = case_when(
+      Scenario %in% c("S1", "S2") ~ phi_3,
+      Scenario %in% c("S3")       ~ phi_4,
+      TRUE                        ~ NA_real_
+    ),
+    phi_target_name = case_when(
+      Scenario %in% c("S1", "S2") ~ "phi_3",
+      Scenario %in% c("S3")       ~ "phi_4",
+      TRUE                        ~ NA_character_
+    )
+  ) %>%
+  filter(estimator %in% c("NP", "NP_P", "Eff1_union", "Eff2_union", "Eff1", "Eff2"))
 
-
+ggplot(res_phi, aes(x = estimator, y = phi_target)) +
+  geom_boxplot(na.rm = TRUE, outlier.alpha = 0.4) +
+  geom_jitter(width = 0.15, alpha = 0.25, na.rm = TRUE) +
+  facet_wrap(~ Scenario, ncol = 1) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "phi (S1–S2: phi_3, S3: phi_4)")
