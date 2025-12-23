@@ -2203,6 +2203,7 @@ df_estimate_NP <- function(dat,
        ci = theta_res$ci)
 }
 
+
 df_estimate_NP_P <- function(dat,
                              base_fun,
                              phi_start = NULL,
