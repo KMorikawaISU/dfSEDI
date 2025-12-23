@@ -1327,7 +1327,7 @@ pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
   }
 
   # Required columns in dat
-  need <- c("d_np")
+  need <- c("d_np", "y")
   if (isTRUE(p.use)) need <- c(need, "d_p", "pi_p")
   if (!all(need %in% names(dat))) {
     miss <- setdiff(need, names(dat))
@@ -1361,6 +1361,24 @@ pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
     stop("pi_np.est_simple(): `d_np` must be coded as 0/1 (or logical).", call. = FALSE)
   }
 
+
+  y <- as.numeric(dat$y)
+  if (length(y) != nrow(b_mat)) {
+    stop("y length mismatch with X/base_fun.")
+  }
+  # For (d_np,d_p)=(0,0) rows, y is irrelevant for this estimating equation;
+  # replace non-finite y by 0 to keep pi_np finite.
+  if ("d_p" %in% names(dat)) {
+    d_p_tmp <- as.numeric(dat$d_p)
+    idx_00 <- (d_np == 0) & (d_p_tmp == 0)
+    if (any(idx_00 & !is.finite(y))) y[idx_00 & !is.finite(y)] <- 0
+    if (any(!idx_00 & !is.finite(y))) {
+      stop("y contains NA/Inf outside (d_np,d_p)=(0,0) rows.")
+    }
+  } else {
+    if (any(!is.finite(y))) stop("y contains NA/Inf.")
+  }
+  l_mat <- cbind(1, X, y)
   d_p <- NULL
   pi_p <- NULL
   if (isTRUE(p.use)) {
@@ -1397,7 +1415,7 @@ pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
       stop("pi_np.est_simple(): `phi` contains NA/Inf.", call. = FALSE)
     }
 
-    eta   <- as.numeric(b_mat %*% phi)
+    eta <- as.numeric(l_mat %*% phi)
     pi_np <- df_clip_prob(plogis(eta))
 
     if (isTRUE(p.use)) {
