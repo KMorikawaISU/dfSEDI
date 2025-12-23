@@ -177,113 +177,20 @@ df_prepare_pi_p <- function(pi_p, d_p, d_np, context = "dfSEDI") {
   d_np <- as.numeric(d_np)
 
   union <- (d_p == 1 | d_np == 1)
-  union[is.na(union)] <- FALSE
 
-  mis <- !is.finite(pi_p)
-  if (!any(mis)) {
-    return(df_clip_prob(pi_p))
+  if (any(union & !is.finite(pi_p))) {
+    stop(
+      context, ": `pi_p` is missing (NA/Inf) for some union-sample units (d_p==1 or d_np==1).\n",
+      "Impute pi_p for non-P units in the union sample first (e.g., impute_pi_p_crossfit() or a model-based imputation).",
+      call. = FALSE
+    )
   }
 
-  # Fill missing pi_p with a sensible finite value to avoid NA propagation.
-  # Primary choice: mean among observed P-sample units (d_p==1).
-  obs_p <- which(d_p == 1 & is.finite(pi_p))
-  if (length(obs_p) >= 1L) {
-    fill <- mean(pi_p[obs_p], na.rm = TRUE)
-  } else if (any(is.finite(pi_p))) {
-    fill <- mean(pi_p[is.finite(pi_p)], na.rm = TRUE)
-  } else {
-    fill <- 0.5
-  }
-  if (!is.finite(fill)) fill <- 0.5
+  fill_val <- mean(pi_p[is.finite(pi_p)], na.rm = TRUE)
+  if (!is.finite(fill_val)) fill_val <- 0.5
 
-  pi_p_filled <- pi_p
-  pi_p_filled[mis] <- fill
-
-  df_clip_prob(pi_p_filled)
-}
-
-
-# Parametric (linear) imputation of pi_p for NP-only union units (d_np==1, d_p==0).
-# We mirror the *target* of the nonparametric imputer used in Eff:
-#   regress 1/pi_p on L = (X, y) using P-sample units (d_p==1), then predict for missing.
-# Cross-fitting is intentionally NOT used here (parametric model).
-df_impute_pi_p_lm <- function(dat,
-                              context = "dfSEDI",
-                              min_train = 5L) {
-  if (!is.data.frame(dat)) return(dat)
-  if (!("pi_p" %in% names(dat))) return(dat)
-  if (!("d_p" %in% names(dat))) return(dat)
-  if (!("d_np" %in% names(dat))) return(dat)
-
-  d_p  <- as.numeric(dat$d_p)
-  d_np <- as.numeric(dat$d_np)
-  pi_p <- as.numeric(dat$pi_p)
-
-  # Only need pi_p for union-sample units; in typical "pi_p observed only when d_p==1"
-  # setups, the missing cases are (d_np, d_p) = (1, 0).
-  idx_mis <- which(d_p == 0 & d_np == 1 & !is.finite(pi_p))
-  if (length(idx_mis) == 0L) return(dat)
-
-  idx_tr <- which(d_p == 1 & is.finite(pi_p))
-  if (length(idx_tr) < min_train) {
-    # Fallback: mean-impute (best-effort).
-    fill <- mean(pi_p[idx_tr], na.rm = TRUE)
-    if (!is.finite(fill)) fill <- 0.5
-    pi_p[idx_mis] <- fill
-    dat$pi_p <- pi_p
-    return(dat)
-  }
-
-  # Design matrix for regression inputs
-  X <- df_get_X(dat)
-  if (!("y" %in% names(dat))) {
-    y <- rep(0, nrow(X))
-  } else {
-    y <- as.numeric(dat$y)
-  }
-
-  # L = (X, y)
-  L <- cbind(X, y)
-
-  # Train: 1/pi_p ~ L  (linear model)
-  train_df <- as.data.frame(L[idx_tr, , drop = FALSE])
-  colnames(train_df) <- c(paste0("x", seq_len(ncol(X))), "y")
-  train_df$resp <- 1 / df_clip_prob(pi_p[idx_tr])
-
-  fit <- tryCatch(
-    stats::lm(resp ~ ., data = train_df),
-    error = function(e) NULL
-  )
-
-  if (is.null(fit)) {
-    fill <- mean(pi_p[idx_tr], na.rm = TRUE)
-    if (!is.finite(fill)) fill <- 0.5
-    pi_p[idx_mis] <- fill
-    dat$pi_p <- pi_p
-    return(dat)
-  }
-
-  new_df <- as.data.frame(L[idx_mis, , drop = FALSE])
-  colnames(new_df) <- c(paste0("x", seq_len(ncol(X))), "y")
-
-  pred_resp <- tryCatch(
-    stats::predict(fit, newdata = new_df),
-    error = function(e) rep(NA_real_, nrow(new_df))
-  )
-  pred_resp <- as.numeric(pred_resp)
-
-  # Guard: predicted 1/pi_p must be positive & finite
-  resp_bar <- mean(train_df$resp, na.rm = TRUE)
-  if (!is.finite(resp_bar) || resp_bar <= 0) resp_bar <- 1 / df_clip_prob(mean(pi_p[idx_tr], na.rm = TRUE))
-
-  pred_resp[!is.finite(pred_resp) | pred_resp <= 0] <- resp_bar
-
-  pi_hat <- 1 / pred_resp
-  pi_hat <- df_clip_prob(pi_hat)
-
-  pi_p[idx_mis] <- pi_hat
-  dat$pi_p <- pi_p
-  dat
+  pi_p[!union & !is.finite(pi_p)] <- fill_val
+  df_clip_prob(pi_p)
 }
 
 # Apply x_info setting:
@@ -300,20 +207,7 @@ df_apply_x_info <- function(dat, x_info = TRUE) {
     dat$X <- x0
   }
 
-  if (isTRUE(x_info)) {
-    # If Y is unavailable for (d_np, d_p) = (0, 0) units (common in practice),
-    # replace missing Y by a finite dummy value to avoid NA propagation.
-    if (all(c("d_p", "d_np", "y") %in% names(dat))) {
-      d_p0  <- as.numeric(dat$d_p)
-      d_np0 <- as.numeric(dat$d_np)
-      y0    <- suppressWarnings(as.numeric(dat$y))
-      idx00 <- which(d_p0 == 0 & d_np0 == 0 & !is.finite(y0))
-      if (length(idx00) > 0L) {
-        dat$y[idx00] <- 0
-      }
-    }
-    return(dat)
-  }
+  if (isTRUE(x_info)) return(dat)
   if (!all(c("d_p", "d_np") %in% names(dat))) return(dat)
 
   d_p  <- as.numeric(dat$d_p)
@@ -2110,7 +2004,7 @@ df_estimate_NP <- function(dat,
   expected_k <- ncol(X) + 2L
 
   # Evaluate base_fun once (also validates dimensions)
-  b_mat <- df_eval_base_fun(base_fun, X, context = "df_estimate_NP")
+  b_mat <- df_eval_base_fun(base_fun, X, caller = "df_estimate_NP")
   if (ncol(b_mat) != expected_k) {
     stop(sprintf("df_estimate_NP(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
                  expected_k, ncol(b_mat)))
@@ -2119,7 +2013,6 @@ df_estimate_NP <- function(dat,
 
   d_np <- as.numeric(dat$d_np)
   y <- as.numeric(dat$y)
-  l_mat <- df_make_l_matrix(X, y)
 
   # Center for initial values
   if (is.null(phi_start)) {
@@ -2133,7 +2026,7 @@ df_estimate_NP <- function(dat,
 
   # Estimating equation (p.use = FALSE)
   ee_phi <- function(phi) {
-    eta <- as.numeric(l_mat %*% phi)
+    eta <- as.numeric(b_mat %*% phi)
     pi_np <- df_clip_prob(stats::plogis(eta))
     d_set4 <- 1 - d_np / pi_np
     as.numeric(crossprod(b_mat, d_set4))
@@ -2170,7 +2063,7 @@ df_estimate_NP <- function(dat,
   phi_hat <- ms$res$par
 
   # Compute pi_np under phi_hat
-  eta <- as.numeric(l_mat %*% phi_hat)
+  eta <- as.numeric(b_mat %*% phi_hat)
   pi_np <- df_clip_prob(stats::plogis(eta))
 
   # Theta
@@ -2218,7 +2111,7 @@ df_estimate_NP_P <- function(dat,
   expected_k <- ncol(X) + 2L
 
   # Evaluate base_fun once (also validates dimensions)
-  b_mat <- df_eval_base_fun(base_fun, X, context = "df_estimate_NP_P")
+  b_mat <- df_eval_base_fun(base_fun, X, caller = "df_estimate_NP_P")
   if (ncol(b_mat) != expected_k) {
     stop(sprintf("df_estimate_NP_P(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
                  expected_k, ncol(b_mat)))
@@ -2228,13 +2121,9 @@ df_estimate_NP_P <- function(dat,
   d_np <- as.numeric(dat$d_np)
   d_p <- as.numeric(dat$d_p)
   y <- as.numeric(dat$y)
-  l_mat <- df_make_l_matrix(X, y)
-  # If pi_p is missing for (d_np, d_p) = (1, 0), impute it via a parametric lm on 1/pi_p.
-  dat <- df_impute_pi_p_lm(dat, context = "df_estimate_NP_P()")
-
 
   # pi_p can be missing for d_p == 0. We only require it for union-sample units.
-  pi_p <- df_prepare_pi_p(as.numeric(dat$pi_p), d_p = d_p, d_np = d_np, context = "df_estimate_NP_P")
+  pi_p <- df_prepare_pi_p(dat)
 
   # Center for initial values
   if (is.null(phi_start)) {
@@ -2248,7 +2137,7 @@ df_estimate_NP_P <- function(dat,
 
   # Estimating equation (p.use = TRUE)
   ee_phi <- function(phi) {
-    eta <- as.numeric(l_mat %*% phi)
+    eta <- as.numeric(b_mat %*% phi)
     pi_np <- df_clip_prob(stats::plogis(eta))
 
     denom <- df_clip_prob(pi_p + pi_np - pi_p * pi_np)
@@ -2289,7 +2178,7 @@ df_estimate_NP_P <- function(dat,
   phi_hat <- ms$res$par
 
   # Compute pi_np under phi_hat
-  eta <- as.numeric(l_mat %*% phi_hat)
+  eta <- as.numeric(b_mat %*% phi_hat)
   pi_np <- df_clip_prob(stats::plogis(eta))
 
   # Union denominator and indicator
