@@ -3,7 +3,7 @@
 ##
 ## Dual-frame simulation + MC runner for dfSEDI
 ##
-## - Scenarios S1/S2/S3 (paper-style DGP)
+## - Scenarios S1/S2/S3/S4 (paper-style DGP)
 ## - Fit: P / NP / NP_P / Eff1 / Eff2 / Eff1_union / Eff2_union / Eff_S / Eff_P
 ## - MC: run_mc(B=..., ...) returns long-format results
 ## - Summary: summarize_mc(res, theta_true=...)
@@ -17,7 +17,16 @@
 ##   dynamic scheduling + a progress bar. This avoids the common "idle CPU" issue.
 ##
 ## NEW (this revision):
-## - MC output now also includes phi estimates and (when available) their SE/CI.
+## - Added Scenario 4:
+##     * DGP up to (d_np, d_p) is identical to Scenario 1.
+##     * Then, overlap units with (d_np, d_p) = (1, 1) are duplicated to remove overlap:
+##         - NP-only copy: (d_np, d_p) = (1, 0)
+##         - P-only  copy: (d_np, d_p) = (0, 1)
+##       As a result, if original counts are n_{11}, n_{10}, n_{01}, n_{00} (for
+##       (d_np,d_p) = (1,1), (1,0), (0,1), (0,0)), the Scenario 4 dataset size is
+##           n' = 2*n_{11} + n_{10} + n_{01} + n_{00} = n + n_{11}.
+##
+## - MC output includes phi estimates and (when available) their SE/CI.
 ##   Columns added (fixed width up to 4 coefficients):
 ##     phi_1..phi_4, phi_se_1..phi_se_4, phi_ci_l_1..phi_ci_l_4, phi_ci_u_1..phi_ci_u_4
 ##   Notes:
@@ -39,7 +48,7 @@ normalize_scenario <- function(Scenario) {
     Scenario <- suppressWarnings(as.integer(s))
   }
   Scenario <- as.integer(Scenario)
-  if (!(Scenario %in% 1:3)) stop("Scenario must be 1, 2, 3 or 'S1', 'S2', 'S3'.")
+  if (!(Scenario %in% 1:4)) stop("Scenario must be 1, 2, 3, 4 or 'S1', 'S2', 'S3', 'S4'.")
   Scenario
 }
 
@@ -121,20 +130,23 @@ extract_row <- function(fit, estimator, rep_id, Scenario, n_np, n_p, n_union) {
 generate_dualframe_population <- function(N, Scenario = 1, pi_p_offset = 0.005) {
   sc <- normalize_scenario(Scenario)
 
+  # Scenario 4 uses the Scenario 1 DGP up to (d_np, d_p), then removes overlap by duplication.
+  sc_dgp <- if (sc == 4L) 1L else sc
+
   x <- rnorm(N, 0, 1)
   z <- rbinom(N, 1, 0.5)
   eps <- rnorm(N, mean = 0, sd = 0.5)
 
-  if (sc == 1) {
+  if (sc_dgp == 1) {
     mu_y <- -exp(-2) + cos(2 * x) + 0.5 * x
-  } else if (sc == 2) {
+  } else if (sc_dgp == 2) {
     mu_y <- 0.8 * x
   } else {
     mu_y <- 0.2 + 0.8 * x - 0.4 * z
   }
   y <- mu_y + eps
 
-  if (sc %in% c(1, 2)) {
+  if (sc_dgp %in% c(1, 2)) {
     lin_np <- -2.15 - 0.5 * x - 0.75 * y
   } else {
     lin_np <- -1.5 - 0.3 * cos(2 * y) - 0.1 * (y - 1)^2
@@ -147,12 +159,43 @@ generate_dualframe_population <- function(N, Scenario = 1, pi_p_offset = 0.005) 
   pi_p  <- pmin(pmax(pi_p, 0), 1)
   d_p   <- rbinom(N, 1, pi_p)
 
-  # Requested: pi_p is observed only for d_p==1 units.
-  pi_p[d_p == 0] <- NA_real_
+  # ---- Scenario 4: split overlap (1,1) into two rows (1,0) and (0,1) ----
+  if (sc == 4L) {
+    overlap <- (d_np == 1L & d_p == 1L)
+    idx_ov  <- which(overlap)
+    if (length(idx_ov) > 0L) {
+      idx_no  <- which(!overlap)
+      idx_new <- c(idx_no, idx_ov, idx_ov)
 
-  X <- if (sc %in% c(1, 2)) {
+      # Duplicate covariates/outcomes/inclusion probs for overlap units
+      x     <- x[idx_new]
+      z     <- z[idx_new]
+      y     <- y[idx_new]
+      pi_np <- pi_np[idx_new]
+      pi_p  <- pi_p[idx_new]
+
+      # Keep non-overlap indicators, replace overlap with two copies:
+      d_np_no <- d_np[idx_no]
+      d_p_no  <- d_p[idx_no]
+
+      d_np <- c(d_np_no,
+                rep(1L, length(idx_ov)),  # NP-only copy
+                rep(0L, length(idx_ov)))  # P-only copy
+
+      d_p  <- c(d_p_no,
+                rep(0L, length(idx_ov)),  # NP-only copy
+                rep(1L, length(idx_ov)))  # P-only copy
+    }
+  }
+
+  # Requested: pi_p is observed only for d_p==1 units (apply AFTER Scenario 4 split).
+  pi_p[d_p == 0L] <- NA_real_
+
+  X <- if (sc_dgp %in% c(1, 2)) {
+    # Scenario 1/2/4: x only
     matrix(x, ncol = 1)
   } else {
+    # Scenario 3: (x, z)
     cbind(x, z)
   }
 
@@ -173,7 +216,8 @@ generate_dualframe_population <- function(N, Scenario = 1, pi_p_offset = 0.005) 
 make_base_fun <- function(Scenario) {
   sc <- normalize_scenario(Scenario)
 
-  if (sc %in% c(1, 2)) {
+  # Scenario 4 uses the Scenario 1 basis (x only).
+  if (sc %in% c(1, 2, 4)) {
     base_fun <- function(X) {
       X <- as.matrix(X)
       cbind(1, X[, 1], X[, 1]^2)
@@ -200,7 +244,8 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
   n_union <- sum(dat$d_np == 1 | dat$d_p == 1)
 
   # Initialization for pi_np = expit((1, X, y)' phi)
-  if (sc %in% c(1, 2)) {
+  # Scenario 4 uses Scenario 1 DGP for pi_np, so same start as S1.
+  if (sc %in% c(1, 2, 4)) {
     phi_start_true <- c(-2.15, -0.5, -0.75)
   } else {
     # Scenario 3 uses a nonlinear pi_np DGP; use a simple finite start.
@@ -267,12 +312,18 @@ mc_one_rep_long <- function(seed,
                             N,
                             Scenario,
                             K = 2,
-                            Eff_type = c("DML1", "DML2"),
+                            Eff_type = 2,  # kept for backward-compatibility; accepts 1/2 or "DML1"/"DML2"
                             x_info = TRUE,
                             pi_p_offset = 0,
                             progress_each_fit = FALSE) {
 
-  Eff_type <- match.arg(Eff_type)
+  # Accept both numeric (1/2) and character ("DML1"/"DML2") without error.
+  if (is.character(Eff_type)) {
+    Eff_type <- match.arg(Eff_type, choices = c("DML1", "DML2"))
+    Eff_type <- if (Eff_type == "DML1") 1L else 2L
+  }
+  Eff_type <- as.integer(Eff_type)
+  if (!(Eff_type %in% c(1L, 2L))) Eff_type <- 2L
 
   tryCatch({
     set.seed(seed)
@@ -384,7 +435,7 @@ run_mc <- function(B,
                    N = 10000,
                    Scenario = 1,
                    K = 2,
-                   Eff_type = 2,              # 2=DML2 (default), 1=DML1
+                   Eff_type = 2,              # 2=DML2 (default), 1=DML1 (kept for backward compatibility)
                    x_info = TRUE,
                    seed_start = 1,
                    show_progress = TRUE,
