@@ -272,7 +272,8 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
     x_info    = FALSE,
     progress  = progress_each,
     type      = 1,
-    phi_start = phi_start_Eff1
+    phi_start = phi_start_Eff1,
+    N=N
   )
   if ("N" %in% names(formals(Eff))) {
     eff_union_args$N <- nrow(dat)
