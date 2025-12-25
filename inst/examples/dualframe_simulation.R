@@ -586,3 +586,209 @@ summarize_mc <- function(res, theta_true = 0) {
   rownames(sum_df) <- NULL
   sum_df[order(sum_df$estimator), ]
 }
+
+
+
+
+############################################################
+## 8) Eff1_union / Eff2_union だけ実行する版（ダミーなし）
+##    - 出力: 2推定量 × B 行
+##    - 列: extract_row() を使うので run_mc() と同じ列構成
+############################################################
+
+fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE) {
+  sc <- normalize_scenario(Scenario)
+
+  n_np    <- sum(dat$d_np == 1L)
+  n_p     <- sum(dat$d_p  == 1L)
+  n_union <- sum(dat$d_np == 1L | dat$d_p == 1L)
+
+  # phi_start（元コードのルールと同じ）
+  if (sc %in% c(1, 2, 4)) {
+    phi_start_true <- c(-2.15, -0.5, -0.75)
+  } else {
+    phi_start_true <- c(-1.5, 0, 0, 0)
+  }
+
+  dat_union <- subset(dat, d_np == 1L | d_p == 1L)
+
+  eff_union_args <- list(
+    dat       = dat_union,
+    K         = K,
+    x_info    = FALSE,
+    progress  = progress_each,
+    phi_start = phi_start_true
+  )
+
+  # Eff() が N 引数を持つ場合だけ渡す（full N = nrow(dat)）
+  if ("N" %in% names(formals(Eff))) {
+    eff_union_args$N <- nrow(dat)
+  }
+
+  eff_union_args$type <- 1L
+  fit_Eff1_union <- safe_fit(do.call(Eff, eff_union_args))
+
+  eff_union_args$type <- 2L
+  fit_Eff2_union <- safe_fit(do.call(Eff, eff_union_args))
+
+  list(
+    Eff1_union = fit_Eff1_union,
+    Eff2_union = fit_Eff2_union,
+    n_np       = n_np,
+    n_p        = n_p,
+    n_union    = n_union
+  )
+}
+
+mc_one_rep_long_union_only <- function(seed,
+                                       rep_id,
+                                       N,
+                                       Scenario,
+                                       K = 2,
+                                       Eff_type = 2,      # 互換のため残す（未使用）
+                                       x_info = TRUE,     # 互換のため残す（未使用）
+                                       pi_p_offset = 0.005,
+                                       progress_each_fit = FALSE) {
+  tryCatch({
+    set.seed(seed)
+    dat <- generate_dualframe_population(N = N, Scenario = Scenario, pi_p_offset = pi_p_offset)
+
+    fits <- fit_union_estimators_once(
+      dat = dat,
+      Scenario = Scenario,
+      K = K,
+      progress_each = progress_each_fit
+    )
+
+    rbind(
+      extract_row(fits$Eff1_union, "Eff1_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
+      extract_row(fits$Eff2_union, "Eff2_union", rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union)
+    )
+  }, error = function(e) {
+    blank <- list(
+      theta  = NA_real_,
+      se     = NA_real_,
+      ci     = c(NA_real_, NA_real_),
+      phi    = NA_real_,
+      phi_se = NA_real_,
+      phi_ci = matrix(NA_real_, nrow = 2, ncol = 1,
+                      dimnames = list(c("lower","upper"), NULL)),
+      error  = paste0("mc_one_rep_long_union_only error: ", conditionMessage(e))
+    )
+    rbind(
+      extract_row(blank, "Eff1_union", rep_id, Scenario, NA_integer_, NA_integer_, NA_integer_),
+      extract_row(blank, "Eff2_union", rep_id, Scenario, NA_integer_, NA_integer_, NA_integer_)
+    )
+  })
+}
+
+run_mc_union <- function(B,
+                         N = 10000,
+                         Scenario = 1,
+                         K = 2,
+                         Eff_type = 2,              # 互換のため残す（未使用）
+                         x_info = TRUE,             # 互換のため残す（未使用）
+                         seed_start = 1,
+                         show_progress = TRUE,
+                         progress_each_fit = FALSE,
+                         pi_p_offset = 0.005,
+                         parallel = c("none", "multicore", "snow"),
+                         n_cores = NULL) {
+
+  parallel <- match.arg(parallel)
+
+  B <- as.integer(B)
+  if (!is.finite(B) || B < 1L) stop("B must be a positive integer.")
+
+  sc <- normalize_scenario(Scenario)
+
+  seeds   <- seed_start + seq_len(B) - 1L
+  rep_ids <- seq_len(B)
+
+  worker_i <- function(i) {
+    mc_one_rep_long_union_only(
+      seed = seeds[i],
+      rep_id = rep_ids[i],
+      N = N,
+      Scenario = sc,
+      K = K,
+      Eff_type = Eff_type,
+      x_info = x_info,
+      pi_p_offset = pi_p_offset,
+      progress_each_fit = progress_each_fit
+    )
+  }
+
+  if (parallel == "none") {
+    out_list <- vector("list", B)
+    pb <- NULL
+    if (isTRUE(show_progress)) {
+      pb <- utils::txtProgressBar(min = 0, max = B, style = 3)
+      on.exit(try(close(pb), silent = TRUE), add = TRUE)
+    }
+    for (b in seq_len(B)) {
+      out_list[[b]] <- worker_i(b)
+      if (!is.null(pb)) utils::setTxtProgressBar(pb, b)
+    }
+    return(do.call(rbind, out_list))
+  }
+
+  if (!requireNamespace("parallel", quietly = TRUE)) {
+    stop("Package 'parallel' is required for parallel != 'none'.", call. = FALSE)
+  }
+
+  if (is.null(n_cores)) {
+    n_cores <- parallel::detectCores(logical = TRUE)
+    if (!is.finite(n_cores) || n_cores < 1L) n_cores <- 1L
+    n_cores <- max(1L, as.integer(n_cores) - 1L)
+  }
+  n_cores <- as.integer(n_cores)
+  if (!is.finite(n_cores) || n_cores < 1L) n_cores <- 1L
+  n_cores <- min(n_cores, B)
+
+  if (parallel == "multicore") {
+    if (isTRUE(show_progress)) {
+      message("parallel='multicore': show_progress is ignored (no progress bar in base R for mclapply).")
+    }
+    out_list <- parallel::mclapply(seq_len(B), worker_i, mc.cores = n_cores, mc.preschedule = FALSE)
+    return(do.call(rbind, out_list))
+  }
+
+  # snow (PSOCK)
+  cl <- parallel::makeCluster(n_cores)
+  on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
+
+  parallel::clusterEvalQ(cl, library(dfSEDI))
+
+  parallel::clusterExport(
+    cl,
+    varlist = c(
+      "normalize_scenario",
+      "generate_dualframe_population",
+      "safe_fit",
+      "extract_row",
+      "fit_union_estimators_once",
+      "mc_one_rep_long_union_only",
+      "seeds",
+      "rep_ids",
+      "N",
+      "sc",
+      "K",
+      "Eff_type",
+      "x_info",
+      "pi_p_offset",
+      "progress_each_fit"
+    ),
+    envir = environment()
+  )
+
+  idxs <- seq_len(B)
+  out_list <- df_par_lapply_lb_progress(
+    cl = cl,
+    X = idxs,
+    fun = worker_i,
+    show_progress = show_progress
+  )
+
+  do.call(rbind, out_list)
+}
