@@ -8,8 +8,8 @@ dual-frame sampling (Morikawa & Kim, 202x).
 
 Main user-facing estimators:
 
-- `Eff` : semiparametric efficient estimator (**default: DML1**,
-  supports DML1 / DML2, K-fold)
+- `Eff` : semiparametric efficient estimator (**default: DML2**,
+  supports DML1 / DML2, K-fold; see `prob_only` below)
 - `Eff_S` : sub-efficient estimator (Remark 6-type, K-fold)
 - `Eff_P` : parametric efficient estimator (working model)
 
@@ -110,6 +110,39 @@ dfSEDI exposes this choice via the flag `x_info`:
 > ``` r
 > dat_union <- subset(dat, d_np == 1 | d_p == 1)
 > ```
+
+## NEW: `prob_only` in `Eff()` (estimating the augmentation terms)
+
+When `x_info = TRUE`, `Eff()` estimates the optimal augmentation
+functions $h_4^*(X)$ and $\eta_4^*(X)$ via cross-fitted nonparametric
+regression (DML).
+
+In the paper these nuisance functions admit two equivalent
+representations (see Eq. (9)/(11) and Eq. (10)/(12) in the current
+draft):
+
+- **Probability-sample-only** representation: conditional expectations
+  are taken over the probability sample ($\delta_P = 1$), involving
+  $O_{NP\cup P} / \pi_P$.
+- **Combined-sample** representation: conditional expectations are taken
+  over the union sample ($\delta_{NP}\cup\delta_P = 1$), involving
+  $O_{NP\cup P} / \pi_{NP\cup P}$.
+
+dfSEDI exposes this choice via `prob_only`:
+
+- `prob_only = FALSE` (default): use the **combined-sample** version
+  (10)/(12) (current default behavior).
+- `prob_only = TRUE`: use the **probability-sample-only** version
+  (9)/(11).
+
+Notes: - `prob_only` only affects the estimation of $h_4^*(X)$ and
+$\eta_4^*(X)$. The target parameter and the main estimating equations
+are unchanged. - If `x_info = FALSE`, the augmentation terms are fixed
+to zero and `prob_only` is ignored. - Trade-off: `prob_only = TRUE` uses
+fewer training points (only the probability sample), so it can be
+noisier when $n_P$ is small; `prob_only = FALSE` uses more data (union
+sample) but can be more sensitive to issues driven by the
+non-probability side.
 
 ------------------------------------------------------------------------
 
@@ -240,7 +273,7 @@ observe the union sample:
 ``` r
 dat_union <- subset(dat, d_np == 1 | d_p == 1)
 
-# Eff uses DML1 by default (faster).
+# Eff uses DML2 by default.
 fit_eff_union <- Eff(
   dat         = dat_union,
   K           = 2,
@@ -261,11 +294,12 @@ For simulation studies where you keep the full population-like data
 structure:
 
 ``` r
-# Eff uses DML1 by default (faster).
+# Eff uses DML2 by default.
 fit_eff_full <- Eff(
   dat         = dat,
   K           = 2,
   x_info      = TRUE,
+  prob_only   = FALSE,  # default: combined-sample augmentation (10)/(12)
   progress    = TRUE
 )
 
@@ -273,6 +307,20 @@ fit_eff_full$theta
 fit_eff_full$se
 fit_eff_full$ci
 fit_eff_full$info
+
+# Probability-sample-only augmentation (9)/(11)
+fit_eff_full_prob_only <- Eff(
+  dat         = dat,
+  K           = 2,
+  x_info      = TRUE,
+  prob_only   = TRUE,
+  progress    = TRUE
+)
+
+fit_eff_full_prob_only$theta
+fit_eff_full_prob_only$se
+fit_eff_full_prob_only$ci
+fit_eff_full_prob_only$info
 ```
 
 ------------------------------------------------------------------------
@@ -281,7 +329,9 @@ fit_eff_full$info
 
 The example script `inst/examples/dualframe_simulation.R` also defines:
 
-- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, ...)`
+- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, prob_only, ...)`
+- `run_mc_union(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, prob_only, ...)`
+  (runs only `Eff1_union` / `Eff2_union`)
 - `summarize_mc(res, theta_true = 0)`
 
 `run_mc()` returns a long-format data frame (one row per replication ×
@@ -304,6 +354,18 @@ The typical columns are:
 - `theta`, `se`, `ci_l`, `ci_u`
 - `n_np`, `n_p`, `n_union`
 - `error`
+- (NEW) `phi_1..phi_4`, `phi_se_1..phi_se_4`, `phi_ci_l_1..phi_ci_l_4`,
+  `phi_ci_u_1..phi_ci_u_4` (filled with `NA` when not available)
+
+NEW in this example script:
+
+- `prob_only` is passed through to `Eff()` inside `run_mc()` /
+  `run_mc_union()`.  
+  Set `prob_only = TRUE` to use the probability-sample-only augmentation
+  (9)/(11); default is `FALSE` (combined-sample augmentation (10)/(12)).
+- `Scenario` can be `1:4` (or `"S1"`–`"S4"`). Scenario 4 duplicates
+  overlap units to mimic the no-record-linkage setting (see Remark 1 /
+  Section 6.2 in the paper).
 
 ### Serial MC (built-in progress bar)
 
