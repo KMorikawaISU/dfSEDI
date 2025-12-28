@@ -34,7 +34,8 @@ Imports:
     stats,
     utils,
     pbapply,
-    parallel
+    parallel,
+    glmnet
 Suggests:
     knitr,
     rmarkdown

@@ -298,6 +298,7 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE,
   if ("prob_only" %in% names(formals(Eff))) {
     eff_union_args$prob_only <- isTRUE(prob_only)
   }
+  if ("nonpara_method" %in% names(formals(Eff))) eff_union_args$nonpara_method <- nonpara_method
   fit_Eff1_union <- safe_fit(do.call(Eff, eff_union_args))
 
   eff_union_args$type      <- 2
@@ -620,7 +621,7 @@ summarize_mc <- function(res, theta_true = 0) {
 ##    - 列: extract_row() を使うので run_mc() と同じ列構成
 ############################################################
 
-fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE, prob_only = FALSE) {
+fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE, prob_only = FALSE, nonpara_method = "KRR") {
   sc <- normalize_scenario(Scenario)
 
   n_np    <- sum(dat$d_np == 1L)
@@ -676,6 +677,7 @@ mc_one_rep_long_union_only <- function(seed,
                                        x_info = TRUE,     # 互換のため残す（未使用）
                                        pi_p_offset = 0.005,
                                        prob_only = FALSE,
+                                       nonpara_method = "KRR",
                                        progress_each_fit = FALSE) {
   tryCatch({
     set.seed(seed)
@@ -686,7 +688,8 @@ mc_one_rep_long_union_only <- function(seed,
       Scenario = Scenario,
       K = K,
       progress_each = progress_each_fit,
-      prob_only = prob_only
+      prob_only = prob_only,
+      nonpara_method = nonpara_method
     )
 
     rbind(
