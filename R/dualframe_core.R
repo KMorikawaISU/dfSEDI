@@ -3870,6 +3870,7 @@ efficient_parametric_estimator <- function(dat,
                                            eta4_star = 0,
                                            max_iter  = 20,
                                            logit     = NULL,
+                                           nonpara_method = NULL,
                                            progress  = FALSE,
                                            x_info    = TRUE) {
   dat <- df_apply_x_info(dat, x_info)
@@ -3953,30 +3954,65 @@ efficient_parametric_estimator <- function(dat,
 
       X_full <- df_get_X(dat)
 
-      if (isTRUE(use_logit)) {
-        y01_sub <- df_as_binary01(dat_sub$y)$y01
-        df_sub <- data.frame(y = y01_sub, X_sub)
-        colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
+      # Working model for h4*(X) / mu(X) = E(Y|X).
+      # Default (nonpara_method=NULL): keep the original "simple working model"
+      #   - binary y (logit=TRUE): parametric logistic regression
+      #   - continuous y         : parametric linear regression
+      # If nonpara_method is specified, use the corresponding nonparametric / high-dim method
+      # (KRR / mixed KRR / logistic KRR / glmnet_linear / glmnet_logistic).
+      if (is.null(nonpara_method)) {
+        if (isTRUE(use_logit)) {
+          y01_sub <- df_as_binary01(dat_sub$y)$y01
+          df_sub <- data.frame(y = y01_sub, X_sub)
+          colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
 
-        glm_fit <- stats::glm(y ~ ., data = df_sub, family = stats::binomial())
+          glm_fit <- stats::glm(y ~ ., data = df_sub, family = stats::binomial())
 
-        df_full <- data.frame(X_full)
-        colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
-        mu_hat <- as.numeric(stats::predict(glm_fit, newdata = df_full, type = "response"))
-        mu_hat <- df_clip_prob(mu_hat)
+          df_full <- data.frame(X_full)
+          colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
+          mu_hat <- as.numeric(stats::predict(glm_fit, newdata = df_full, type = "response"))
+          mu_hat <- df_clip_prob(mu_hat)
 
-        mu_model <- "parametric_logistic"
+          mu_model <- "parametric_logistic"
+        } else {
+          df_sub <- data.frame(y = as.numeric(dat_sub$y), X_sub)
+          colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
+
+          lm_fit <- stats::lm(y ~ ., data = df_sub)
+
+          df_full <- data.frame(X_full)
+          colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
+          mu_hat <- as.numeric(stats::predict(lm_fit, newdata = df_full))
+
+          mu_model <- "parametric_linear"
+        }
       } else {
-        df_sub <- data.frame(y = as.numeric(dat_sub$y), X_sub)
-        colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
+        method <- df_match_nonpara_method(nonpara_method)
 
-        lm_fit <- stats::lm(y ~ ., data = df_sub)
+        if (isTRUE(use_logit)) {
+          mu_hat <- df_np_predict_binomial(
+            X_train = X_sub,
+            y_train = dat_sub$y,
+            X_test  = X_full,
+            prep    = NULL,
+            sigma   = NULL,
+            nonpara_method = method,
+            context = "Eff_P: mu(X) working model"
+          )
+          mu_hat <- df_clip_prob(mu_hat)
+        } else {
+          mu_hat <- df_np_predict_gaussian(
+            X_train = X_sub,
+            y_train = as.numeric(dat_sub$y),
+            X_test  = X_full,
+            prep    = NULL,
+            sigma   = NULL,
+            nonpara_method = method,
+            context = "Eff_P: mu(X) working model"
+          )
+        }
 
-        df_full <- data.frame(X_full)
-        colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
-        mu_hat <- as.numeric(stats::predict(lm_fit, newdata = df_full))
-
-        mu_model <- "parametric_linear"
+        mu_model <- paste0("nonpara_method=", method)
       }
     }
 
@@ -4000,6 +4036,7 @@ efficient_parametric_estimator <- function(dat,
                   progress  = progress,
                   x_info    = isTRUE(x_info),
                   logit     = use_logit,
+                  nonpara_method = if (is.null(nonpara_method)) NA_character_ else df_match_nonpara_method(nonpara_method),
                   mu_model  = mu_model)
   )
 }
@@ -4049,9 +4086,10 @@ Eff_P <- function(dat,
                   eta4_star = 0,
                   max_iter  = 20,
                   logit     = NULL,
+                  nonpara_method = NULL,
                   progress  = interactive(),
                   x_info    = TRUE) {
   efficient_parametric_estimator(dat, phi_start = phi_start, eta4_star = eta4_star,
-                                 max_iter = max_iter, logit = logit, progress = progress,
+                                 max_iter = max_iter, logit = logit, nonpara_method = nonpara_method, progress = progress,
                                  x_info = x_info)
 }
