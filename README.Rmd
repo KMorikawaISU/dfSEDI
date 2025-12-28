@@ -131,7 +131,10 @@ You can now choose the regression back-end via `nonpara_method`:
 Important notes:
 
 - `glmnet_*` requires the `glmnet` package (`install.packages("glmnet")`).
-- In `Eff()`, all nuisance regressions are **continuous-valued** (even when `y` is binary), so `"logistic KRR"` / `"glmnet_logistic"` are automatically mapped to `"KRR"` / `"glmnet_linear"` with a warning.
+- In `Eff()` with **binary** `y` (and `x_info = TRUE`), `"logistic KRR"` / `"glmnet_logistic"` are used to fit \(p(X)=P(Y=1\mid X)\), and the needed conditional expectations are evaluated via
+  \(E\{g(X,Y)\mid X\}=g(X,0)\{1-p(X)\}+g(X,1)p(X)\).
+  (If `y` is not binary, logistic methods fall back to the corresponding continuous methods.)
+- In `Eff()`, the \(\pi_P(L)\) imputation step regresses a **continuous** target \(1/\pi_P\), so if you set `nonpara_method = "logistic KRR"` or `"glmnet_logistic"`, dfSEDI internally uses `"KRR"` or `"glmnet_linear"` for that imputation step (with a warning).
 - In `Eff_S()`, \(\mu(X)=E[Y\mid X]\) can be fit using `"logistic KRR"` or `"glmnet_logistic"` when `y` is binary.
 
 Example usage:
@@ -141,6 +144,7 @@ Example usage:
 fit_eff_krr    <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "KRR")
 fit_eff_mixed  <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "mixed KRR")
 fit_eff_glmnet <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "glmnet_linear")
+fit_eff_glmnet_logit <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "glmnet_logistic")
 
 # Sub-efficient estimator: binary y can use logistic methods
 fit_effS_logit_krr <- Eff_S(dat, K = 2, x_info = TRUE, nonpara_method = "logistic KRR")
@@ -149,7 +153,7 @@ fit_effS_glmnet    <- Eff_S(dat, K = 2, x_info = TRUE, nonpara_method = "glmnet_
 
 ## Mixed continuous/discrete covariates (automatic)
 
-> Note: The mixed-type (RBF × delta) product-kernel behavior below is used when you set `nonpara_method = "mixed KRR"` (or `"logistic KRR"` for binary regressions).
+> Note: The mixed-type (RBF × delta) product-kernel behavior below is used when you set `nonpara_method = "mixed KRR"`.
 > If you set `nonpara_method = "KRR"` (plain RBF on all columns) or `"glmnet_*"` (elastic-net), dfSEDI will not use the delta kernel.
 
 
