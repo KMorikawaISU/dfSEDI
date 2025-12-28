@@ -239,7 +239,7 @@ make_base_fun <- function(Scenario) {
 ## 3) Fit all estimators once (single dataset)
 ############################################################
 
-fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE, prob_only = FALSE) {
+fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE, prob_only = FALSE, nonpara_method = "KRR") {
   sc <- normalize_scenario(Scenario)
   base_fun <- make_base_fun(sc)
 
@@ -276,6 +276,7 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE,
   if ("prob_only" %in% names(formals(Eff))) {
     eff_args$prob_only <- isTRUE(prob_only)
   }
+  if ("nonpara_method" %in% names(formals(Eff))) eff_args$nonpara_method <- nonpara_method
   fit_Eff1 <- safe_fit(do.call(Eff, eff_args))
 
   eff_args$type      <- 2
@@ -305,7 +306,9 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE,
   eff_union_args$phi_start <- phi_start_Eff2
   fit_Eff2_union <- safe_fit(do.call(Eff, eff_union_args))
 
-  fit_Eff_S <- safe_fit(Eff_S(dat = dat, K = K, x_info = TRUE, progress = progress_each))
+  effS_args <- list(dat = dat, K = K, x_info = TRUE, progress = progress_each)
+  if ("nonpara_method" %in% names(formals(Eff_S))) effS_args$nonpara_method <- nonpara_method
+  fit_Eff_S <- safe_fit(do.call(Eff_S, effS_args))
   fit_Eff_P <- safe_fit(Eff_P(dat = dat, x_info = TRUE, phi_start = phi_start_true, progress = progress_each))
 
   list(
@@ -338,6 +341,7 @@ mc_one_rep_long <- function(seed,
                             x_info = TRUE,
                             pi_p_offset = 0,
                             prob_only = FALSE,
+                            nonpara_method = "KRR",
                             progress_each_fit = FALSE) {
 
   # Accept both numeric (1/2) and character ("DML1"/"DML2") without error.
@@ -352,7 +356,7 @@ mc_one_rep_long <- function(seed,
     set.seed(seed)
     dat <- generate_dualframe_population(N = N, Scenario = Scenario, pi_p_offset = pi_p_offset)
 
-    fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress_each_fit, prob_only = prob_only)
+    fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress_each_fit, prob_only = prob_only, nonpara_method = nonpara_method)
 
     rbind(
       extract_row(fits$P,          "P",          rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
@@ -461,6 +465,7 @@ run_mc <- function(B,
                    Eff_type = 2,              # 2=DML2 (default), 1=DML1 (kept for backward compatibility)
                    x_info = TRUE,
                    prob_only = FALSE,
+                   nonpara_method = "KRR",
                    seed_start = 1,
                    show_progress = TRUE,
                    progress_each_fit = FALSE,
@@ -489,6 +494,7 @@ run_mc <- function(B,
       x_info = x_info,
       pi_p_offset = pi_p_offset,
       prob_only = prob_only,
+      nonpara_method = nonpara_method,
       progress_each_fit = progress_each_fit
     )
   }
@@ -552,6 +558,7 @@ run_mc <- function(B,
       "x_info",
       "pi_p_offset",
       "prob_only",
+      "nonpara_method",
       "progress_each_fit"
     ),
     envir = environment()
@@ -652,6 +659,7 @@ fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALS
   if ("prob_only" %in% names(formals(Eff))) {
     eff_union_args$prob_only <- isTRUE(prob_only)
   }
+  if ("nonpara_method" %in% names(formals(Eff))) eff_union_args$nonpara_method <- nonpara_method
 
   eff_union_args$type <- 1L
   fit_Eff1_union <- safe_fit(do.call(Eff, eff_union_args))
@@ -721,6 +729,7 @@ run_mc_union <- function(B,
                          Eff_type = 2,              # 互換のため残す（未使用）
                          x_info = TRUE,             # 互換のため残す（未使用）
                          prob_only = FALSE,
+                         nonpara_method = "KRR",
                          seed_start = 1,
                          show_progress = TRUE,
                          progress_each_fit = FALSE,
@@ -749,6 +758,7 @@ run_mc_union <- function(B,
       x_info = x_info,
       pi_p_offset = pi_p_offset,
       prob_only = prob_only,
+      nonpara_method = nonpara_method,
       progress_each_fit = progress_each_fit
     )
   }
@@ -812,6 +822,7 @@ run_mc_union <- function(B,
       "x_info",
       "pi_p_offset",
       "prob_only",
+      "nonpara_method",
       "progress_each_fit"
     ),
     envir = environment()

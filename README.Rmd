@@ -115,7 +115,43 @@ Notes:
 
 ---
 
+## NEW: `nonpara_method` (nuisance regression back-end)
+
+dfSEDI estimates several nuisance functions by nonparametric regression (e.g., \(\mu(X)=E[Y\mid X]\), \(\pi_P(L)\) imputation, and the DML nuisance terms \(h_4^*(X)\) / \(\eta_4^*(X)\)).
+You can now choose the regression back-end via `nonpara_method`:
+
+- `nonpara_method = "KRR"` (**default**): kernel ridge regression with an RBF/Gaussian kernel applied to **all** columns of the design matrix.
+- `nonpara_method = "mixed KRR"`: mixed-type KRR with a product kernel:
+  - RBF kernel on continuous columns
+  - delta (Kronecker) kernel on categorical columns (fits separate models within each categorical cell)
+- `nonpara_method = "logistic KRR"`: kernel logistic regression (only meaningful for **binary** response regressions, e.g. \(P(Y=1\mid X)\)).
+- `nonpara_method = "glmnet_linear"`: elastic-net regression via `glmnet` with Gaussian family.
+- `nonpara_method = "glmnet_logistic"`: elastic-net logistic regression via `glmnet` with binomial family.
+
+Important notes:
+
+- `glmnet_*` requires the `glmnet` package (`install.packages("glmnet")`).
+- In `Eff()`, all nuisance regressions are **continuous-valued** (even when `y` is binary), so `"logistic KRR"` / `"glmnet_logistic"` are automatically mapped to `"KRR"` / `"glmnet_linear"` with a warning.
+- In `Eff_S()`, \(\mu(X)=E[Y\mid X]\) can be fit using `"logistic KRR"` or `"glmnet_logistic"` when `y` is binary.
+
+Example usage:
+
+```r
+# Efficient estimator (DML): choose the nuisance regression back-end
+fit_eff_krr    <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "KRR")
+fit_eff_mixed  <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "mixed KRR")
+fit_eff_glmnet <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "glmnet_linear")
+
+# Sub-efficient estimator: binary y can use logistic methods
+fit_effS_logit_krr <- Eff_S(dat, K = 2, x_info = TRUE, nonpara_method = "logistic KRR")
+fit_effS_glmnet    <- Eff_S(dat, K = 2, x_info = TRUE, nonpara_method = "glmnet_logistic")
+```
+
 ## Mixed continuous/discrete covariates (automatic)
+
+> Note: The mixed-type (RBF × delta) product-kernel behavior below is used when you set `nonpara_method = "mixed KRR"` (or `"logistic KRR"` for binary regressions).
+> If you set `nonpara_method = "KRR"` (plain RBF on all columns) or `"glmnet_*"` (elastic-net), dfSEDI will not use the delta kernel.
+
 
 dfSEDI estimates nuisance functions (e.g., \(\mu(X)=E[Y\mid X]\), \(\pi_P\), \(\eta_4^*(X)\), \(h_4^*(X)\)) using kernel methods.
 
@@ -277,8 +313,8 @@ fit_eff_full_prob_only$info
 
 The example script `inst/examples/dualframe_simulation.R` also defines:
 
-- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, prob_only, ...)`
-- `run_mc_union(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, prob_only, ...)` (runs only `Eff1_union` / `Eff2_union`)
+- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, prob_only, nonpara_method, ...)`
+- `run_mc_union(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, prob_only, nonpara_method, ...)` (runs only `Eff1_union` / `Eff2_union`)
 - `summarize_mc(res, theta_true = 0)`
 
 `run_mc()` returns a long-format data frame (one row per replication × estimator).
@@ -308,6 +344,8 @@ NEW in this example script:
 
 - `prob_only` is passed through to `Eff()` inside `run_mc()` / `run_mc_union()`.  
   Set `prob_only = TRUE` to use the probability-sample-only augmentation (9)/(11); default is `FALSE` (combined-sample augmentation (10)/(12)).
+- (NEW) `nonpara_method` is passed through to `Eff()` (and `Eff_S()` where relevant) inside `run_mc()` / `run_mc_union()`.  
+  See the `nonpara_method` section above for available options.
 - `Scenario` can be `1:4` (or `"S1"`–`"S4"`). Scenario 4 duplicates overlap units to mimic the no-record-linkage setting (see Remark 1 / Section 6.2 in the paper).
 
 ### Serial MC (built-in progress bar)
@@ -325,7 +363,8 @@ res <- run_mc(
   K = 2,
   seed_start = 1,
   show_progress = TRUE,
-  progress_each_fit = FALSE
+  progress_each_fit = FALSE,
+  nonpara_method = "KRR"
 )
 
 summarize_mc(res, theta_true = 0)
