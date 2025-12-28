@@ -17,6 +17,10 @@
 ##   dynamic scheduling + a progress bar. This avoids the common "idle CPU" issue.
 ##
 ## NEW (this revision):
+## - Added `prob_only` (passed to Eff()):
+##     * prob_only = FALSE (default): combined-sample version (10)/(12) (current default).
+##     * prob_only = TRUE: probability-sample-only version (9)/(11).
+##
 ## - Added Scenario 4:
 ##     * DGP up to (d_np, d_p) is identical to Scenario 1.
 ##     * Then, overlap units with (d_np, d_p) = (1, 1) are duplicated to remove overlap:
@@ -235,7 +239,7 @@ make_base_fun <- function(Scenario) {
 ## 3) Fit all estimators once (single dataset)
 ############################################################
 
-fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE) {
+fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE, prob_only = FALSE) {
   sc <- normalize_scenario(Scenario)
   base_fun <- make_base_fun(sc)
 
@@ -261,8 +265,22 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
   fit_NP  <- safe_fit(df_estimate_NP(dat, base_fun = base_fun, phi_start = phi_start_NP))
   fit_NP_P <- safe_fit(df_estimate_NP_P(dat, base_fun = base_fun, phi_start = phi_start_NP_P))
 
-  fit_Eff1 <- safe_fit(Eff(dat = dat, K = K, x_info = TRUE, type = 1, phi_start = phi_start_Eff1, progress = progress_each))
-  fit_Eff2 <- safe_fit(Eff(dat = dat, K = K, x_info = TRUE, type = 2, phi_start = phi_start_Eff2, progress = progress_each))
+  eff_args <- list(
+    dat       = dat,
+    K         = K,
+    x_info    = TRUE,
+    type      = 1,
+    phi_start = phi_start_Eff1,
+    progress  = progress_each
+  )
+  if ("prob_only" %in% names(formals(Eff))) {
+    eff_args$prob_only <- isTRUE(prob_only)
+  }
+  fit_Eff1 <- safe_fit(do.call(Eff, eff_args))
+
+  eff_args$type      <- 2
+  eff_args$phi_start <- phi_start_Eff2
+  fit_Eff2 <- safe_fit(do.call(Eff, eff_args))
 
   dat_union <- subset(dat, d_np == 1 | d_p == 1)
 
@@ -272,11 +290,13 @@ fit_all_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE)
     x_info    = FALSE,
     progress  = progress_each,
     type      = 1,
-    phi_start = phi_start_Eff1,
-    N=N
+    phi_start = phi_start_Eff1
   )
   if ("N" %in% names(formals(Eff))) {
     eff_union_args$N <- nrow(dat)
+  }
+  if ("prob_only" %in% names(formals(Eff))) {
+    eff_union_args$prob_only <- isTRUE(prob_only)
   }
   fit_Eff1_union <- safe_fit(do.call(Eff, eff_union_args))
 
@@ -316,6 +336,7 @@ mc_one_rep_long <- function(seed,
                             Eff_type = 2,  # kept for backward-compatibility; accepts 1/2 or "DML1"/"DML2"
                             x_info = TRUE,
                             pi_p_offset = 0,
+                            prob_only = FALSE,
                             progress_each_fit = FALSE) {
 
   # Accept both numeric (1/2) and character ("DML1"/"DML2") without error.
@@ -330,7 +351,7 @@ mc_one_rep_long <- function(seed,
     set.seed(seed)
     dat <- generate_dualframe_population(N = N, Scenario = Scenario, pi_p_offset = pi_p_offset)
 
-    fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress_each_fit)
+    fits <- fit_all_estimators_once(dat = dat, Scenario = Scenario, K = K, progress_each = progress_each_fit, prob_only = prob_only)
 
     rbind(
       extract_row(fits$P,          "P",          rep_id, Scenario, fits$n_np, fits$n_p, fits$n_union),
@@ -438,6 +459,7 @@ run_mc <- function(B,
                    K = 2,
                    Eff_type = 2,              # 2=DML2 (default), 1=DML1 (kept for backward compatibility)
                    x_info = TRUE,
+                   prob_only = FALSE,
                    seed_start = 1,
                    show_progress = TRUE,
                    progress_each_fit = FALSE,
@@ -465,6 +487,7 @@ run_mc <- function(B,
       Eff_type = Eff_type,
       x_info = x_info,
       pi_p_offset = pi_p_offset,
+      prob_only = prob_only,
       progress_each_fit = progress_each_fit
     )
   }
@@ -527,6 +550,7 @@ run_mc <- function(B,
       "Eff_type",
       "x_info",
       "pi_p_offset",
+      "prob_only",
       "progress_each_fit"
     ),
     envir = environment()
@@ -596,7 +620,7 @@ summarize_mc <- function(res, theta_true = 0) {
 ##    - 列: extract_row() を使うので run_mc() と同じ列構成
 ############################################################
 
-fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE) {
+fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE, prob_only = FALSE) {
   sc <- normalize_scenario(Scenario)
 
   n_np    <- sum(dat$d_np == 1L)
@@ -624,6 +648,9 @@ fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALS
   if ("N" %in% names(formals(Eff))) {
     eff_union_args$N <- nrow(dat)
   }
+  if ("prob_only" %in% names(formals(Eff))) {
+    eff_union_args$prob_only <- isTRUE(prob_only)
+  }
 
   eff_union_args$type <- 1L
   fit_Eff1_union <- safe_fit(do.call(Eff, eff_union_args))
@@ -648,6 +675,7 @@ mc_one_rep_long_union_only <- function(seed,
                                        Eff_type = 2,      # 互換のため残す（未使用）
                                        x_info = TRUE,     # 互換のため残す（未使用）
                                        pi_p_offset = 0.005,
+                                       prob_only = FALSE,
                                        progress_each_fit = FALSE) {
   tryCatch({
     set.seed(seed)
@@ -657,7 +685,8 @@ mc_one_rep_long_union_only <- function(seed,
       dat = dat,
       Scenario = Scenario,
       K = K,
-      progress_each = progress_each_fit
+      progress_each = progress_each_fit,
+      prob_only = prob_only
     )
 
     rbind(
@@ -688,6 +717,7 @@ run_mc_union <- function(B,
                          K = 2,
                          Eff_type = 2,              # 互換のため残す（未使用）
                          x_info = TRUE,             # 互換のため残す（未使用）
+                         prob_only = FALSE,
                          seed_start = 1,
                          show_progress = TRUE,
                          progress_each_fit = FALSE,
@@ -715,6 +745,7 @@ run_mc_union <- function(B,
       Eff_type = Eff_type,
       x_info = x_info,
       pi_p_offset = pi_p_offset,
+      prob_only = prob_only,
       progress_each_fit = progress_each_fit
     )
   }
@@ -777,6 +808,7 @@ run_mc_union <- function(B,
       "Eff_type",
       "x_info",
       "pi_p_offset",
+      "prob_only",
       "progress_each_fit"
     ),
     envir = environment()

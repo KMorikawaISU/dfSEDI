@@ -1531,23 +1531,38 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
                                                               X_obs,
                                                               l_obs,
                                                               pi_p_obs,
-                                                              prep) {
+                                                              prep,
+                                                              prob_only = FALSE) {
   phi <- as.numeric(phi)
   new_X <- as.matrix(new_X)
   X_obs <- as.matrix(X_obs)
   l_obs <- as.matrix(l_obs)
   pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
 
+  p_dim <- length(phi)
+
+  # If the training sample is empty, return zeros (valid but less efficient).
+  # This avoids NaN/NA propagation in small-sample edge cases.
+  if (nrow(X_obs) < 1L) {
+    return(matrix(0, nrow = nrow(new_X), ncol = p_dim))
+  }
+
   eta   <- as.numeric(l_obs %*% phi)
   pi_np <- df_clip_prob(1 / (1 + exp(-eta)))
 
-  Denom_vals <- h4_prob_denom_function(pi_np, pi_p_obs, phi)
+  # Denominator depends on which representation is used:
+  #  - prob_only=FALSE (default): combined-sample version (10)/(12): O_{NP∪P} / pi_{NP∪P}
+  #  - prob_only=TRUE            : probability-sample version (9)/(11): O_{NP∪P} / pi_{P}
+  pi_np_p <- df_clip_prob(pi_p_obs + pi_np - pi_p_obs * pi_np)
+  if (isTRUE(prob_only)) {
+    Denom_vals <- (1 - pi_np_p) / (pi_np_p * pi_p_obs)
+  } else {
+    Denom_vals <- (1 - pi_np_p) / (pi_np_p ^ 2)
+  }
 
   # vectorized Numer_mat: Numer_mat[i,] = -pi_np[i] * Denom_vals[i] * l_obs[i,]
   coef <- -pi_np * as.numeric(Denom_vals)
   Numer_mat <- l_obs * coef
-
-  p_dim <- length(phi)
 
   if (nrow(X_obs) < 2L) {
     denom_pred <- rep(mean(Denom_vals), nrow(new_X))
@@ -1588,7 +1603,8 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
                                                                 y_obs,
                                                                 l_obs,
                                                                 pi_p_obs,
-                                                                prep) {
+                                                                prep,
+                                                                prob_only = FALSE) {
   phi <- as.numeric(phi)
   new_X <- as.matrix(new_X)
   X_obs <- as.matrix(X_obs)
@@ -1596,10 +1612,24 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
   l_obs <- as.matrix(l_obs)
   pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
 
+  # If the training sample is empty, return zeros (valid but less efficient).
+  if (nrow(X_obs) < 1L) {
+    return(rep(0, nrow(new_X)))
+  }
+
   eta   <- as.numeric(l_obs %*% phi)
   pi_np <- df_clip_prob(1 / (1 + exp(-eta)))
 
-  Denom_vals <- h4_prob_denom_function(pi_np, pi_p_obs, phi)
+  # Denominator depends on which representation is used:
+  #  - prob_only=FALSE (default): combined-sample version (10)/(12): O_{NP∪P} / pi_{NP∪P}
+  #  - prob_only=TRUE            : probability-sample version (9)/(11): O_{NP∪P} / pi_{P}
+  pi_np_p <- df_clip_prob(pi_p_obs + pi_np - pi_p_obs * pi_np)
+  if (isTRUE(prob_only)) {
+    Denom_vals <- (1 - pi_np_p) / (pi_np_p * pi_p_obs)
+  } else {
+    Denom_vals <- (1 - pi_np_p) / (pi_np_p ^ 2)
+  }
+
   # vectorized Numer_vals: -y * Denom_vals
   Numer_vals <- -y_obs * as.numeric(Denom_vals)
 
@@ -2337,7 +2367,8 @@ efficient_estimator_dml2 <- function(dat,
                                      max_restart = 10,
                                      progress    = FALSE,
                                      x_info      = TRUE,
-                                     N           = NULL) {
+                                     N           = NULL,
+                                     prob_only   = FALSE) {
 
   had_frame_units <- df_dat_has_frame_units(dat)
 
@@ -2406,7 +2437,11 @@ efficient_estimator_dml2 <- function(dat,
 
     # train side for nuisances
     X_all_tr <- df_get_X(dat_train)
-    idx_obs  <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+    if (isTRUE(prob_only)) {
+      idx_obs <- which(as.numeric(dat_train$d_p) == 1)
+    } else {
+      idx_obs <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+    }
 
     X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
     y_obs    <- as.numeric(dat_train$y[idx_obs])
@@ -2465,7 +2500,8 @@ efficient_estimator_dml2 <- function(dat,
           X_obs    = fc$train$X_obs,
           l_obs    = fc$train$l_obs,
           pi_p_obs = fc$train$pi_p_obs,
-          prep     = fc$train$prep_eta4
+          prep     = fc$train$prep_eta4,
+          prob_only = prob_only
         )
       } else {
         matrix(0, nrow = nrow(fc$test$l), ncol = p_phi)
@@ -2584,10 +2620,12 @@ efficient_estimator_dml2 <- function(dat,
         max_restart      = max_restart,
         progress         = progress,
         x_info           = isTRUE(x_info),
+        prob_only          = isTRUE(prob_only),
+        aug_terms_method   = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
         aug_terms        = if (isTRUE(x_info)) "estimated" else "fixed_zero",
         convergence      = if (!is.null(best)) best$convergence else NA_integer_,
         phi_obj          = if (!is.null(best)) best$value else NA_real_,
-        theta_var_method = theta_var_method,
+        theta_var_method = NA_character_,
         sandwich_n_eff   = n,
         population_N     = N_total,
         n_obs            = n,
@@ -2617,7 +2655,8 @@ efficient_estimator_dml2 <- function(dat,
         X_obs    = fc$train$X_obs,
         l_obs    = fc$train$l_obs,
         pi_p_obs = fc$train$pi_p_obs,
-        prep     = fc$train$prep_eta4
+        prep     = fc$train$prep_eta4,
+        prob_only = prob_only
       )
       h4_k <- estimate_conditional_expectation_kernlab_theta_core(
         phi      = phi_hat,
@@ -2626,7 +2665,8 @@ efficient_estimator_dml2 <- function(dat,
         y_obs    = fc$train$y_obs,
         l_obs    = fc$train$l_obs,
         pi_p_obs = fc$train$pi_p_obs,
-        prep     = fc$train$prep_h4
+        prep     = fc$train$prep_h4,
+        prob_only = prob_only
       )
 
       eta4_all[idx_test, ] <- eta4_k
@@ -2728,6 +2768,8 @@ efficient_estimator_dml2 <- function(dat,
       max_restart = max_restart,
       progress    = progress,
       x_info      = isTRUE(x_info),
+      prob_only   = isTRUE(prob_only),
+      aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       convergence = res$convergence,
       theta_var_method = theta_var_method,
@@ -2749,7 +2791,8 @@ efficient_estimator_dml1 <- function(dat,
                                      max_restart = 10,
                                      progress    = FALSE,
                                      x_info      = TRUE,
-                                     N           = NULL) {
+                                     N           = NULL,
+                                     prob_only   = FALSE) {
 
   had_frame_units <- df_dat_has_frame_units(dat)
 
@@ -2822,7 +2865,11 @@ efficient_estimator_dml1 <- function(dat,
     train_cache <- NULL
     if (isTRUE(x_info)) {
       X_all_tr <- df_get_X(dat_train)
-      idx_obs  <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+      if (isTRUE(prob_only)) {
+        idx_obs <- which(as.numeric(dat_train$d_p) == 1)
+      } else {
+        idx_obs <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+      }
 
       X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
       y_obs    <- as.numeric(dat_train$y[idx_obs])
@@ -2858,7 +2905,8 @@ efficient_estimator_dml1 <- function(dat,
           X_obs    = train_cache$X_obs,
           l_obs    = train_cache$l_obs,
           pi_p_obs = train_cache$pi_p_obs,
-          prep     = train_cache$prep_eta4
+          prep     = train_cache$prep_eta4,
+          prob_only = prob_only
         )
       } else {
         matrix(0, nrow = nrow(l_test), ncol = p_phi)
@@ -2960,7 +3008,8 @@ efficient_estimator_dml1 <- function(dat,
         X_obs    = train_cache$X_obs,
         l_obs    = train_cache$l_obs,
         pi_p_obs = train_cache$pi_p_obs,
-        prep     = train_cache$prep_eta4
+        prep     = train_cache$prep_eta4,
+        prob_only = prob_only
       )
       h4_k <- estimate_conditional_expectation_kernlab_theta_core(
         phi      = phi_k,
@@ -2969,7 +3018,8 @@ efficient_estimator_dml1 <- function(dat,
         y_obs    = train_cache$y_obs,
         l_obs    = train_cache$l_obs,
         pi_p_obs = train_cache$pi_p_obs,
-        prep     = train_cache$prep_h4
+        prep     = train_cache$prep_h4,
+        prob_only = prob_only
       )
     } else {
       eta4_k <- matrix(0, nrow = nrow(l_test), ncol = p_phi)
@@ -3020,6 +3070,8 @@ efficient_estimator_dml1 <- function(dat,
       ci = c(NA_real_, NA_real_),
       info = list(type = "Eff", dml_type = "DML1", K = K, progress = progress,
                   x_info = isTRUE(x_info),
+                  prob_only = isTRUE(prob_only),
+                  aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
                   population_N = N_total,
                   n_obs = n,
                   theta_scale = theta_scale)
@@ -3092,6 +3144,8 @@ efficient_estimator_dml1 <- function(dat,
       max_restart = max_restart,
       progress    = progress,
       x_info      = isTRUE(x_info),
+      prob_only   = isTRUE(prob_only),
+      aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       theta_var_method = theta_var_method,
       n_contrib_eff = sum(is.finite(contrib_all)),
@@ -3350,6 +3404,7 @@ Eff <- function(dat,
                 dml_type    = 1,
                 progress    = interactive(),
                 x_info      = TRUE,
+                prob_only   = FALSE,
                 N           = NULL) {
 
   if (!is.null(type)) dml_type <- type
@@ -3360,10 +3415,10 @@ Eff <- function(dat,
 
   if (dml_type == "DML2") {
     efficient_estimator_dml2(dat, phi_start = phi_start, K = K, max_restart = max_restart,
-                             progress = progress, x_info = x_info, N = N)
+                             progress = progress, x_info = x_info, N = N, prob_only = prob_only)
   } else {
     efficient_estimator_dml1(dat, phi_start = phi_start, K = K, max_restart = max_restart,
-                             progress = progress, x_info = x_info, N = N)
+                             progress = progress, x_info = x_info, N = N, prob_only = prob_only)
   }
 }
 
