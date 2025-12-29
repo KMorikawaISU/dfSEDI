@@ -8,8 +8,8 @@ dual-frame sampling (Morikawa & Kim, 202x).
 
 Main user-facing estimators:
 
-- `Eff` : semiparametric efficient estimator (**default: DML2**,
-  supports DML1 / DML2, K-fold; see `prob_only` below)
+- `Eff` : semiparametric efficient estimator (**default: DML1**,
+  supports DML1 / DML2, K-fold)
 - `Eff_S` : sub-efficient estimator (Remark 6-type, K-fold)
 - `Eff_P` : parametric efficient estimator (working model)
 
@@ -111,6 +111,8 @@ dfSEDI exposes this choice via the flag `x_info`:
 > dat_union <- subset(dat, d_np == 1 | d_p == 1)
 > ```
 
+------------------------------------------------------------------------
+
 ## NEW: `prob_only` in `Eff()` (estimating the augmentation terms)
 
 When `x_info = TRUE`, `Eff()` estimates the optimal augmentation
@@ -131,25 +133,28 @@ draft):
 dfSEDI exposes this choice via `prob_only`:
 
 - `prob_only = FALSE` (default): use the **combined-sample** version
-  (10)/(12) (current default behavior).
+  (10)/(12).
 - `prob_only = TRUE`: use the **probability-sample-only** version
   (9)/(11).
 
-Notes: - `prob_only` only affects the estimation of $h_4^*(X)$ and
-$\eta_4^*(X)$. The target parameter and the main estimating equations
-are unchanged. - If `x_info = FALSE`, the augmentation terms are fixed
-to zero and `prob_only` is ignored. - Trade-off: `prob_only = TRUE` uses
-fewer training points (only the probability sample), so it can be
-noisier when $n_P$ is small; `prob_only = FALSE` uses more data (union
-sample) but can be more sensitive to issues driven by the
-non-probability side.
+Notes:
+
+- `prob_only` only affects the estimation of $h_4^*(X)$ and
+  $\eta_4^*(X)$. The target parameter and the main estimating equations
+  are unchanged.
+- If `x_info = FALSE`, the augmentation terms are fixed to zero and
+  `prob_only` is ignored.
+- Trade-off: `prob_only = TRUE` uses fewer training points (only the
+  probability sample), so it can be noisier when $n_P$ is small;
+  `prob_only = FALSE` uses more training points (union sample), but
+  depends more on the combined-sample weights.
 
 ------------------------------------------------------------------------
 
 ## NEW: `nonpara_method` (nuisance regression back-end)
 
-dfSEDI estimates several nuisance functions by nonparametric regression
-(e.g., $\mu(X)=E[Y\mid X]$, $\pi_P(L)$ imputation, and the DML nuisance
+dfSEDI estimates several nuisance functions by regression (e.g.,
+$\mu(X)=E[Y\mid X]$, $\bar\pi_P(L)$ imputation, and the DML nuisance
 terms $h_4^*(X)$ / $\eta_4^*(X)$). You can now choose the regression
 back-end via `nonpara_method`:
 
@@ -160,50 +165,61 @@ back-end via `nonpara_method`:
   - RBF kernel on continuous columns
   - delta (Kronecker) kernel on categorical columns (fits separate
     models within each categorical cell)
-- `nonpara_method = "logistic KRR"`: kernel logistic regression (only
-  meaningful for **binary** response regressions, e.g. $P(Y=1\mid X)$).
+- `nonpara_method = "logistic KRR"`: kernel logistic regression (used to
+  estimate $P(Y=1\mid X)$ when `y` is binary).
 - `nonpara_method = "glmnet_linear"`: elastic-net regression via
   `glmnet` with Gaussian family.
 - `nonpara_method = "glmnet_logistic"`: elastic-net logistic regression
-  via `glmnet` with binomial family.
+  via `glmnet` with binomial family (used for $P(Y=1\mid X)$ when `y` is
+  binary).
+- `nonpara_method = "RF_cont"`: random forest **regression** (continuous
+  outcome), using `ranger` if available (fast) and falling back to
+  `randomForest` if not.
+- `nonpara_method = "RF_binom"`: random forest **classification** for
+  $P(Y=1\mid X)$, using `ranger` if available and falling back to
+  `randomForest` if not.
 
 Important notes:
 
 - `glmnet_*` requires the `glmnet` package
   (`install.packages("glmnet")`).
-- In `Eff()` with **binary** `y` (and `x_info = TRUE`), `"logistic KRR"`
-  / `"glmnet_logistic"` are used to fit $p(X)=P(Y=1\mid X)$, and the
-  needed conditional expectations are evaluated via
-  $E\{g(X,Y)\mid X\}=g(X,0)\{1-p(X)\}+g(X,1)p(X)$. (If `y` is not
-  binary, logistic methods fall back to the corresponding continuous
-  methods.)
-- In `Eff()`, the $\pi_P(L)$ imputation step regresses a **continuous**
-  target $1/\pi_P$, so if you set `nonpara_method = "logistic KRR"` or
-  `"glmnet_logistic"`, dfSEDI internally uses `"KRR"` or
-  `"glmnet_linear"` for that imputation step (with a warning).
-- In `Eff_S()`, $\mu(X)=E[Y\mid X]$ can be fit using `"logistic KRR"` or
-  `"glmnet_logistic"` when `y` is binary.
+- `RF_*` requires either `ranger` (**recommended**) or `randomForest`
+  (`install.packages("ranger")`).
+- For **continuous** regression tasks, the binomial-only methods
+  (`"logistic KRR"`, `"glmnet_logistic"`, `"RF_binom"`) automatically
+  fall back to their continuous counterparts with a warning.
+- For **binary** `y` in `Eff()`, selecting `"logistic KRR"`,
+  `"glmnet_logistic"`, or `"RF_binom"` uses the **binary-mixture**
+  strategy:
+  1)  estimate $p(X)=P(Y=1\mid X)$, then  
+  2)  compute the conditional expectations by mixing the $Y=0$ and $Y=1$
+      expressions.
+- For **binary** `y` in `Eff()`, selecting `"KRR"`, `"mixed KRR"`,
+  `"glmnet_linear"`, or `"RF_cont"` uses the **direct** strategy (treat
+  `y` as numeric 0/1) and directly regresses the required
+  numerator/denominator pseudo-outcomes.
 
 Example usage:
 
 ``` r
 # Efficient estimator (DML): choose the nuisance regression back-end
-fit_eff_krr    <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "KRR")
-fit_eff_mixed  <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "mixed KRR")
-fit_eff_glmnet <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "glmnet_linear")
-fit_eff_glmnet_logit <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "glmnet_logistic")
+fit_eff_krr     <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "KRR")
+fit_eff_mixed   <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "mixed KRR")
+fit_eff_glmnet  <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "glmnet_linear")
+fit_eff_rf      <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "RF_cont")
 
-# Sub-efficient estimator: binary y can use logistic methods
-fit_effS_logit_krr <- Eff_S(dat, K = 2, x_info = TRUE, nonpara_method = "logistic KRR")
-fit_effS_glmnet    <- Eff_S(dat, K = 2, x_info = TRUE, nonpara_method = "glmnet_logistic")
+# If y is binary and you want to use a probability model P(Y=1|X):
+fit_eff_logit   <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "logistic KRR")
+fit_eff_glmnetL <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "glmnet_logistic")
+fit_eff_rfL     <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_method = "RF_binom")
 ```
 
 ## Mixed continuous/discrete covariates (automatic)
 
 > Note: The mixed-type (RBF × delta) product-kernel behavior below is
 > used when you set `nonpara_method = "mixed KRR"`. If you set
-> `nonpara_method = "KRR"` (plain RBF on all columns) or `"glmnet_*"`
-> (elastic-net), dfSEDI will not use the delta kernel.
+> `nonpara_method = "KRR"` (plain RBF on all columns) or `"glmnet_*"` /
+> `"RF_*"`, dfSEDI will not use the delta kernel.
 
 dfSEDI estimates nuisance functions (e.g., $\mu(X)=E[Y\mid X]$, $\pi_P$,
 $\eta_4^*(X)$, $h_4^*(X)$) using kernel methods.
@@ -330,7 +346,7 @@ observe the union sample:
 ``` r
 dat_union <- subset(dat, d_np == 1 | d_p == 1)
 
-# Eff uses DML2 by default.
+# Eff uses DML1 by default (faster).
 fit_eff_union <- Eff(
   dat         = dat_union,
   K           = 2,
@@ -351,12 +367,11 @@ For simulation studies where you keep the full population-like data
 structure:
 
 ``` r
-# Eff uses DML2 by default.
+# Eff uses DML1 by default (faster).
 fit_eff_full <- Eff(
   dat         = dat,
   K           = 2,
   x_info      = TRUE,
-  prob_only   = FALSE,  # default: combined-sample augmentation (10)/(12)
   progress    = TRUE
 )
 
@@ -364,20 +379,6 @@ fit_eff_full$theta
 fit_eff_full$se
 fit_eff_full$ci
 fit_eff_full$info
-
-# Probability-sample-only augmentation (9)/(11)
-fit_eff_full_prob_only <- Eff(
-  dat         = dat,
-  K           = 2,
-  x_info      = TRUE,
-  prob_only   = TRUE,
-  progress    = TRUE
-)
-
-fit_eff_full_prob_only$theta
-fit_eff_full_prob_only$se
-fit_eff_full_prob_only$ci
-fit_eff_full_prob_only$info
 ```
 
 ------------------------------------------------------------------------
@@ -386,9 +387,7 @@ fit_eff_full_prob_only$info
 
 The example script `inst/examples/dualframe_simulation.R` also defines:
 
-- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, prob_only, nonpara_method, ...)`
-- `run_mc_union(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, prob_only, nonpara_method, ...)`
-  (runs only `Eff1_union` / `Eff2_union`)
+- `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, ...)`
 - `summarize_mc(res, theta_true = 0)`
 
 `run_mc()` returns a long-format data frame (one row per replication ×
@@ -411,21 +410,6 @@ The typical columns are:
 - `theta`, `se`, `ci_l`, `ci_u`
 - `n_np`, `n_p`, `n_union`
 - `error`
-- (NEW) `phi_1..phi_4`, `phi_se_1..phi_se_4`, `phi_ci_l_1..phi_ci_l_4`,
-  `phi_ci_u_1..phi_ci_u_4` (filled with `NA` when not available)
-
-NEW in this example script:
-
-- `prob_only` is passed through to `Eff()` inside `run_mc()` /
-  `run_mc_union()`.  
-  Set `prob_only = TRUE` to use the probability-sample-only augmentation
-  (9)/(11); default is `FALSE` (combined-sample augmentation (10)/(12)).
-- (NEW) `nonpara_method` is passed through to `Eff()` (and `Eff_S()`
-  where relevant) inside `run_mc()` / `run_mc_union()`.  
-  See the `nonpara_method` section above for available options.
-- `Scenario` can be `1:4` (or `"S1"`–`"S4"`). Scenario 4 duplicates
-  overlap units to mimic the no-record-linkage setting (see Remark 1 /
-  Section 6.2 in the paper).
 
 ### Serial MC (built-in progress bar)
 
@@ -442,8 +426,7 @@ res <- run_mc(
   K = 2,
   seed_start = 1,
   show_progress = TRUE,
-  progress_each_fit = FALSE,
-  nonpara_method = "KRR"
+  progress_each_fit = FALSE
 )
 
 summarize_mc(res, theta_true = 0)
@@ -596,4 +579,7 @@ summarize_mc(res_par, theta_true = 0)
 Notes: - In the parallel examples above, we run one replication per
 seed, and the progress bar is shown in the master process. - If you want
 to list optional packages in DESCRIPTION, add: - `pbapply` (progress bar
-for PSOCK clusters; works on Windows/macOS/Linux)
+for PSOCK clusters; works on Windows/macOS/Linux) - `glmnet` (needed
+when you use `nonpara_method = "glmnet_*"`) - `ranger` (recommended;
+needed when you use `nonpara_method = "RF_*"`) - (optional fallback)
+`randomForest` can also be used if `ranger` is not installed
