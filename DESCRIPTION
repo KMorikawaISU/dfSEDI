@@ -35,9 +35,11 @@ Imports:
     utils,
     pbapply,
     parallel,
-    glmnet
+    glmnet,
+    ranger
 Suggests:
     knitr,
-    rmarkdown
+    rmarkdown,
+    randomForest
 VignetteBuilder: knitr
 RoxygenNote: 7.3.3

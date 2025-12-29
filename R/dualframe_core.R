@@ -440,9 +440,22 @@ df_match_nonpara_method <- function(nonpara_method) {
     return("glmnet_logistic")
   }
 
+  # Random forest (two explicit variants so that the
+  # nuisance strategy is unambiguous):
+  #  - RF_cont : regression (directly regress the numerator/denominator pseudo outcomes)
+  #  - RF_binom: classification (estimate P(Y=1|X) and use the binary mixture formula)
+  if (nm0 %in% c("rf_cont", "rf cont", "rf regression", "random forest", "random forest cont",
+                 "random forest regression", "rf gaussian", "rf continuous")) {
+    return("RF_cont")
+  }
+  if (nm0 %in% c("rf_binom", "rf binom", "rf logistic", "rf logit", "random forest binom",
+                 "random forest classification", "random forest classifier")) {
+    return("RF_binom")
+  }
+
   stop(
     "Unknown nonpara_method: `", nm, "`.\n",
-    "Allowed: 'KRR', 'mixed KRR', 'logistic KRR', 'glmnet_linear', 'glmnet_logistic'.",
+    "Allowed: 'KRR', 'mixed KRR', 'logistic KRR', 'glmnet_linear', 'glmnet_logistic', 'RF_cont', 'RF_binom'.",
     call. = FALSE
   )
 }
@@ -1387,11 +1400,181 @@ df_glmnet_predict <- function(X_train, y_train, X_test, family = c("gaussian", "
   pred
 }
 
+############################################################
+## NEW: Random forest (optional) + unified wrappers
+############################################################
+
+# Simple mean-imputation for RF engines that cannot handle NA/Inf.
+df_rf_impute_mats <- function(X_train, X_test) {
+  X_train <- as.matrix(X_train)
+  X_test  <- as.matrix(X_test)
+
+  if (nrow(X_train) < 1L) return(list(X_train = X_train, X_test = X_test))
+
+  X_train[!is.finite(X_train)] <- NA_real_
+  X_test[!is.finite(X_test)]   <- NA_real_
+
+  cm <- suppressWarnings(colMeans(X_train, na.rm = TRUE))
+  cm[!is.finite(cm)] <- 0
+
+  for (j in seq_len(ncol(X_train))) {
+    if (anyNA(X_train[, j])) X_train[is.na(X_train[, j]), j] <- cm[j]
+    if (anyNA(X_test[, j]))  X_test[is.na(X_test[, j]), j]   <- cm[j]
+  }
+
+  list(X_train = X_train, X_test = X_test)
+}
+
+# RF regression (continuous outcome).
+df_rf_predict_gaussian <- function(X_train, y_train, X_test,
+                                   num.trees = NULL, mtry = NULL, min.node.size = NULL,
+                                   seed = NULL) {
+  X_train <- as.matrix(X_train)
+  X_test  <- as.matrix(X_test)
+  y_train <- as.numeric(y_train)
+
+  nte <- nrow(X_test)
+  if (nte == 0L) return(numeric(0))
+
+  keep <- is.finite(y_train)
+  X_tr <- X_train[keep, , drop = FALSE]
+  y_tr <- y_train[keep]
+
+  ntr <- nrow(X_tr)
+  if (ntr < 1L) return(rep(NA_real_, nte))
+
+  # If no variation, return constant.
+  u <- unique(y_tr[is.finite(y_tr)])
+  if (length(u) < 2L) return(rep(mean(y_tr), nte))
+
+  if (is.null(num.trees)) num.trees <- getOption("dfSEDI.rf_num_trees", 500L)
+  num.trees <- as.integer(num.trees)[1]
+  if (!is.finite(num.trees) || num.trees < 50L) num.trees <- 500L
+
+  if (!is.null(seed)) seed <- as.integer(seed)[1]
+
+  imp <- df_rf_impute_mats(X_tr, X_test)
+  X_tr <- imp$X_train
+  X_te <- imp$X_test
+
+  # Prefer ranger (fast); fallback to randomForest.
+  if (requireNamespace("ranger", quietly = TRUE)) {
+    df_tr <- data.frame(y = y_tr, as.data.frame(X_tr))
+    df_te <- as.data.frame(X_te)
+
+    fit <- ranger::ranger(
+      y ~ .,
+      data = df_tr,
+      num.trees = num.trees,
+      mtry = mtry,
+      min.node.size = min.node.size,
+      seed = seed
+    )
+    return(as.numeric(predict(fit, data = df_te)$predictions))
+  }
+
+  if (requireNamespace("randomForest", quietly = TRUE)) {
+    fit <- randomForest::randomForest(
+      x = X_tr,
+      y = y_tr,
+      ntree = num.trees,
+      mtry = mtry
+    )
+    return(as.numeric(stats::predict(fit, X_te)))
+  }
+
+  stop(
+    "dfSEDI: nonpara_method='RF_*' requires either the 'ranger' or 'randomForest' package. ",
+    "Please install one of them (install.packages('ranger') is recommended).",
+    call. = FALSE
+  )
+}
+
+# RF classification (binary outcome): returns P(Y=1|X).
+df_rf_predict_binomial <- function(X_train, y01_train, X_test,
+                                   num.trees = NULL, mtry = NULL, min.node.size = NULL,
+                                   seed = NULL) {
+  X_train <- as.matrix(X_train)
+  X_test  <- as.matrix(X_test)
+  y01_train <- as.numeric(y01_train)
+
+  nte <- nrow(X_test)
+  if (nte == 0L) return(numeric(0))
+
+  keep <- is.finite(y01_train)
+  X_tr <- X_train[keep, , drop = FALSE]
+  y_tr <- y01_train[keep]
+
+  ntr <- nrow(X_tr)
+  if (ntr < 1L) return(rep(NA_real_, nte))
+
+  u <- unique(y_tr[is.finite(y_tr)])
+  if (length(u) < 2L) {
+    p0 <- df_clip_prob(mean(y_tr))
+    return(rep(p0, nte))
+  }
+
+  if (is.null(num.trees)) num.trees <- getOption("dfSEDI.rf_num_trees", 500L)
+  num.trees <- as.integer(num.trees)[1]
+  if (!is.finite(num.trees) || num.trees < 50L) num.trees <- 500L
+
+  if (!is.null(seed)) seed <- as.integer(seed)[1]
+
+  imp <- df_rf_impute_mats(X_tr, X_test)
+  X_tr <- imp$X_train
+  X_te <- imp$X_test
+
+  y_fac <- factor(ifelse(as.numeric(y_tr) == 1, "1", "0"), levels = c("0", "1"))
+
+  if (requireNamespace("ranger", quietly = TRUE)) {
+    df_tr <- data.frame(y = y_fac, as.data.frame(X_tr))
+    df_te <- as.data.frame(X_te)
+
+    fit <- ranger::ranger(
+      y ~ .,
+      data = df_tr,
+      probability = TRUE,
+      num.trees = num.trees,
+      mtry = mtry,
+      min.node.size = min.node.size,
+      seed = seed
+    )
+    pr <- predict(fit, data = df_te)$predictions
+    if (is.matrix(pr) && ("1" %in% colnames(pr))) {
+      return(df_clip_prob(as.numeric(pr[, "1"])))
+    }
+    # Fallback: try last column
+    if (is.matrix(pr)) return(df_clip_prob(as.numeric(pr[, ncol(pr)])))
+    return(df_clip_prob(as.numeric(pr)))
+  }
+
+  if (requireNamespace("randomForest", quietly = TRUE)) {
+    fit <- randomForest::randomForest(
+      x = X_tr,
+      y = y_fac,
+      ntree = num.trees,
+      mtry = mtry
+    )
+    pr <- stats::predict(fit, X_te, type = "prob")
+    if (is.matrix(pr) && ("1" %in% colnames(pr))) {
+      return(df_clip_prob(as.numeric(pr[, "1"])))
+    }
+    if (is.matrix(pr)) return(df_clip_prob(as.numeric(pr[, ncol(pr)])))
+    return(df_clip_prob(as.numeric(pr)))
+  }
+
+  stop(
+    "dfSEDI: nonpara_method='RF_*' requires either the 'ranger' or 'randomForest' package. ",
+    "Please install one of them (install.packages('ranger') is recommended).",
+    call. = FALSE
+  )
+}
+
 # Prepare KRR/mixed-KRR kernels depending on `nonpara_method`.
 df_np_prepare <- function(X_train, sigma = NULL, nonpara_method = "KRR", context = "nuisance regression") {
   method <- df_match_nonpara_method(nonpara_method)
 
-  if (method %in% c("glmnet_linear", "glmnet_logistic")) return(NULL)
+  if (method %in% c("glmnet_linear", "glmnet_logistic", "RF_cont", "RF_binom")) return(NULL)
 
   # 'mixed KRR' => infer categorical columns (delta kernel).
   # otherwise => treat all columns as continuous (plain RBF kernel on the full design).
@@ -1426,8 +1609,20 @@ df_np_predict_gaussian <- function(X_train, y_train, X_test, prep = NULL, sigma 
     method <- "KRR"
   }
 
+  if (identical(method, "RF_binom")) {
+    df_warn_once(
+      paste0("dfSEDI_RF_binom_fallback_", context),
+      paste0("dfSEDI warning: nonpara_method='RF_binom' was requested for a continuous target in ", context, ". Using RF_cont instead.")
+    )
+    method <- "RF_cont"
+  }
+
   if (identical(method, "glmnet_linear")) {
     return(df_glmnet_predict(X_train, y_train, X_test, family = "gaussian"))
+  }
+
+  if (identical(method, "RF_cont")) {
+    return(df_rf_predict_gaussian(X_train, y_train, X_test))
   }
 
   if (is.null(prep)) {
@@ -1465,12 +1660,24 @@ df_np_predict_binomial <- function(X_train, y_train, X_test, prep = NULL, sigma 
     return(rep(p0, nrow(X_test)))
   }
 
+  if (identical(method, "RF_binom")) {
+    return(df_rf_predict_binomial(X_train, y01, X_test))
+  }
+
   if (identical(method, "glmnet_logistic")) {
     return(df_glmnet_predict(X_train, y01, X_test, family = "binomial"))
   }
 
   if (identical(method, "glmnet_linear")) {
     return(df_clip_prob(df_glmnet_predict(X_train, y01, X_test, family = "gaussian")))
+  }
+
+  if (identical(method, "RF_cont")) {
+    df_warn_once(
+      paste0("dfSEDI_RF_cont_for_binomial_", context),
+      paste0("dfSEDI warning: nonpara_method='RF_cont' was requested for a binary target in ", context, ". Fitting RF regression to {0,1} and clipping to [0,1]. Consider RF_binom instead.")
+    )
+    return(df_clip_prob(df_rf_predict_gaussian(X_train, y01, X_test)))
   }
 
   if (method %in% c("KRR", "mixed KRR")) {
@@ -1782,7 +1989,17 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL, nonpara_method = "
     method <- "KRR"
   }
 
-  if (identical(method, "glmnet_linear")) {
+  if (identical(method, "RF_binom")) {
+    df_warn_once(
+      "dfSEDI_pi_p_RF_binom_fallback",
+      "dfSEDI warning: nonpara_method='RF_binom' was requested for pi_p imputation (continuous target). Using RF_cont instead."
+    )
+    method <- "RF_cont"
+  }
+
+  if (identical(method, "RF_cont")) {
+    reg_pred <- df_rf_predict_gaussian(L_obs, 1 / pi_p_obs, as.matrix(new_L))
+  } else if (identical(method, "glmnet_linear")) {
     reg_pred <- df_glmnet_predict(L_obs, 1 / pi_p_obs, as.matrix(new_L), family = "gaussian")
   } else {
     # KRR / mixed KRR
@@ -1838,6 +2055,8 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
   l_obs <- as.matrix(l_obs)
   pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
 
+  method <- df_match_nonpara_method(nonpara_method)
+
   p_dim <- length(phi)
 
   # If the training sample is empty, return zeros (valid but less efficient).
@@ -1846,93 +2065,80 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
     return(matrix(0, nrow = nrow(new_X), ncol = p_dim))
   }
 
-  # If Y is binary and a logistic nonpara_method is requested, estimate
-  # E[g(X,Y)|X] via the mixture formula
-  #   E[g(X,Y)|X] = g(X,y0)*(1-p(X)) + g(X,y1)*p(X),
-  # where p(X)=P(Y=y1|X) is estimated by logistic KRR or glmnet_logistic.
-  #
-  # This is an alternative nuisance strategy to the default (directly regressing
-  # numerator/denominator pseudo-outcomes on X).
-  method <- df_match_nonpara_method(nonpara_method)
+  # If Y is binary and a binomial-type method is requested, we can compute
+  # E[g(X,Y)|X] using the binary mixture formula:
+  #   E[g(X,Y)|X] = g(X,y0)*(1-p(X)) + g(X,y1)*p(X)
+  # where p(X)=P(Y=y1|X).
   y_obs_here <- as.numeric(l_obs[, ncol(l_obs)])
-  if (method %in% c("logistic KRR", "glmnet_logistic") && df_is_binary_y(y_obs_here)) {
+  use_binom_mixture <- (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs_here)
+
+  if (isTRUE(use_binom_mixture)) {
+    if (is.null(p_hat_new)) {
+      stop("eta4*(X;phi): binomial nonpara_method requires p_hat_new (P(Y=1|X) predictions) to be precomputed and passed in.", call. = FALSE)
+    }
+    if (is.null(pi_p_new)) {
+      stop("eta4*(X;phi): binomial nonpara_method requires pi_p_new (pi_p values for new_X) to be passed in.", call. = FALSE)
+    }
+
     n_new <- nrow(new_X)
 
-    # p_hat_new: P(Y=y1 | X=new_X)
-    if (is.null(p_hat_new)) {
-      p_hat_new <- df_np_predict_binomial(
-        X_train = X_obs,
-        y_train = y_obs_here,
-        X_test  = new_X,
-        prep    = NULL,
-        sigma   = NULL,
-        nonpara_method = method,
-        context = "P(Y=1|X) nuisance regression for eta4*(X;phi)"
-      )
+    p_hat <- df_clip_prob(as.numeric(p_hat_new))
+    if (length(p_hat) != n_new) {
+      stop("eta4*(X;phi): length(p_hat_new) must match nrow(new_X).", call. = FALSE)
     }
-    p_hat_new <- as.numeric(p_hat_new)
-    if (length(p_hat_new) == 1L) p_hat_new <- rep(p_hat_new, n_new)
-    if (length(p_hat_new) != n_new) {
-      stop("estimate_conditional_expectation_kernlab_phi_core(): length(p_hat_new) must equal nrow(new_X).", call. = FALSE)
+    bad_p <- !is.finite(p_hat)
+    if (any(bad_p)) {
+      bin_tr <- df_as_binary01(y_obs_here)
+      p0 <- df_clip_prob(mean(bin_tr$y01))
+      p_hat[bad_p] <- p0
     }
-    p_hat_new <- df_clip_prob(p_hat_new)
 
-    # pi_p_new (needed to evaluate O_{NP∪P} / pi_P or O_{NP∪P} / pi_{NP∪P} at (X,y)).
-    pibar <- mean(pi_p_obs[is.finite(pi_p_obs)], na.rm = TRUE)
-    if (!is.finite(pibar)) pibar <- 0.5
-    if (is.null(pi_p_new)) {
-      pi_p_new <- rep(pibar, n_new)
+    pi_pn <- df_clip_prob(as.numeric(pi_p_new))
+    if (length(pi_pn) != n_new) {
+      stop("eta4*(X;phi): length(pi_p_new) must match nrow(new_X).", call. = FALSE)
+    }
+    bad_pi <- !is.finite(pi_pn)
+    if (any(bad_pi)) pi_pn[bad_pi] <- mean(pi_p_obs)
+
+    y_vals <- sort(unique(y_obs_here[is.finite(y_obs_here)]))
+    if (length(y_vals) != 2L) {
+      stop("eta4*(X;phi): y is not binary (need exactly 2 distinct finite values) even though a binomial method was selected.", call. = FALSE)
+    }
+    y0 <- y_vals[1]
+    y1 <- y_vals[2]
+
+    l0 <- df_make_l_matrix(new_X, rep(y0, n_new))
+    l1 <- df_make_l_matrix(new_X, rep(y1, n_new))
+
+    eta0 <- as.numeric(l0 %*% phi)
+    eta1 <- as.numeric(l1 %*% phi)
+    pi_np0 <- df_clip_prob(1 / (1 + exp(-eta0)))
+    pi_np1 <- df_clip_prob(1 / (1 + exp(-eta1)))
+
+    pi_np_p0 <- df_clip_prob(pi_pn + pi_np0 - pi_pn * pi_np0)
+    pi_np_p1 <- df_clip_prob(pi_pn + pi_np1 - pi_pn * pi_np1)
+
+    if (isTRUE(prob_only)) {
+      Denom0 <- (1 - pi_np_p0) / (pi_np_p0 * pi_pn)
+      Denom1 <- (1 - pi_np_p1) / (pi_np_p1 * pi_pn)
     } else {
-      pi_p_new <- as.numeric(pi_p_new)
-      if (length(pi_p_new) == 1L) pi_p_new <- rep(pi_p_new, n_new)
-      if (length(pi_p_new) != n_new) {
-        stop("estimate_conditional_expectation_kernlab_phi_core(): length(pi_p_new) must equal nrow(new_X).", call. = FALSE)
-      }
-      pi_p_new <- df_clip_prob(pi_p_new)
-      pi_p_new[!is.finite(pi_p_new)] <- pibar
+      Denom0 <- (1 - pi_np_p0) / (pi_np_p0 ^ 2)
+      Denom1 <- (1 - pi_np_p1) / (pi_np_p1 ^ 2)
     }
 
-    # Binary support values (on the numeric scale used in l_obs).
-    u <- sort(unique(y_obs_here[is.finite(y_obs_here)]))
-    if (length(u) == 2L) {
-      y0 <- u[1]
-      y1 <- u[2]
+    Denom_new <- Denom0 * (1 - p_hat) + Denom1 * p_hat
+    Denom_new <- df_floor_pos(as.numeric(Denom_new))
 
-      l0 <- cbind(1, new_X, rep(y0, n_new))
-      l1 <- cbind(1, new_X, rep(y1, n_new))
+    coef0 <- -pi_np0 * as.numeric(Denom0)
+    coef1 <- -pi_np1 * as.numeric(Denom1)
+    Numer0 <- l0 * coef0
+    Numer1 <- l1 * coef1
+    Numer_new <- Numer0 * (1 - p_hat) + Numer1 * p_hat
 
-      eta0 <- as.numeric(l0 %*% phi)
-      eta1 <- as.numeric(l1 %*% phi)
-      pi_np0 <- df_clip_prob(df_sigmoid(eta0))
-      pi_np1 <- df_clip_prob(df_sigmoid(eta1))
-
-      pi_np_p0 <- df_clip_prob(pi_p_new + pi_np0 - pi_p_new * pi_np0)
-      pi_np_p1 <- df_clip_prob(pi_p_new + pi_np1 - pi_p_new * pi_np1)
-
-      if (isTRUE(prob_only)) {
-        Den0 <- (1 - pi_np_p0) / (pi_np_p0 * pi_p_new)
-        Den1 <- (1 - pi_np_p1) / (pi_np_p1 * pi_p_new)
-      } else {
-        Den0 <- (1 - pi_np_p0) / (pi_np_p0 ^ 2)
-        Den1 <- (1 - pi_np_p1) / (pi_np_p1 ^ 2)
-      }
-
-      Den0 <- as.numeric(Den0)
-      Den1 <- as.numeric(Den1)
-
-      # Numer matrices at y0,y1: -pi_np * Den * l
-      Num0 <- l0 * (-pi_np0 * Den0)
-      Num1 <- l1 * (-pi_np1 * Den1)
-
-      denom_pred <- Den1 * p_hat_new + Den0 * (1 - p_hat_new)
-      denom_pred <- df_floor_pos(denom_pred)
-
-      numer_pred <- Num1 * p_hat_new + Num0 * (1 - p_hat_new)
-
-      return(sweep(numer_pred, 1, denom_pred, "/"))
-    }
+    return(sweep(Numer_new, 1, Denom_new, "/"))
   }
 
+  # Default strategy: directly regress the numerator/denominator pseudo outcomes.
   eta   <- as.numeric(l_obs %*% phi)
   pi_np <- df_clip_prob(1 / (1 + exp(-eta)))
 
@@ -2002,86 +2208,76 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
   pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
   y_obs <- as.numeric(y_obs)
 
+  method <- df_match_nonpara_method(nonpara_method)
+
   # If the training sample is empty, return zeros (valid but less efficient).
   if (nrow(X_obs) < 1L) {
     return(rep(0, nrow(new_X)))
   }
 
-  # Binary Y + logistic nonpara_method: compute conditional expectations by
-  # enumerating y in {y0,y1} and mixing with p_hat(X)=P(Y=y1|X).
-  method <- df_match_nonpara_method(nonpara_method)
-  if (method %in% c("logistic KRR", "glmnet_logistic") && df_is_binary_y(y_obs)) {
+  use_binom_mixture <- (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+  if (isTRUE(use_binom_mixture)) {
+    if (is.null(p_hat_new)) {
+      stop("h4*(X;phi): binomial nonpara_method requires p_hat_new (P(Y=1|X) predictions) to be precomputed and passed in.", call. = FALSE)
+    }
+    if (is.null(pi_p_new)) {
+      stop("h4*(X;phi): binomial nonpara_method requires pi_p_new (pi_p values for new_X) to be passed in.", call. = FALSE)
+    }
+
     n_new <- nrow(new_X)
 
-    if (is.null(p_hat_new)) {
-      p_hat_new <- df_np_predict_binomial(
-        X_train = X_obs,
-        y_train = y_obs,
-        X_test  = new_X,
-        prep    = NULL,
-        sigma   = NULL,
-        nonpara_method = method,
-        context = "P(Y=1|X) nuisance regression for h4*(X;phi)"
-      )
+    p_hat <- df_clip_prob(as.numeric(p_hat_new))
+    if (length(p_hat) != n_new) {
+      stop("h4*(X;phi): length(p_hat_new) must match nrow(new_X).", call. = FALSE)
     }
-    p_hat_new <- as.numeric(p_hat_new)
-    if (length(p_hat_new) == 1L) p_hat_new <- rep(p_hat_new, n_new)
-    if (length(p_hat_new) != n_new) {
-      stop("estimate_conditional_expectation_kernlab_theta_core(): length(p_hat_new) must equal nrow(new_X).", call. = FALSE)
+    bad_p <- !is.finite(p_hat)
+    if (any(bad_p)) {
+      bin_tr <- df_as_binary01(y_obs)
+      p0 <- df_clip_prob(mean(bin_tr$y01))
+      p_hat[bad_p] <- p0
     }
-    p_hat_new <- df_clip_prob(p_hat_new)
 
-    pibar <- mean(pi_p_obs[is.finite(pi_p_obs)], na.rm = TRUE)
-    if (!is.finite(pibar)) pibar <- 0.5
-    if (is.null(pi_p_new)) {
-      pi_p_new <- rep(pibar, n_new)
+    pi_pn <- df_clip_prob(as.numeric(pi_p_new))
+    if (length(pi_pn) != n_new) {
+      stop("h4*(X;phi): length(pi_p_new) must match nrow(new_X).", call. = FALSE)
+    }
+    bad_pi <- !is.finite(pi_pn)
+    if (any(bad_pi)) pi_pn[bad_pi] <- mean(pi_p_obs)
+
+    y_vals <- sort(unique(y_obs[is.finite(y_obs)]))
+    if (length(y_vals) != 2L) {
+      stop("h4*(X;phi): y is not binary (need exactly 2 distinct finite values) even though a binomial method was selected.", call. = FALSE)
+    }
+    y0 <- y_vals[1]
+    y1 <- y_vals[2]
+
+    l0 <- df_make_l_matrix(new_X, rep(y0, n_new))
+    l1 <- df_make_l_matrix(new_X, rep(y1, n_new))
+
+    eta0 <- as.numeric(l0 %*% phi)
+    eta1 <- as.numeric(l1 %*% phi)
+    pi_np0 <- df_clip_prob(1 / (1 + exp(-eta0)))
+    pi_np1 <- df_clip_prob(1 / (1 + exp(-eta1)))
+
+    pi_np_p0 <- df_clip_prob(pi_pn + pi_np0 - pi_pn * pi_np0)
+    pi_np_p1 <- df_clip_prob(pi_pn + pi_np1 - pi_pn * pi_np1)
+
+    if (isTRUE(prob_only)) {
+      Denom0 <- (1 - pi_np_p0) / (pi_np_p0 * pi_pn)
+      Denom1 <- (1 - pi_np_p1) / (pi_np_p1 * pi_pn)
     } else {
-      pi_p_new <- as.numeric(pi_p_new)
-      if (length(pi_p_new) == 1L) pi_p_new <- rep(pi_p_new, n_new)
-      if (length(pi_p_new) != n_new) {
-        stop("estimate_conditional_expectation_kernlab_theta_core(): length(pi_p_new) must equal nrow(new_X).", call. = FALSE)
-      }
-      pi_p_new <- df_clip_prob(pi_p_new)
-      pi_p_new[!is.finite(pi_p_new)] <- pibar
+      Denom0 <- (1 - pi_np_p0) / (pi_np_p0 ^ 2)
+      Denom1 <- (1 - pi_np_p1) / (pi_np_p1 ^ 2)
     }
 
-    u <- sort(unique(y_obs[is.finite(y_obs)]))
-    if (length(u) == 2L) {
-      y0 <- u[1]
-      y1 <- u[2]
+    Denom_new <- Denom0 * (1 - p_hat) + Denom1 * p_hat
+    Denom_new <- df_floor_pos(as.numeric(Denom_new))
 
-      l0 <- cbind(1, new_X, rep(y0, n_new))
-      l1 <- cbind(1, new_X, rep(y1, n_new))
+    Numer0 <- -y0 * as.numeric(Denom0)
+    Numer1 <- -y1 * as.numeric(Denom1)
+    Numer_new <- Numer0 * (1 - p_hat) + Numer1 * p_hat
 
-      eta0 <- as.numeric(l0 %*% phi)
-      eta1 <- as.numeric(l1 %*% phi)
-      pi_np0 <- df_clip_prob(df_sigmoid(eta0))
-      pi_np1 <- df_clip_prob(df_sigmoid(eta1))
-
-      pi_np_p0 <- df_clip_prob(pi_p_new + pi_np0 - pi_p_new * pi_np0)
-      pi_np_p1 <- df_clip_prob(pi_p_new + pi_np1 - pi_p_new * pi_np1)
-
-      if (isTRUE(prob_only)) {
-        Den0 <- (1 - pi_np_p0) / (pi_np_p0 * pi_p_new)
-        Den1 <- (1 - pi_np_p1) / (pi_np_p1 * pi_p_new)
-      } else {
-        Den0 <- (1 - pi_np_p0) / (pi_np_p0 ^ 2)
-        Den1 <- (1 - pi_np_p1) / (pi_np_p1 ^ 2)
-      }
-
-      Den0 <- as.numeric(Den0)
-      Den1 <- as.numeric(Den1)
-
-      Num0 <- -y0 * Den0
-      Num1 <- -y1 * Den1
-
-      denom_pred <- Den1 * p_hat_new + Den0 * (1 - p_hat_new)
-      denom_pred <- df_floor_pos(denom_pred)
-
-      numer_pred <- Num1 * p_hat_new + Num0 * (1 - p_hat_new)
-
-      return(as.numeric(numer_pred / denom_pred))
-    }
+    return(as.numeric(Numer_new / Denom_new))
   }
 
   eta   <- as.numeric(l_obs %*% phi)
@@ -2831,22 +3027,30 @@ efficient_estimator_dml2 <- function(dat,
 
   nonpara_method <- df_match_nonpara_method(nonpara_method)
 
-  # pi_p imputation is a continuous regression (the target is 1/pi_p), so we map
-  # logistic-only methods to continuous ones here (once).
-  nonpara_method_pi_p <- nonpara_method
-  if (identical(nonpara_method_pi_p, "glmnet_logistic")) {
+  # nonpara_method is used for eta4*(X;phi) and h4*(X;phi) nuisances.
+  # pi_p(L) imputation is always a *continuous* regression, so logistic-only and RF_binom
+  # are mapped to reasonable continuous counterparts for that step.
+  nonpara_method_pi <- nonpara_method
+  if (identical(nonpara_method_pi, "glmnet_logistic")) {
     df_warn_once(
-      "dfSEDI_Eff_pi_p_glmnet_logistic_fallback",
-      "dfSEDI warning: nonpara_method='glmnet_logistic' was requested. pi_p imputation is a continuous regression, so using glmnet_linear for pi_p imputation."
+      "dfSEDI_Eff_pi_glmnet_logistic_fallback",
+      "dfSEDI warning: nonpara_method='glmnet_logistic' was requested for Eff(), but pi_p imputation is continuous; using glmnet_linear instead."
     )
-    nonpara_method_pi_p <- "glmnet_linear"
+    nonpara_method_pi <- "glmnet_linear"
   }
-  if (identical(nonpara_method_pi_p, "logistic KRR")) {
+  if (identical(nonpara_method_pi, "logistic KRR")) {
     df_warn_once(
-      "dfSEDI_Eff_pi_p_logistic_krr_fallback",
-      "dfSEDI warning: nonpara_method='logistic KRR' was requested. pi_p imputation is a continuous regression, so using KRR for pi_p imputation."
+      "dfSEDI_Eff_pi_logistic_krr_fallback",
+      "dfSEDI warning: nonpara_method='logistic KRR' was requested for Eff(), but pi_p imputation is continuous; using KRR instead."
     )
-    nonpara_method_pi_p <- "KRR"
+    nonpara_method_pi <- "KRR"
+  }
+  if (identical(nonpara_method_pi, "RF_binom")) {
+    df_warn_once(
+      "dfSEDI_Eff_pi_RF_binom_fallback",
+      "dfSEDI warning: nonpara_method='RF_binom' was requested for Eff(), but pi_p imputation is continuous; using RF_cont instead."
+    )
+    nonpara_method_pi <- "RF_cont"
   }
 
   n <- nrow(dat)
@@ -2875,7 +3079,7 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   folds <- make_folds(n, K)
-  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress, nonpara_method = nonpara_method_pi_p)
+  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress, nonpara_method = nonpara_method_pi)
 
   # Build fold caches (output-preserving): precompute X_test/l_test and train prep for eta4*/h4*
   make_fold_cache <- function(idx_test, idx_train) {
@@ -2893,7 +3097,7 @@ efficient_estimator_dml2 <- function(dat,
       d_p  = as.numeric(dat_test$d_p),
       d_np = as.numeric(dat_test$d_np),
       pi_p = as.numeric(dat_test$pi_p),  # allow NA for (0,0); handled in df_prepare_pi_p()
-      p_hat = NULL                       # optional: P(Y=y1|X) for logistic nuisance strategy
+      p_hat = NULL
     )
 
     if (!isTRUE(x_info)) {
@@ -2919,43 +3123,37 @@ efficient_estimator_dml2 <- function(dat,
     pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
     l_obs    <- df_make_l_matrix(X_obs, y_obs)
 
-    # If Y is binary and a logistic nuisance method is requested, we precompute
-    # p_hat(X)=P(Y=y1|X) on the test fold and let eta4*/h4* use the mixture formula.
-    method <- df_match_nonpara_method(nonpara_method)
-    y_is_binary <- df_is_binary_y(y_obs)
+    prep_eta4 <- df_np_prepare(
+      X_train = X_obs,
+      sigma   = NULL,
+      nonpara_method = nonpara_method,
+      context = "eta4*(X;phi) nuisance regression"
+    )
+    prep_h4 <- df_np_prepare(
+      X_train = X_obs,
+      sigma   = NULL,
+      nonpara_method = nonpara_method,
+      context = "h4*(X;phi) nuisance regression"
+    )
 
-    p_hat_test <- NULL
-    if (method %in% c("logistic KRR", "glmnet_logistic") && isTRUE(y_is_binary)) {
-      p_hat_test <- df_np_predict_binomial(
+    # For binomial nonpara methods (logistic KRR / glmnet_logistic / RF_binom),
+    # precompute p_hat(X) = P(Y=Y1|X) once per fold; this does not depend on phi.
+    use_binom_mixture <- (nonpara_method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+    if (isTRUE(use_binom_mixture)) {
+      prep_p <- df_np_prepare(
+        X_train = X_obs,
+        sigma   = NULL,
+        nonpara_method = nonpara_method,
+        context = "P(Y=1|X) nuisance regression"
+      )
+      test$p_hat <- df_np_predict_binomial(
         X_train = X_obs,
         y_train = y_obs,
         X_test  = X_test,
-        prep    = NULL,
-        sigma   = NULL,
-        nonpara_method = method,
-        context = "P(Y=1|X) nuisance regression (Eff)"
+        prep    = prep_p,
+        nonpara_method = nonpara_method,
+        context = "P(Y=1|X) nuisance regression"
       )
-      test$p_hat <- as.numeric(p_hat_test)
-      prep_eta4 <- NULL
-      prep_h4   <- NULL
-    } else {
-      if (identical(method, "glmnet_linear")) {
-        prep_eta4 <- NULL
-        prep_h4   <- NULL
-      } else {
-        prep_eta4 <- df_np_prepare(
-          X_train = X_obs,
-          sigma   = NULL,
-          nonpara_method = method,
-          context = "eta4*(X;phi) nuisance regression"
-        )
-        prep_h4 <- df_np_prepare(
-          X_train = X_obs,
-          sigma   = NULL,
-          nonpara_method = method,
-          context = "h4*(X;phi) nuisance regression"
-        )
-      }
     }
 
     train <- list(
@@ -3278,7 +3476,8 @@ efficient_estimator_dml2 <- function(dat,
       x_info      = isTRUE(x_info),
       prob_only   = isTRUE(prob_only),
       nonpara_method = nonpara_method,
-      nonpara_method_pi_p = nonpara_method_pi_p,
+      nonpara_method_pi = nonpara_method_pi,
+      nonpara_method_cont = nonpara_method_pi,
       aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       convergence = res$convergence,
@@ -3316,23 +3515,32 @@ efficient_estimator_dml1 <- function(dat,
 
   nonpara_method <- df_match_nonpara_method(nonpara_method)
 
-  # pi_p imputation is a continuous regression (target 1/pi_p), so logistic-only methods
-  # are mapped to their continuous counterparts here (once).
-  nonpara_method_pi_p <- nonpara_method
-  if (identical(nonpara_method_pi_p, "glmnet_logistic")) {
+  # nonpara_method is used for eta4*/h4* nuisances.
+  # pi_p(L) imputation is continuous, so logistic-only / RF_binom methods are mapped
+  # to their continuous counterparts for pi_p only.
+  nonpara_method_pi <- nonpara_method
+  if (identical(nonpara_method_pi, "glmnet_logistic")) {
     df_warn_once(
-      "dfSEDI_Eff_pi_p_glmnet_logistic_fallback",
-      "dfSEDI warning: nonpara_method='glmnet_logistic' was requested. pi_p imputation is continuous; using glmnet_linear for pi_p imputation."
+      "dfSEDI_Eff_pi_glmnet_logistic_fallback",
+      "dfSEDI warning: nonpara_method='glmnet_logistic' was requested, but pi_p imputation is continuous; using glmnet_linear for pi_p imputation instead."
     )
-    nonpara_method_pi_p <- "glmnet_linear"
+    nonpara_method_pi <- "glmnet_linear"
   }
-  if (identical(nonpara_method_pi_p, "logistic KRR")) {
+  if (identical(nonpara_method_pi, "logistic KRR")) {
     df_warn_once(
-      "dfSEDI_Eff_pi_p_logistic_krr_fallback",
-      "dfSEDI warning: nonpara_method='logistic KRR' was requested. pi_p imputation is continuous; using KRR for pi_p imputation."
+      "dfSEDI_Eff_pi_logistic_krr_fallback",
+      "dfSEDI warning: nonpara_method='logistic KRR' was requested, but pi_p imputation is continuous; using KRR for pi_p imputation instead."
     )
-    nonpara_method_pi_p <- "KRR"
+    nonpara_method_pi <- "KRR"
   }
+  if (identical(nonpara_method_pi, "RF_binom")) {
+    df_warn_once(
+      "dfSEDI_Eff_pi_RF_binom_fallback",
+      "dfSEDI warning: nonpara_method='RF_binom' was requested, but pi_p imputation is continuous; using RF_cont for pi_p imputation instead."
+    )
+    nonpara_method_pi <- "RF_cont"
+  }
+  nonpara_method_cont <- nonpara_method_pi
 
   n <- nrow(dat)
   X <- df_get_X(dat)
@@ -3360,7 +3568,7 @@ efficient_estimator_dml1 <- function(dat,
   }
 
   folds <- make_folds(n, K)
-  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress, nonpara_method = nonpara_method_pi_p)
+  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress, nonpara_method = nonpara_method_cont)
 
   phi_k_mat   <- matrix(NA_real_, nrow = K, ncol = p_phi)
   theta_k     <- rep(NA_real_, K)
@@ -3407,43 +3615,39 @@ efficient_estimator_dml1 <- function(dat,
       pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
       l_obs    <- df_make_l_matrix(X_obs, y_obs)
 
-      # If Y is binary and a logistic nuisance method is requested, precompute
-      # p_hat(X)=P(Y=y1|X) on the test fold and use the mixture formula inside
-      # eta4*/h4* (see estimate_conditional_expectation_*_core).
-      method <- df_match_nonpara_method(nonpara_method)
-      y_is_binary <- df_is_binary_y(y_obs)
+      prep_eta4 <- df_np_prepare(
+        X_train = X_obs,
+        sigma   = NULL,
+        nonpara_method = nonpara_method,
+        context = "eta4*(X;phi) nuisance regression"
+      )
+      prep_h4 <- df_np_prepare(
+        X_train = X_obs,
+        sigma   = NULL,
+        nonpara_method = nonpara_method,
+        context = "h4*(X;phi) nuisance regression"
+      )
 
+      # For binomial methods (logistic KRR / glmnet_logistic / RF_binom) when Y is binary,
+      # precompute p_hat_test = P(Y=Y1|X) on the test fold once.
       p_hat_test <- NULL
-      if (method %in% c("logistic KRR", "glmnet_logistic") && isTRUE(y_is_binary)) {
+      use_binom_mixture <- (nonpara_method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+      if (isTRUE(use_binom_mixture)) {
+        prep_p <- df_np_prepare(
+          X_train = X_obs,
+          sigma   = NULL,
+          nonpara_method = nonpara_method,
+          context = "P(Y=1|X) nuisance regression"
+        )
         p_hat_test <- df_np_predict_binomial(
           X_train = X_obs,
           y_train = y_obs,
           X_test  = X_test,
-          prep    = NULL,
+          prep    = prep_p,
           sigma   = NULL,
-          nonpara_method = method,
-          context = "P(Y=1|X) nuisance regression (Eff)"
+          nonpara_method = nonpara_method,
+          context = "P(Y=1|X) nuisance regression"
         )
-        prep_eta4 <- NULL
-        prep_h4   <- NULL
-      } else {
-        if (identical(method, "glmnet_linear")) {
-          prep_eta4 <- NULL
-          prep_h4   <- NULL
-        } else {
-          prep_eta4 <- df_np_prepare(
-            X_train = X_obs,
-            sigma   = NULL,
-            nonpara_method = method,
-            context = "eta4*(X;phi) nuisance regression"
-          )
-          prep_h4 <- df_np_prepare(
-            X_train = X_obs,
-            sigma   = NULL,
-            nonpara_method = method,
-            context = "h4*(X;phi) nuisance regression"
-          )
-        }
       }
 
       train_cache <- list(
@@ -3453,7 +3657,7 @@ efficient_estimator_dml1 <- function(dat,
         l_obs     = l_obs,
         prep_eta4 = prep_eta4,
         prep_h4   = prep_h4,
-        p_hat_test = as.numeric(p_hat_test)
+        p_hat_test = p_hat_test
       )
     }
 
@@ -3715,7 +3919,8 @@ efficient_estimator_dml1 <- function(dat,
       x_info      = isTRUE(x_info),
       prob_only   = isTRUE(prob_only),
       nonpara_method = nonpara_method,
-      nonpara_method_pi_p = nonpara_method_pi_p,
+      nonpara_method_pi = nonpara_method_pi,
+      nonpara_method_cont = nonpara_method_pi,
       aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       theta_var_method = theta_var_method,
@@ -3756,16 +3961,16 @@ subefficient_contrib <- function(dat, mu_hat) {
 subefficient_estimator_dml2 <- function(dat,
                                         K = 2,
                                         logit = NULL,
-                                        nonpara_method = NULL,
+                                        nonpara_method = "KRR",
                                         progress = FALSE,
                                         x_info = TRUE) {
   dat <- df_apply_x_info(dat, x_info)
 
   n <- nrow(dat)
-  folds <- make_folds(n, K)
+  folds <- df_make_folds(n, K)
 
   # Determine nuisance regression method for mu(X).
-  if (is.null(nonpara_method)) {
+  if (missing(nonpara_method)) {
     # Legacy path: choose kernel logistic only when requested (or auto via logit=NULL).
     use_logit <- df_infer_logit_flag(logit, dat$y)
     method <- if (isTRUE(use_logit)) "logistic KRR" else "KRR"
@@ -3773,13 +3978,13 @@ subefficient_estimator_dml2 <- function(dat,
     method <- df_match_nonpara_method(nonpara_method)
   }
 
-  # Validate / coerce logistic-only methods when y is not binary.
-  if (method %in% c("logistic KRR", "glmnet_logistic") && !df_is_binary_y(dat$y)) {
+  # Validate / coerce binomial-only methods when y is not binary.
+  if (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom") && !df_is_binary_y(dat$y)) {
     df_warn_once(
       "dfSEDI_EffS_logistic_nonbinary_fallback",
-      "dfSEDI warning: a logistic nonpara_method was requested for Eff_S, but y is not binary; using the corresponding linear method instead."
+      "dfSEDI warning: a binomial nonpara_method was requested for Eff_S, but y is not binary; using the corresponding continuous method instead."
     )
-    method <- if (identical(method, "glmnet_logistic")) "glmnet_linear" else "KRR"
+    method <- if (identical(method, "glmnet_logistic")) "glmnet_linear" else if (identical(method, "RF_binom")) "RF_cont" else "KRR"
   }
 
   X_all <- df_get_X(dat)
@@ -3817,7 +4022,7 @@ subefficient_estimator_dml2 <- function(dat,
     y_train <- dat_train$y
     X_test  <- df_get_X(dat_test)
 
-    mu_k <- if (method %in% c("logistic KRR", "glmnet_logistic")) {
+    mu_k <- if (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) {
       df_np_predict_binomial(
         X_train = X_train,
         y_train = y_train,
@@ -3870,7 +4075,6 @@ efficient_parametric_estimator <- function(dat,
                                            eta4_star = 0,
                                            max_iter  = 20,
                                            logit     = NULL,
-                                           nonpara_method = NULL,
                                            progress  = FALSE,
                                            x_info    = TRUE) {
   dat <- df_apply_x_info(dat, x_info)
@@ -3954,65 +4158,30 @@ efficient_parametric_estimator <- function(dat,
 
       X_full <- df_get_X(dat)
 
-      # Working model for h4*(X) / mu(X) = E(Y|X).
-      # Default (nonpara_method=NULL): keep the original "simple working model"
-      #   - binary y (logit=TRUE): parametric logistic regression
-      #   - continuous y         : parametric linear regression
-      # If nonpara_method is specified, use the corresponding nonparametric / high-dim method
-      # (KRR / mixed KRR / logistic KRR / glmnet_linear / glmnet_logistic).
-      if (is.null(nonpara_method)) {
-        if (isTRUE(use_logit)) {
-          y01_sub <- df_as_binary01(dat_sub$y)$y01
-          df_sub <- data.frame(y = y01_sub, X_sub)
-          colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
+      if (isTRUE(use_logit)) {
+        y01_sub <- df_as_binary01(dat_sub$y)$y01
+        df_sub <- data.frame(y = y01_sub, X_sub)
+        colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
 
-          glm_fit <- stats::glm(y ~ ., data = df_sub, family = stats::binomial())
+        glm_fit <- stats::glm(y ~ ., data = df_sub, family = stats::binomial())
 
-          df_full <- data.frame(X_full)
-          colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
-          mu_hat <- as.numeric(stats::predict(glm_fit, newdata = df_full, type = "response"))
-          mu_hat <- df_clip_prob(mu_hat)
+        df_full <- data.frame(X_full)
+        colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
+        mu_hat <- as.numeric(stats::predict(glm_fit, newdata = df_full, type = "response"))
+        mu_hat <- df_clip_prob(mu_hat)
 
-          mu_model <- "parametric_logistic"
-        } else {
-          df_sub <- data.frame(y = as.numeric(dat_sub$y), X_sub)
-          colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
-
-          lm_fit <- stats::lm(y ~ ., data = df_sub)
-
-          df_full <- data.frame(X_full)
-          colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
-          mu_hat <- as.numeric(stats::predict(lm_fit, newdata = df_full))
-
-          mu_model <- "parametric_linear"
-        }
+        mu_model <- "parametric_logistic"
       } else {
-        method <- df_match_nonpara_method(nonpara_method)
+        df_sub <- data.frame(y = as.numeric(dat_sub$y), X_sub)
+        colnames(df_sub)[-1] <- paste0("x", seq_len(ncol(X_sub)))
 
-        if (isTRUE(use_logit)) {
-          mu_hat <- df_np_predict_binomial(
-            X_train = X_sub,
-            y_train = dat_sub$y,
-            X_test  = X_full,
-            prep    = NULL,
-            sigma   = NULL,
-            nonpara_method = method,
-            context = "Eff_P: mu(X) working model"
-          )
-          mu_hat <- df_clip_prob(mu_hat)
-        } else {
-          mu_hat <- df_np_predict_gaussian(
-            X_train = X_sub,
-            y_train = as.numeric(dat_sub$y),
-            X_test  = X_full,
-            prep    = NULL,
-            sigma   = NULL,
-            nonpara_method = method,
-            context = "Eff_P: mu(X) working model"
-          )
-        }
+        lm_fit <- stats::lm(y ~ ., data = df_sub)
 
-        mu_model <- paste0("nonpara_method=", method)
+        df_full <- data.frame(X_full)
+        colnames(df_full) <- paste0("x", seq_len(ncol(X_full)))
+        mu_hat <- as.numeric(stats::predict(lm_fit, newdata = df_full))
+
+        mu_model <- "parametric_linear"
       }
     }
 
@@ -4036,7 +4205,6 @@ efficient_parametric_estimator <- function(dat,
                   progress  = progress,
                   x_info    = isTRUE(x_info),
                   logit     = use_logit,
-                  nonpara_method = if (is.null(nonpara_method)) NA_character_ else df_match_nonpara_method(nonpara_method),
                   mu_model  = mu_model)
   )
 }
@@ -4075,7 +4243,7 @@ Eff <- function(dat,
 Eff_S <- function(dat,
                   K = 2,
                   logit = NULL,
-                  nonpara_method = NULL,
+                  nonpara_method = "KRR",
                   progress = interactive(),
                   x_info = TRUE) {
   subefficient_estimator_dml2(dat, K = K, logit = logit, nonpara_method = nonpara_method, progress = progress, x_info = x_info)
@@ -4086,10 +4254,9 @@ Eff_P <- function(dat,
                   eta4_star = 0,
                   max_iter  = 20,
                   logit     = NULL,
-                  nonpara_method = NULL,
                   progress  = interactive(),
                   x_info    = TRUE) {
   efficient_parametric_estimator(dat, phi_start = phi_start, eta4_star = eta4_star,
-                                 max_iter = max_iter, logit = logit, nonpara_method = nonpara_method, progress = progress,
+                                 max_iter = max_iter, logit = logit, progress = progress,
                                  x_info = x_info)
 }
