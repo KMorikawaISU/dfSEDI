@@ -4061,7 +4061,7 @@ subefficient_estimator_dml2 <- function(dat,
        ci    = theta_res$ci,
        info  = list(type = "Eff_S", K = K, progress = progress,
                     x_info = isTRUE(x_info),
-                    logit = if (method %in% c("logistic KRR", "glmnet_logistic")) TRUE else FALSE,
+                    logit = if (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) TRUE else FALSE,
                     nonpara_method = method,
                     mu_model = method))
 }
@@ -4246,7 +4246,19 @@ Eff_S <- function(dat,
                   nonpara_method = "KRR",
                   progress = interactive(),
                   x_info = TRUE) {
-  subefficient_estimator_dml2(dat, K = K, logit = logit, nonpara_method = nonpara_method, progress = progress, x_info = x_info)
+
+  # Backward compatibility:
+  # - If `nonpara_method` is not supplied, use the legacy `logit`/auto-detect
+  #   behavior to choose KRR vs logistic KRR for mu(X).
+  # - If `nonpara_method` is supplied, it fully controls the mu(X) regression.
+  if (missing(nonpara_method)) {
+    subefficient_estimator_dml2(dat, K = K, logit = logit,
+                                progress = progress, x_info = x_info)
+  } else {
+    subefficient_estimator_dml2(dat, K = K, logit = logit,
+                                nonpara_method = nonpara_method,
+                                progress = progress, x_info = x_info)
+  }
 }
 
 Eff_P <- function(dat,
