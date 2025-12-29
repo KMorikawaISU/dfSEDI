@@ -3967,7 +3967,7 @@ subefficient_estimator_dml2 <- function(dat,
   dat <- df_apply_x_info(dat, x_info)
 
   n <- nrow(dat)
-  folds <- df_make_folds(n, K)
+  folds <- make_folds(n, K)
 
   # Determine nuisance regression method for mu(X).
   if (missing(nonpara_method)) {
