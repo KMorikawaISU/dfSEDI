@@ -3756,16 +3756,16 @@ subefficient_contrib <- function(dat, mu_hat) {
 subefficient_estimator_dml2 <- function(dat,
                                         K = 2,
                                         logit = NULL,
-                                        nonpara_method = "KRR",
+                                        nonpara_method = NULL,
                                         progress = FALSE,
                                         x_info = TRUE) {
   dat <- df_apply_x_info(dat, x_info)
 
   n <- nrow(dat)
-  folds <- df_make_folds(n, K)
+  folds <- make_folds(n, K)
 
   # Determine nuisance regression method for mu(X).
-  if (missing(nonpara_method)) {
+  if (is.null(nonpara_method)) {
     # Legacy path: choose kernel logistic only when requested (or auto via logit=NULL).
     use_logit <- df_infer_logit_flag(logit, dat$y)
     method <- if (isTRUE(use_logit)) "logistic KRR" else "KRR"
@@ -4075,7 +4075,7 @@ Eff <- function(dat,
 Eff_S <- function(dat,
                   K = 2,
                   logit = NULL,
-                  nonpara_method = "KRR",
+                  nonpara_method = NULL,
                   progress = interactive(),
                   x_info = TRUE) {
   subefficient_estimator_dml2(dat, K = K, logit = logit, nonpara_method = nonpara_method, progress = progress, x_info = x_info)
