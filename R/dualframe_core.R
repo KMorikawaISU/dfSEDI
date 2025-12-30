@@ -433,6 +433,9 @@ df_match_nonpara_method <- function(nonpara_method) {
   if (nm0 %in% c("logistic krr", "kernel logistic", "kernel logistic regression", "kernel_logistic")) {
     return("logistic KRR")
   }
+  if (nm0 %in% c("mixed logistic krr", "mixed kernel logistic", "mixed kernel logistic regression", "mixed_logistic_krr")) {
+    return("mixed logistic KRR")
+  }
   if (nm0 %in% c("glmnet_linear", "glmnet linear", "glmnet gaussian", "glmnet")) {
     return("glmnet_linear")
   }
@@ -455,7 +458,7 @@ df_match_nonpara_method <- function(nonpara_method) {
 
   stop(
     "Unknown nonpara_method: `", nm, "`.\n",
-    "Allowed: 'KRR', 'mixed KRR', 'logistic KRR', 'glmnet_linear', 'glmnet_logistic', 'RF_cont', 'RF_binom'.",
+    "Allowed: 'KRR', 'mixed KRR', 'logistic KRR', 'mixed logistic KRR', 'glmnet_linear', 'glmnet_logistic', 'RF_cont', 'RF_binom'.",
     call. = FALSE
   )
 }
@@ -1578,7 +1581,7 @@ df_np_prepare <- function(X_train, sigma = NULL, nonpara_method = "KRR", context
 
   # 'mixed KRR' => infer categorical columns (delta kernel).
   # otherwise => treat all columns as continuous (plain RBF kernel on the full design).
-  cat_cols_use <- if (identical(method, "mixed KRR")) NULL else integer(0)
+  cat_cols_use <- if (method %in% c("mixed KRR", "mixed logistic KRR")) NULL else integer(0)
 
   df_krr_mixed_prepare(
     X_train  = X_train,
@@ -1608,6 +1611,14 @@ df_np_predict_gaussian <- function(X_train, y_train, X_test, prep = NULL, sigma 
     )
     method <- "KRR"
   }
+  if (identical(method, "mixed logistic KRR")) {
+    df_warn_once(
+      paste0("dfSEDI_mixed_logistic_krr_fallback_", context),
+      paste0("dfSEDI warning: nonpara_method='mixed logistic KRR' was requested for a non-binary response in ", context, ". Using mixed KRR instead.")
+    )
+    method <- "mixed KRR"
+  }
+
 
   if (identical(method, "RF_binom")) {
     df_warn_once(
@@ -1988,6 +1999,14 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL, nonpara_method = "
     )
     method <- "KRR"
   }
+  if (identical(method, "mixed logistic KRR")) {
+    df_warn_once(
+      "dfSEDI_pi_p_mixed_logistic_krr_fallback",
+      "dfSEDI warning: nonpara_method='mixed logistic KRR' was requested for pi_p imputation (continuous target). Using mixed KRR instead."
+    )
+    method <- "mixed KRR"
+  }
+
 
   if (identical(method, "RF_binom")) {
     df_warn_once(
@@ -2070,7 +2089,7 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
   #   E[g(X,Y)|X] = g(X,y0)*(1-p(X)) + g(X,y1)*p(X)
   # where p(X)=P(Y=y1|X).
   y_obs_here <- as.numeric(l_obs[, ncol(l_obs)])
-  use_binom_mixture <- (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs_here)
+  use_binom_mixture <- (method %in% c("logistic KRR", "mixed logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs_here)
 
   if (isTRUE(use_binom_mixture)) {
     if (is.null(p_hat_new)) {
@@ -2215,7 +2234,7 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
     return(rep(0, nrow(new_X)))
   }
 
-  use_binom_mixture <- (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+  use_binom_mixture <- (method %in% c("logistic KRR", "mixed logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
   if (isTRUE(use_binom_mixture)) {
     if (is.null(p_hat_new)) {
       stop("h4*(X;phi): binomial nonpara_method requires p_hat_new (P(Y=1|X) predictions) to be precomputed and passed in.", call. = FALSE)
@@ -3138,7 +3157,7 @@ efficient_estimator_dml2 <- function(dat,
 
     # For binomial nonpara methods (logistic KRR / glmnet_logistic / RF_binom),
     # precompute p_hat(X) = P(Y=Y1|X) once per fold; this does not depend on phi.
-    use_binom_mixture <- (nonpara_method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+    use_binom_mixture <- (nonpara_method %in% c("logistic KRR", "mixed logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
     if (isTRUE(use_binom_mixture)) {
       prep_p <- df_np_prepare(
         X_train = X_obs,
@@ -3631,7 +3650,7 @@ efficient_estimator_dml1 <- function(dat,
       # For binomial methods (logistic KRR / glmnet_logistic / RF_binom) when Y is binary,
       # precompute p_hat_test = P(Y=Y1|X) on the test fold once.
       p_hat_test <- NULL
-      use_binom_mixture <- (nonpara_method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+      use_binom_mixture <- (nonpara_method %in% c("logistic KRR", "mixed logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
       if (isTRUE(use_binom_mixture)) {
         prep_p <- df_np_prepare(
           X_train = X_obs,
@@ -3979,7 +3998,7 @@ subefficient_estimator_dml2 <- function(dat,
   }
 
   # Validate / coerce binomial-only methods when y is not binary.
-  if (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom") && !df_is_binary_y(dat$y)) {
+  if (method %in% c("logistic KRR", "mixed logistic KRR", "glmnet_logistic", "RF_binom") && !df_is_binary_y(dat$y)) {
     df_warn_once(
       "dfSEDI_EffS_logistic_nonbinary_fallback",
       "dfSEDI warning: a binomial nonpara_method was requested for Eff_S, but y is not binary; using the corresponding continuous method instead."
@@ -4022,7 +4041,7 @@ subefficient_estimator_dml2 <- function(dat,
     y_train <- dat_train$y
     X_test  <- df_get_X(dat_test)
 
-    mu_k <- if (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) {
+    mu_k <- if (method %in% c("logistic KRR", "mixed logistic KRR", "glmnet_logistic", "RF_binom")) {
       df_np_predict_binomial(
         X_train = X_train,
         y_train = y_train,
@@ -4061,7 +4080,7 @@ subefficient_estimator_dml2 <- function(dat,
        ci    = theta_res$ci,
        info  = list(type = "Eff_S", K = K, progress = progress,
                     x_info = isTRUE(x_info),
-                    logit = if (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) TRUE else FALSE,
+                    logit = if (method %in% c("logistic KRR", "mixed logistic KRR", "glmnet_logistic", "RF_binom")) TRUE else FALSE,
                     nonpara_method = method,
                     mu_model = method))
 }
