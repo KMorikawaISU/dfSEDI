@@ -68,6 +68,7 @@
 .dfSEDI_state <- new.env(parent = emptyenv())
 .dfSEDI_state$allow_small_cells   <- FALSE
 .dfSEDI_state$seen_smallcell_keys <- character(0)
+.dfSEDI_state$warned_keys         <- character(0)
 
 df_ask_yes_no <- function(question, default = FALSE) {
   if (requireNamespace("utils", quietly = TRUE) &&
@@ -407,6 +408,71 @@ df_infer_logit_flag <- function(logit, y) {
     return(df_is_binary_y(y))
   }
   isTRUE(logit)
+}
+
+############################################################
+## NEW: Nonparametric regression method dispatcher
+############################################################
+
+# Normalize/validate `nonpara_method`.
+df_match_nonpara_method <- function(nonpara_method) {
+  if (is.null(nonpara_method)) return("KRR")
+  nm <- as.character(nonpara_method)[1]
+  if (is.na(nm) || !nzchar(nm)) return("KRR")
+
+  nm0 <- tolower(trimws(nm))
+  nm0 <- gsub("_", " ", nm0)
+  nm0 <- gsub("\\s+", " ", nm0)
+
+  if (nm0 %in% c("krr", "kernel ridge", "kernel ridge regression", "kernel_ridge")) {
+    return("KRR")
+  }
+  if (nm0 %in% c("mixed krr", "mixed", "mixed kernel ridge", "mixed kernel ridge regression", "mixed_krr")) {
+    return("mixed KRR")
+  }
+  if (nm0 %in% c("logistic krr", "kernel logistic", "kernel logistic regression", "kernel_logistic",
+                 "mixed logistic krr", "mixed kernel logistic", "mixed kernel logistic regression")) {
+    return("logistic KRR")
+  }
+  if (nm0 %in% c("glmnet_linear", "glmnet linear", "glmnet gaussian", "glmnet")) {
+    return("glmnet_linear")
+  }
+  if (nm0 %in% c("glmnet_logistic", "glmnet logistic", "glmnet binomial", "glmnet_logit")) {
+    return("glmnet_logistic")
+  }
+
+  # Random forest (two explicit variants so that the
+  # nuisance strategy is unambiguous):
+  #  - RF_cont : regression (directly regress the numerator/denominator pseudo outcomes)
+  #  - RF_binom: classification (estimate P(Y=1|X) and use the binary mixture formula)
+  if (nm0 %in% c("rf_cont", "rf cont", "rf regression", "random forest", "random forest cont",
+                 "random forest regression", "rf gaussian", "rf continuous")) {
+    return("RF_cont")
+  }
+  if (nm0 %in% c("rf_binom", "rf binom", "rf logistic", "rf logit", "random forest binom",
+                 "random forest classification", "random forest classifier")) {
+    return("RF_binom")
+  }
+
+  stop(
+    "Unknown nonpara_method: `", nm, "`.\n",
+    "Allowed: 'KRR', 'mixed KRR', 'logistic KRR', 'glmnet_linear', 'glmnet_logistic', 'RF_cont', 'RF_binom'.",
+    call. = FALSE
+  )
+}
+
+# Warn only once per session for a given key.
+df_warn_once <- function(key, msg) {
+  key <- as.character(key)[1]
+  if (is.na(key) || !nzchar(key)) key <- "dfSEDI_warn"
+  if (!exists("warned_keys", envir = .dfSEDI_state, inherits = FALSE)) {
+    .dfSEDI_state$warned_keys <- character(0)
+  }
+  if (!(key %in% .dfSEDI_state$warned_keys)) {
+    .dfSEDI_state$warned_keys <- c(.dfSEDI_state$warned_keys, key)
+    warning(msg, call. = FALSE)
+  }
+  invisible(TRUE)
 }
 
 # Extract parametric design matrix X
@@ -1189,7 +1255,10 @@ df_klogit_mixed_predict <- function(X_train,
 }
 
 # mu(x) = P(Y=1 | X=x) via mixed-type kernel logistic regression
-regression_expectation_klogit <- function(dat, new_X, sigma = NULL, success_level = NULL) {
+# mu(x) = P(Y=1 | X=x) via kernel logistic regression
+# - If `cat_cols` is NULL (default), we infer categorical columns and use the mixed-type (delta x RBF) kernel.
+# - If `cat_cols` is integer(0), all columns are treated as continuous (plain RBF kernel on the full design).
+regression_expectation_klogit <- function(dat, new_X, sigma = NULL, success_level = NULL, cat_cols = NULL) {
   X_all <- df_get_X(dat)
   idx   <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
   X_obs <- X_all[idx, , drop = FALSE]
@@ -1210,19 +1279,431 @@ regression_expectation_klogit <- function(dat, new_X, sigma = NULL, success_leve
   prep <- df_krr_mixed_prepare(
     X_train = X_obs,
     sigma   = sigma,
+    cat_cols = cat_cols,
     context = "mu(X) = P(Y=1 | X) kernel logistic regression"
   )
 
   df_klogit_mixed_predict(
-    X_train  = X_obs,
-    y01_train= y01,
-    X_test   = as.matrix(new_X),
+    X_train   = X_obs,
+    y01_train = y01,
+    X_test    = as.matrix(new_X),
+    sigma     = prep$sigma,
+    cat_cols  = prep$cat_cols,
+    cont_cols = prep$cont_cols
+  )
+}
+
+############################################################
+## NEW: glmnet (optional) + unified nonparametric regressors
+############################################################
+
+# Generic glmnet prediction wrapper (cv.glmnet when possible).
+df_glmnet_predict <- function(X_train, y_train, X_test, family = c("gaussian", "binomial"),
+                              alpha = NULL, nfolds = NULL, standardize = NULL, intercept = TRUE) {
+  if (!requireNamespace("glmnet", quietly = TRUE)) {
+    stop(
+      "dfSEDI: nonpara_method='glmnet_*' requires the 'glmnet' package. Please install it (install.packages('glmnet')).",
+      call. = FALSE
+    )
+  }
+
+  family <- match.arg(family)
+
+  X_train <- as.matrix(X_train)
+  X_test  <- as.matrix(X_test)
+  y_train <- as.numeric(y_train)
+
+  # Drop rows with non-finite y or X (glmnet cannot handle NA/Inf).
+  keep <- is.finite(y_train) & apply(X_train, 1L, function(r) all(is.finite(r)))
+  X_tr <- X_train[keep, , drop = FALSE]
+  y_tr <- y_train[keep]
+
+  ntr <- nrow(X_tr)
+  nte <- nrow(X_test)
+  if (nte == 0L) return(numeric(0))
+  if (ntr < 1L) return(rep(NA_real_, nte))
+
+  # If effectively no variation, return constant.
+  u <- unique(y_tr[is.finite(y_tr)])
+  if (length(u) < 2L) {
+    if (family == "binomial") {
+      p0 <- df_clip_prob(mean(y_tr))
+      return(rep(p0, nte))
+    }
+    return(rep(mean(y_tr), nte))
+  }
+
+  if (is.null(alpha)) alpha <- getOption("dfSEDI.glmnet_alpha", 1)
+  alpha <- as.numeric(alpha)[1]
+  if (!is.finite(alpha) || alpha < 0 || alpha > 1) alpha <- 1
+
+  if (is.null(nfolds)) nfolds <- getOption("dfSEDI.glmnet_nfolds", 5L)
+  nfolds <- as.integer(nfolds)[1]
+  if (!is.finite(nfolds) || nfolds < 2L) nfolds <- 5L
+  nfolds <- min(nfolds, ntr)
+
+  if (is.null(standardize)) standardize <- getOption("dfSEDI.glmnet_standardize", TRUE)
+  standardize <- isTRUE(standardize)
+  intercept <- isTRUE(intercept)
+
+  pred <- NULL
+
+  # Prefer CV when feasible (nfolds>=3 and ntr>=3).
+  if (ntr >= 3L && nfolds >= 3L) {
+    cvfit <- tryCatch(
+      glmnet::cv.glmnet(
+        x = X_tr, y = y_tr, family = family, alpha = alpha, nfolds = nfolds,
+        standardize = standardize, intercept = intercept
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(cvfit)) {
+      pred <- tryCatch(
+        predict(cvfit, newx = X_test, s = "lambda.min", type = if (family == "binomial") "response" else "response"),
+        error = function(e) NULL
+      )
+    }
+  }
+
+  # Fallback: fit once without CV (choose the smallest lambda for flexibility).
+  if (is.null(pred)) {
+    fit <- tryCatch(
+      glmnet::glmnet(
+        x = X_tr, y = y_tr, family = family, alpha = alpha,
+        standardize = standardize, intercept = intercept
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(fit)) {
+      if (family == "binomial") {
+        p0 <- df_clip_prob(mean(y_tr))
+        return(rep(p0, nte))
+      }
+      return(rep(mean(y_tr), nte))
+    }
+    lam <- utils::tail(fit$lambda, 1L)
+    pred <- tryCatch(
+      predict(fit, newx = X_test, s = lam, type = if (family == "binomial") "response" else "response"),
+      error = function(e) NULL
+    )
+  }
+
+  if (is.null(pred)) {
+    if (family == "binomial") {
+      p0 <- df_clip_prob(mean(y_tr))
+      return(rep(p0, nte))
+    }
+    return(rep(mean(y_tr), nte))
+  }
+
+  pred <- as.numeric(pred)
+  if (family == "binomial") pred <- df_clip_prob(pred)
+  pred
+}
+
+############################################################
+## NEW: Random forest (optional) + unified wrappers
+############################################################
+
+# Simple mean-imputation for RF engines that cannot handle NA/Inf.
+df_rf_impute_mats <- function(X_train, X_test) {
+  X_train <- as.matrix(X_train)
+  X_test  <- as.matrix(X_test)
+
+  if (nrow(X_train) < 1L) return(list(X_train = X_train, X_test = X_test))
+
+  X_train[!is.finite(X_train)] <- NA_real_
+  X_test[!is.finite(X_test)]   <- NA_real_
+
+  cm <- suppressWarnings(colMeans(X_train, na.rm = TRUE))
+  cm[!is.finite(cm)] <- 0
+
+  for (j in seq_len(ncol(X_train))) {
+    if (anyNA(X_train[, j])) X_train[is.na(X_train[, j]), j] <- cm[j]
+    if (anyNA(X_test[, j]))  X_test[is.na(X_test[, j]), j]   <- cm[j]
+  }
+
+  list(X_train = X_train, X_test = X_test)
+}
+
+# RF regression (continuous outcome).
+df_rf_predict_gaussian <- function(X_train, y_train, X_test,
+                                   num.trees = NULL, mtry = NULL, min.node.size = NULL,
+                                   seed = NULL) {
+  X_train <- as.matrix(X_train)
+  X_test  <- as.matrix(X_test)
+  y_train <- as.numeric(y_train)
+
+  nte <- nrow(X_test)
+  if (nte == 0L) return(numeric(0))
+
+  keep <- is.finite(y_train)
+  X_tr <- X_train[keep, , drop = FALSE]
+  y_tr <- y_train[keep]
+
+  ntr <- nrow(X_tr)
+  if (ntr < 1L) return(rep(NA_real_, nte))
+
+  # If no variation, return constant.
+  u <- unique(y_tr[is.finite(y_tr)])
+  if (length(u) < 2L) return(rep(mean(y_tr), nte))
+
+  if (is.null(num.trees)) num.trees <- getOption("dfSEDI.rf_num_trees", 500L)
+  num.trees <- as.integer(num.trees)[1]
+  if (!is.finite(num.trees) || num.trees < 50L) num.trees <- 500L
+
+  if (!is.null(seed)) seed <- as.integer(seed)[1]
+
+  imp <- df_rf_impute_mats(X_tr, X_test)
+  X_tr <- imp$X_train
+  X_te <- imp$X_test
+
+  # Prefer ranger (fast); fallback to randomForest.
+  if (requireNamespace("ranger", quietly = TRUE)) {
+    df_tr <- data.frame(y = y_tr, as.data.frame(X_tr))
+    df_te <- as.data.frame(X_te)
+
+    fit <- ranger::ranger(
+      y ~ .,
+      data = df_tr,
+      num.trees = num.trees,
+      mtry = mtry,
+      min.node.size = min.node.size,
+      seed = seed
+    )
+    return(as.numeric(predict(fit, data = df_te)$predictions))
+  }
+
+  if (requireNamespace("randomForest", quietly = TRUE)) {
+    fit <- randomForest::randomForest(
+      x = X_tr,
+      y = y_tr,
+      ntree = num.trees,
+      mtry = mtry
+    )
+    return(as.numeric(stats::predict(fit, X_te)))
+  }
+
+  stop(
+    "dfSEDI: nonpara_method='RF_*' requires either the 'ranger' or 'randomForest' package. ",
+    "Please install one of them (install.packages('ranger') is recommended).",
+    call. = FALSE
+  )
+}
+
+# RF classification (binary outcome): returns P(Y=1|X).
+df_rf_predict_binomial <- function(X_train, y01_train, X_test,
+                                   num.trees = NULL, mtry = NULL, min.node.size = NULL,
+                                   seed = NULL) {
+  X_train <- as.matrix(X_train)
+  X_test  <- as.matrix(X_test)
+  y01_train <- as.numeric(y01_train)
+
+  nte <- nrow(X_test)
+  if (nte == 0L) return(numeric(0))
+
+  keep <- is.finite(y01_train)
+  X_tr <- X_train[keep, , drop = FALSE]
+  y_tr <- y01_train[keep]
+
+  ntr <- nrow(X_tr)
+  if (ntr < 1L) return(rep(NA_real_, nte))
+
+  u <- unique(y_tr[is.finite(y_tr)])
+  if (length(u) < 2L) {
+    p0 <- df_clip_prob(mean(y_tr))
+    return(rep(p0, nte))
+  }
+
+  if (is.null(num.trees)) num.trees <- getOption("dfSEDI.rf_num_trees", 500L)
+  num.trees <- as.integer(num.trees)[1]
+  if (!is.finite(num.trees) || num.trees < 50L) num.trees <- 500L
+
+  if (!is.null(seed)) seed <- as.integer(seed)[1]
+
+  imp <- df_rf_impute_mats(X_tr, X_test)
+  X_tr <- imp$X_train
+  X_te <- imp$X_test
+
+  y_fac <- factor(ifelse(as.numeric(y_tr) == 1, "1", "0"), levels = c("0", "1"))
+
+  if (requireNamespace("ranger", quietly = TRUE)) {
+    df_tr <- data.frame(y = y_fac, as.data.frame(X_tr))
+    df_te <- as.data.frame(X_te)
+
+    fit <- ranger::ranger(
+      y ~ .,
+      data = df_tr,
+      probability = TRUE,
+      num.trees = num.trees,
+      mtry = mtry,
+      min.node.size = min.node.size,
+      seed = seed
+    )
+    pr <- predict(fit, data = df_te)$predictions
+    if (is.matrix(pr) && ("1" %in% colnames(pr))) {
+      return(df_clip_prob(as.numeric(pr[, "1"])))
+    }
+    # Fallback: try last column
+    if (is.matrix(pr)) return(df_clip_prob(as.numeric(pr[, ncol(pr)])))
+    return(df_clip_prob(as.numeric(pr)))
+  }
+
+  if (requireNamespace("randomForest", quietly = TRUE)) {
+    fit <- randomForest::randomForest(
+      x = X_tr,
+      y = y_fac,
+      ntree = num.trees,
+      mtry = mtry
+    )
+    pr <- stats::predict(fit, X_te, type = "prob")
+    if (is.matrix(pr) && ("1" %in% colnames(pr))) {
+      return(df_clip_prob(as.numeric(pr[, "1"])))
+    }
+    if (is.matrix(pr)) return(df_clip_prob(as.numeric(pr[, ncol(pr)])))
+    return(df_clip_prob(as.numeric(pr)))
+  }
+
+  stop(
+    "dfSEDI: nonpara_method='RF_*' requires either the 'ranger' or 'randomForest' package. ",
+    "Please install one of them (install.packages('ranger') is recommended).",
+    call. = FALSE
+  )
+}
+
+# Prepare KRR/mixed-KRR kernels depending on `nonpara_method`.
+df_np_prepare <- function(X_train, sigma = NULL, nonpara_method = "KRR", context = "nuisance regression") {
+  method <- df_match_nonpara_method(nonpara_method)
+
+  if (method %in% c("glmnet_linear", "glmnet_logistic", "RF_cont", "RF_binom")) return(NULL)
+
+  # 'mixed KRR' => infer categorical columns (delta kernel).
+  # otherwise => treat all columns as continuous (plain RBF kernel on the full design).
+  cat_cols_use <- if (identical(method, "mixed KRR")) NULL else integer(0)
+
+  df_krr_mixed_prepare(
+    X_train  = X_train,
+    sigma    = sigma,
+    cat_cols = cat_cols_use,
+    context  = context
+  )
+}
+
+# Continuous-response regression E[Z | X].
+df_np_predict_gaussian <- function(X_train, y_train, X_test, prep = NULL, sigma = NULL,
+                                   nonpara_method = "KRR", context = "nuisance regression") {
+  method <- df_match_nonpara_method(nonpara_method)
+
+  # Logistic-only methods: fall back to their continuous counterparts.
+  if (identical(method, "glmnet_logistic")) {
+    df_warn_once(
+      paste0("dfSEDI_glmnet_logistic_fallback_", context),
+      paste0("dfSEDI warning: nonpara_method='glmnet_logistic' was requested for a non-binary response in ", context, ". Using glmnet_linear instead.")
+    )
+    method <- "glmnet_linear"
+  }
+  if (identical(method, "logistic KRR")) {
+    df_warn_once(
+      paste0("dfSEDI_logistic_krr_fallback_", context),
+      paste0("dfSEDI warning: nonpara_method='logistic KRR' was requested for a non-binary response in ", context, ". Using KRR instead.")
+    )
+    method <- "KRR"
+  }
+
+  if (identical(method, "RF_binom")) {
+    df_warn_once(
+      paste0("dfSEDI_RF_binom_fallback_", context),
+      paste0("dfSEDI warning: nonpara_method='RF_binom' was requested for a continuous target in ", context, ". Using RF_cont instead.")
+    )
+    method <- "RF_cont"
+  }
+
+  if (identical(method, "glmnet_linear")) {
+    return(df_glmnet_predict(X_train, y_train, X_test, family = "gaussian"))
+  }
+
+  if (identical(method, "RF_cont")) {
+    return(df_rf_predict_gaussian(X_train, y_train, X_test))
+  }
+
+  if (is.null(prep)) {
+    prep <- df_np_prepare(X_train, sigma = sigma, nonpara_method = method, context = context)
+  } else {
+    if (!is.null(sigma)) prep$sigma <- sigma
+  }
+
+  df_krr_mixed_predict(
+    X_train  = X_train,
+    y_train  = y_train,
+    X_test   = X_test,
     sigma    = prep$sigma,
     cat_cols = prep$cat_cols,
     cont_cols= prep$cont_cols
   )
 }
 
+# Binary-response regression P(Y=1 | X).
+df_np_predict_binomial <- function(X_train, y_train, X_test, prep = NULL, sigma = NULL,
+                                   nonpara_method = "logistic KRR", success_level = NULL,
+                                   context = "binary nuisance regression") {
+  method <- df_match_nonpara_method(nonpara_method)
+
+  if (!df_is_binary_y(y_train)) {
+    stop(paste0(context, ": binary model requested but y is not binary."), call. = FALSE)
+  }
+
+  bin <- df_as_binary01(y_train, success_level = success_level)
+  y01 <- as.numeric(bin$y01)
+
+  u <- unique(y01[is.finite(y01)])
+  if (length(u) < 2L) {
+    p0 <- df_clip_prob(mean(y01))
+    return(rep(p0, nrow(X_test)))
+  }
+
+  if (identical(method, "RF_binom")) {
+    return(df_rf_predict_binomial(X_train, y01, X_test))
+  }
+
+  if (identical(method, "glmnet_logistic")) {
+    return(df_glmnet_predict(X_train, y01, X_test, family = "binomial"))
+  }
+
+  if (identical(method, "glmnet_linear")) {
+    return(df_clip_prob(df_glmnet_predict(X_train, y01, X_test, family = "gaussian")))
+  }
+
+  if (identical(method, "RF_cont")) {
+    df_warn_once(
+      paste0("dfSEDI_RF_cont_for_binomial_", context),
+      paste0("dfSEDI warning: nonpara_method='RF_cont' was requested for a binary target in ", context, ". Fitting RF regression to {0,1} and clipping to [0,1]. Consider RF_binom instead.")
+    )
+    return(df_clip_prob(df_rf_predict_gaussian(X_train, y01, X_test)))
+  }
+
+  if (method %in% c("KRR", "mixed KRR")) {
+    return(df_clip_prob(df_np_predict_gaussian(
+      X_train = X_train, y_train = y01, X_test = X_test, prep = prep, sigma = sigma,
+      nonpara_method = method, context = paste0(context, " (treated as gaussian)")
+    )))
+  }
+
+  # logistic KRR
+  if (is.null(prep)) {
+    prep <- df_np_prepare(X_train, sigma = sigma, nonpara_method = method, context = context)
+  } else {
+    if (!is.null(sigma)) prep$sigma <- sigma
+  }
+
+  df_klogit_mixed_predict(
+    X_train   = X_train,
+    y01_train = y01,
+    X_test    = as.matrix(X_test),
+    sigma     = prep$sigma,
+    cat_cols  = prep$cat_cols,
+    cont_cols = prep$cont_cols
+  )
+}
 ############################################################
 ## Numeric Jacobian + sandwich
 ############################################################
@@ -1459,32 +1940,30 @@ eta4_prob_numer_function <- function(pi_np, pi_p, phi, l) {
 ## 4. Mixed-type KRR nuisance regressions (Eff)
 ############################################################
 
-regression_expectation_kernlab <- function(dat, new_X, sigma = NULL) {
+# mu(x) = E[Y | X=x] via nonparametric regression
+# Supported via `nonpara_method` (KRR / mixed KRR / glmnet_linear; logistic methods fall back to gaussian).
+regression_expectation_kernlab <- function(dat, new_X, sigma = NULL, nonpara_method = "KRR") {
   X_all <- df_get_X(dat)
   idx   <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
   X_obs <- X_all[idx, , drop = FALSE]
   y_obs <- as.numeric(dat$y[idx])
 
   if (length(y_obs) < 1L) return(rep(NA_real_, nrow(new_X)))
-  if (length(y_obs) < 2L) return(rep(mean(y_obs), nrow(new_X)))
 
-  prep <- df_krr_mixed_prepare(
+  as.numeric(df_np_predict_gaussian(
     X_train = X_obs,
+    y_train = y_obs,
+    X_test  = as.matrix(new_X),
     sigma   = sigma,
-    context = "mu(X) = E[Y | X] regression"
-  )
-
-  df_krr_mixed_predict(
-    X_train  = X_obs,
-    y_train  = y_obs,
-    X_test   = as.matrix(new_X),
-    sigma    = prep$sigma,
-    cat_cols = prep$cat_cols,
-    cont_cols= prep$cont_cols
-  )
+    nonpara_method = nonpara_method,
+    context = "mu(X) nuisance regression"
+  ))
 }
 
-pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
+pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL, nonpara_method = "KRR") {
+  # NOTE: pi_p(L) imputation is always performed via KRR (continuous regression of 1/pi_p on L = (X, y)).
+  # The `nonpara_method` argument is accepted for backward compatibility but is ignored.
+
   X_all <- df_get_X(dat)
   idx   <- which(as.numeric(dat$d_p) == 1 & is.finite(as.numeric(dat$pi_p)))
 
@@ -1496,58 +1975,151 @@ pi_p_estimation_kernlab <- function(dat, new_L, sigma = NULL) {
   if (length(pi_p_obs) < 1L) return(rep(NA_real_, nrow(new_L)))
   if (length(pi_p_obs) < 2L) return(rep(mean(pi_p_obs), nrow(new_L)))
 
-  cat_cols_X <- df_infer_categorical_cols(X_obs)
-  cat_cols_L <- cat_cols_X  # do NOT treat y as categorical
-
+  # Plain KRR: treat all columns of L as continuous (Gaussian/RBF kernel).
   prep <- df_krr_mixed_prepare(
-    X_train = L_obs,
-    sigma   = sigma,
-    cat_cols = cat_cols_L,
-    context = "pi_P(L) regression / imputation"
+    X_train  = L_obs,
+    sigma    = sigma,
+    cat_cols = integer(0),
+    context  = "pi_P(L) regression / imputation (KRR)"
   )
 
   reg_pred <- df_krr_mixed_predict(
-    X_train  = L_obs,
-    y_train  = 1 / pi_p_obs,
-    X_test   = as.matrix(new_L),
-    sigma    = prep$sigma,
-    cat_cols = prep$cat_cols,
-    cont_cols= prep$cont_cols
+    X_train   = L_obs,
+    y_train   = 1 / pi_p_obs,
+    X_test    = as.matrix(new_L),
+    sigma     = prep$sigma,
+    cat_cols  = prep$cat_cols,
+    cont_cols = prep$cont_cols
   )
 
   reg_pred <- as.numeric(reg_pred)
   pi_hat <- rep(NA_real_, length(reg_pred))
   bad <- (!is.finite(reg_pred)) | (reg_pred <= 0)
 
-  pi_hat[bad] <- mean(pi_p_obs)
+  pi_hat[bad]  <- mean(pi_p_obs)
   pi_hat[!bad] <- 1 / reg_pred[!bad]
 
   df_clip_prob(pi_hat)
 }
 
 # --- NEW: core evaluators that accept pre-extracted (X_obs, l_obs, pi_p_obs, prep) ---
+# --- core evaluators that accept pre-extracted (X_obs, l_obs, pi_p_obs, prep) ---
 estimate_conditional_expectation_kernlab_phi_core <- function(phi,
                                                               new_X,
                                                               X_obs,
                                                               l_obs,
                                                               pi_p_obs,
-                                                              prep) {
+                                                              prep,
+                                                              prob_only = FALSE,
+                                                              nonpara_method = "mixed KRR",
+                                                              p_hat_new = NULL,
+                                                              pi_p_new = NULL) {
   phi <- as.numeric(phi)
   new_X <- as.matrix(new_X)
   X_obs <- as.matrix(X_obs)
   l_obs <- as.matrix(l_obs)
   pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
 
+  method <- df_match_nonpara_method(nonpara_method)
+
+  p_dim <- length(phi)
+
+  # If the training sample is empty, return zeros (valid but less efficient).
+  # This avoids NaN/NA propagation in small-sample edge cases.
+  if (nrow(X_obs) < 1L) {
+    return(matrix(0, nrow = nrow(new_X), ncol = p_dim))
+  }
+
+  # If Y is binary and a binomial-type method is requested, we can compute
+  # E[g(X,Y)|X] using the binary mixture formula:
+  #   E[g(X,Y)|X] = g(X,y0)*(1-p(X)) + g(X,y1)*p(X)
+  # where p(X)=P(Y=y1|X).
+  y_obs_here <- as.numeric(l_obs[, ncol(l_obs)])
+  use_binom_mixture <- (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs_here)
+
+  if (isTRUE(use_binom_mixture)) {
+    if (is.null(p_hat_new)) {
+      stop("eta4*(X;phi): binomial nonpara_method requires p_hat_new (P(Y=1|X) predictions) to be precomputed and passed in.", call. = FALSE)
+    }
+    if (is.null(pi_p_new)) {
+      stop("eta4*(X;phi): binomial nonpara_method requires pi_p_new (pi_p values for new_X) to be passed in.", call. = FALSE)
+    }
+
+    n_new <- nrow(new_X)
+
+    p_hat <- df_clip_prob(as.numeric(p_hat_new))
+    if (length(p_hat) != n_new) {
+      stop("eta4*(X;phi): length(p_hat_new) must match nrow(new_X).", call. = FALSE)
+    }
+    bad_p <- !is.finite(p_hat)
+    if (any(bad_p)) {
+      bin_tr <- df_as_binary01(y_obs_here)
+      p0 <- df_clip_prob(mean(bin_tr$y01))
+      p_hat[bad_p] <- p0
+    }
+
+    pi_pn <- df_clip_prob(as.numeric(pi_p_new))
+    if (length(pi_pn) != n_new) {
+      stop("eta4*(X;phi): length(pi_p_new) must match nrow(new_X).", call. = FALSE)
+    }
+    bad_pi <- !is.finite(pi_pn)
+    if (any(bad_pi)) pi_pn[bad_pi] <- mean(pi_p_obs)
+
+    y_vals <- sort(unique(y_obs_here[is.finite(y_obs_here)]))
+    if (length(y_vals) != 2L) {
+      stop("eta4*(X;phi): y is not binary (need exactly 2 distinct finite values) even though a binomial method was selected.", call. = FALSE)
+    }
+    y0 <- y_vals[1]
+    y1 <- y_vals[2]
+
+    l0 <- df_make_l_matrix(new_X, rep(y0, n_new))
+    l1 <- df_make_l_matrix(new_X, rep(y1, n_new))
+
+    eta0 <- as.numeric(l0 %*% phi)
+    eta1 <- as.numeric(l1 %*% phi)
+    pi_np0 <- df_clip_prob(1 / (1 + exp(-eta0)))
+    pi_np1 <- df_clip_prob(1 / (1 + exp(-eta1)))
+
+    pi_np_p0 <- df_clip_prob(pi_pn + pi_np0 - pi_pn * pi_np0)
+    pi_np_p1 <- df_clip_prob(pi_pn + pi_np1 - pi_pn * pi_np1)
+
+    if (isTRUE(prob_only)) {
+      Denom0 <- (1 - pi_np_p0) / (pi_np_p0 * pi_pn)
+      Denom1 <- (1 - pi_np_p1) / (pi_np_p1 * pi_pn)
+    } else {
+      Denom0 <- (1 - pi_np_p0) / (pi_np_p0 ^ 2)
+      Denom1 <- (1 - pi_np_p1) / (pi_np_p1 ^ 2)
+    }
+
+    Denom_new <- Denom0 * (1 - p_hat) + Denom1 * p_hat
+    Denom_new <- df_floor_pos(as.numeric(Denom_new))
+
+    coef0 <- -pi_np0 * as.numeric(Denom0)
+    coef1 <- -pi_np1 * as.numeric(Denom1)
+    Numer0 <- l0 * coef0
+    Numer1 <- l1 * coef1
+    Numer_new <- Numer0 * (1 - p_hat) + Numer1 * p_hat
+
+    return(sweep(Numer_new, 1, Denom_new, "/"))
+  }
+
+  # Default strategy: directly regress the numerator/denominator pseudo outcomes.
   eta   <- as.numeric(l_obs %*% phi)
   pi_np <- df_clip_prob(1 / (1 + exp(-eta)))
 
-  Denom_vals <- h4_prob_denom_function(pi_np, pi_p_obs, phi)
+  # Denominator depends on which representation is used:
+  #  - prob_only=FALSE (default): combined-sample version (10)/(12): O_{NP∪P} / pi_{NP∪P}
+  #  - prob_only=TRUE            : probability-sample version (9)/(11): O_{NP∪P} / pi_{P}
+  pi_np_p <- df_clip_prob(pi_p_obs + pi_np - pi_p_obs * pi_np)
+  if (isTRUE(prob_only)) {
+    Denom_vals <- (1 - pi_np_p) / (pi_np_p * pi_p_obs)
+  } else {
+    Denom_vals <- (1 - pi_np_p) / (pi_np_p ^ 2)
+  }
 
   # vectorized Numer_mat: Numer_mat[i,] = -pi_np[i] * Denom_vals[i] * l_obs[i,]
   coef <- -pi_np * as.numeric(Denom_vals)
   Numer_mat <- l_obs * coef
-
-  p_dim <- length(phi)
 
   if (nrow(X_obs) < 2L) {
     denom_pred <- rep(mean(Denom_vals), nrow(new_X))
@@ -1557,26 +2129,27 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
     return(sweep(numer_pred, 1, denom_pred, "/"))
   }
 
-  denom_pred <- df_krr_mixed_predict(
-    X_train  = X_obs,
-    y_train  = as.numeric(Denom_vals),
-    X_test   = new_X,
-    sigma    = prep$sigma,
-    cat_cols = prep$cat_cols,
-    cont_cols= prep$cont_cols
+  denom_pred <- df_np_predict_gaussian(
+    X_train = X_obs,
+    y_train = as.numeric(Denom_vals),
+    X_test  = new_X,
+    prep    = prep,
+    nonpara_method = nonpara_method,
+    context = "eta4*(X;phi) denominator nuisance regression"
   )
   denom_pred <- df_floor_pos(denom_pred)
 
-  numer_pred <- sapply(
+  numer_pred <- vapply(
     seq_len(p_dim),
-    function(j) df_krr_mixed_predict(
-      X_train  = X_obs,
-      y_train  = as.numeric(Numer_mat[, j]),
-      X_test   = new_X,
-      sigma    = prep$sigma,
-      cat_cols = prep$cat_cols,
-      cont_cols= prep$cont_cols
-    )
+    function(j) as.numeric(df_np_predict_gaussian(
+      X_train = X_obs,
+      y_train = as.numeric(Numer_mat[, j]),
+      X_test  = new_X,
+      prep    = prep,
+      nonpara_method = nonpara_method,
+      context = "eta4*(X;phi) numerator nuisance regression"
+    )),
+    FUN.VALUE = numeric(nrow(new_X))
   )
 
   sweep(numer_pred, 1, denom_pred, "/")
@@ -1585,22 +2158,103 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
 estimate_conditional_expectation_kernlab_theta_core <- function(phi,
                                                                 new_X,
                                                                 X_obs,
-                                                                y_obs,
                                                                 l_obs,
                                                                 pi_p_obs,
-                                                                prep) {
+                                                                y_obs,
+                                                                prep,
+                                                                prob_only = FALSE,
+                                                                nonpara_method = "mixed KRR",
+                                                                p_hat_new = NULL,
+                                                                pi_p_new = NULL) {
   phi <- as.numeric(phi)
   new_X <- as.matrix(new_X)
   X_obs <- as.matrix(X_obs)
-  y_obs <- as.numeric(y_obs)
   l_obs <- as.matrix(l_obs)
   pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
+  y_obs <- as.numeric(y_obs)
+
+  method <- df_match_nonpara_method(nonpara_method)
+
+  # If the training sample is empty, return zeros (valid but less efficient).
+  if (nrow(X_obs) < 1L) {
+    return(rep(0, nrow(new_X)))
+  }
+
+  use_binom_mixture <- (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+  if (isTRUE(use_binom_mixture)) {
+    if (is.null(p_hat_new)) {
+      stop("h4*(X;phi): binomial nonpara_method requires p_hat_new (P(Y=1|X) predictions) to be precomputed and passed in.", call. = FALSE)
+    }
+    if (is.null(pi_p_new)) {
+      stop("h4*(X;phi): binomial nonpara_method requires pi_p_new (pi_p values for new_X) to be passed in.", call. = FALSE)
+    }
+
+    n_new <- nrow(new_X)
+
+    p_hat <- df_clip_prob(as.numeric(p_hat_new))
+    if (length(p_hat) != n_new) {
+      stop("h4*(X;phi): length(p_hat_new) must match nrow(new_X).", call. = FALSE)
+    }
+    bad_p <- !is.finite(p_hat)
+    if (any(bad_p)) {
+      bin_tr <- df_as_binary01(y_obs)
+      p0 <- df_clip_prob(mean(bin_tr$y01))
+      p_hat[bad_p] <- p0
+    }
+
+    pi_pn <- df_clip_prob(as.numeric(pi_p_new))
+    if (length(pi_pn) != n_new) {
+      stop("h4*(X;phi): length(pi_p_new) must match nrow(new_X).", call. = FALSE)
+    }
+    bad_pi <- !is.finite(pi_pn)
+    if (any(bad_pi)) pi_pn[bad_pi] <- mean(pi_p_obs)
+
+    y_vals <- sort(unique(y_obs[is.finite(y_obs)]))
+    if (length(y_vals) != 2L) {
+      stop("h4*(X;phi): y is not binary (need exactly 2 distinct finite values) even though a binomial method was selected.", call. = FALSE)
+    }
+    y0 <- y_vals[1]
+    y1 <- y_vals[2]
+
+    l0 <- df_make_l_matrix(new_X, rep(y0, n_new))
+    l1 <- df_make_l_matrix(new_X, rep(y1, n_new))
+
+    eta0 <- as.numeric(l0 %*% phi)
+    eta1 <- as.numeric(l1 %*% phi)
+    pi_np0 <- df_clip_prob(1 / (1 + exp(-eta0)))
+    pi_np1 <- df_clip_prob(1 / (1 + exp(-eta1)))
+
+    pi_np_p0 <- df_clip_prob(pi_pn + pi_np0 - pi_pn * pi_np0)
+    pi_np_p1 <- df_clip_prob(pi_pn + pi_np1 - pi_pn * pi_np1)
+
+    if (isTRUE(prob_only)) {
+      Denom0 <- (1 - pi_np_p0) / (pi_np_p0 * pi_pn)
+      Denom1 <- (1 - pi_np_p1) / (pi_np_p1 * pi_pn)
+    } else {
+      Denom0 <- (1 - pi_np_p0) / (pi_np_p0 ^ 2)
+      Denom1 <- (1 - pi_np_p1) / (pi_np_p1 ^ 2)
+    }
+
+    Denom_new <- Denom0 * (1 - p_hat) + Denom1 * p_hat
+    Denom_new <- df_floor_pos(as.numeric(Denom_new))
+
+    Numer0 <- -y0 * as.numeric(Denom0)
+    Numer1 <- -y1 * as.numeric(Denom1)
+    Numer_new <- Numer0 * (1 - p_hat) + Numer1 * p_hat
+
+    return(as.numeric(Numer_new / Denom_new))
+  }
 
   eta   <- as.numeric(l_obs %*% phi)
   pi_np <- df_clip_prob(1 / (1 + exp(-eta)))
 
-  Denom_vals <- h4_prob_denom_function(pi_np, pi_p_obs, phi)
-  # vectorized Numer_vals: -y * Denom_vals
+  pi_np_p <- df_clip_prob(pi_p_obs + pi_np - pi_p_obs * pi_np)
+  if (isTRUE(prob_only)) {
+    Denom_vals <- (1 - pi_np_p) / (pi_np_p * pi_p_obs)
+  } else {
+    Denom_vals <- (1 - pi_np_p) / (pi_np_p ^ 2)
+  }
+
   Numer_vals <- -y_obs * as.numeric(Denom_vals)
 
   if (nrow(X_obs) < 2L) {
@@ -1610,23 +2264,23 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
     return(as.numeric(numer_pred / denom_pred))
   }
 
-  denom_pred <- df_krr_mixed_predict(
-    X_train  = X_obs,
-    y_train  = as.numeric(Denom_vals),
-    X_test   = new_X,
-    sigma    = prep$sigma,
-    cat_cols = prep$cat_cols,
-    cont_cols= prep$cont_cols
+  denom_pred <- df_np_predict_gaussian(
+    X_train = X_obs,
+    y_train = as.numeric(Denom_vals),
+    X_test  = new_X,
+    prep    = prep,
+    nonpara_method = nonpara_method,
+    context = "h4*(X;phi) denominator nuisance regression"
   )
   denom_pred <- df_floor_pos(denom_pred)
 
-  numer_pred <- df_krr_mixed_predict(
-    X_train  = X_obs,
-    y_train  = as.numeric(Numer_vals),
-    X_test   = new_X,
-    sigma    = prep$sigma,
-    cat_cols = prep$cat_cols,
-    cont_cols= prep$cont_cols
+  numer_pred <- df_np_predict_gaussian(
+    X_train = X_obs,
+    y_train = as.numeric(Numer_vals),
+    X_test  = new_X,
+    prep    = prep,
+    nonpara_method = nonpara_method,
+    context = "h4*(X;phi) numerator nuisance regression"
   )
 
   as.numeric(numer_pred / denom_pred)
@@ -1847,69 +2501,52 @@ make_folds <- function(n, K) {
 
 # Simple (non-crossfit) pi_p imputation for np-only union units.
 # This is used by estimators that require pi_p on the union sample but are not cross-fitted.
-impute_pi_p_simple <- function(dat, sigma = NULL) {
-  if (!is.data.frame(dat)) stop("impute_pi_p_simple(): `dat` must be a data.frame.", call. = FALSE)
-  if (!all(c("d_np", "d_p", "pi_p", "y") %in% names(dat))) {
-    miss <- setdiff(c("d_np", "d_p", "pi_p", "y"), names(dat))
-    stop("impute_pi_p_simple(): missing required columns in `dat`: ",
-         paste(miss, collapse = ", "), call. = FALSE)
-  }
-
-  d_np <- as.numeric(dat$d_np)
-  d_p  <- as.numeric(dat$d_p)
-  pi_p_raw <- as.numeric(dat$pi_p)
-
-  idx_mis <- which(d_np == 1 & d_p == 0 & !is.finite(pi_p_raw))
-  if (length(idx_mis) == 0L) return(dat)
-
+impute_pi_p_simple <- function(dat, sigma = NULL, nonpara_method = "KRR") {
+  # pi_p(L) is always imputed via KRR; `nonpara_method` is ignored (kept for compatibility).
   X_all <- df_get_X(dat)
   y_all <- as.numeric(dat$y)
-  L_all <- as.matrix(cbind(X_all, y_all))
+  pi_p_new <- as.numeric(dat$pi_p)
 
-  tilde_pi <- pi_p_estimation_kernlab(dat, new_L = L_all[idx_mis, , drop = FALSE], sigma = sigma)
-  dat$pi_p[idx_mis] <- tilde_pi
+  idx_missing <- which(is.na(pi_p_new) | !is.finite(pi_p_new))
+  if (length(idx_missing) == 0L) return(dat)
+
+  new_L <- cbind(X_all[idx_missing, , drop = FALSE], y_all[idx_missing])
+  pi_hat <- pi_p_estimation_kernlab(dat, new_L, sigma = sigma)
+
+  pi_p_new[idx_missing] <- pi_hat
+  dat$pi_p <- pi_p_new
   dat
 }
 
-impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE) {
-  dat_cf <- dat
+impute_pi_p_crossfit <- function(dat, folds, sigma = NULL, progress = FALSE, nonpara_method = "KRR") {
+  # pi_p(L) is always imputed via KRR; `nonpara_method` is ignored (kept for compatibility).
+  X_all <- df_get_X(dat)
+  y_all <- as.numeric(dat$y)
+  pi_p_new <- as.numeric(dat$pi_p)
 
-  if (progress) {
-    cat("Step 1/3: cross-fitting pi_P ...\n")
-    pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
-  }
+  idx_missing <- which(is.na(pi_p_new) | !is.finite(pi_p_new))
+  if (length(idx_missing) == 0L) return(dat)
+
+  if (progress) cat("Imputing pi_p via cross-fitting (KRR)...\n")
 
   for (k in seq_along(folds)) {
-    idx_k     <- folds[[k]]
-    dat_fold  <- dat_cf[idx_k, ]
-    dat_train <- dat_cf[-idx_k, ]
+    test_idx  <- folds[[k]]
+    train_idx <- setdiff(seq_len(nrow(dat)), test_idx)
 
-    X_f   <- df_get_X(dat_fold)
-    y_f   <- as.numeric(dat_fold$y)
-    d_p_f  <- as.numeric(dat_fold$d_p)
-    d_np_f <- as.numeric(dat_fold$d_np)
+    idx_fold_missing <- intersect(idx_missing, test_idx)
+    if (length(idx_fold_missing) == 0L) next
 
-    L_f  <- as.matrix(cbind(X_f, y_f))
+    dat_train <- dat[train_idx, , drop = FALSE]
+    new_L <- cbind(X_all[idx_fold_missing, , drop = FALSE], y_all[idx_fold_missing])
 
-    pi_p_mis <- which(d_np_f == 1 & d_p_f == 0 & !is.finite(as.numeric(dat_fold$pi_p)))
-    if (length(pi_p_mis) > 0) {
-      tilde_pi <- pi_p_estimation_kernlab(
-        dat_train,
-        new_L = L_f[pi_p_mis, , drop = FALSE],
-        sigma = sigma
-      )
-      dat_cf$pi_p[idx_k[pi_p_mis]] <- tilde_pi
-    }
+    pi_hat <- pi_p_estimation_kernlab(dat_train, new_L, sigma = sigma)
 
-    if (progress) utils::setTxtProgressBar(pb, k)
+    pi_p_new[idx_fold_missing] <- pi_hat
+    if (progress) cat("  fold", k, ": imputed", length(idx_fold_missing), "values\n")
   }
 
-  if (progress) {
-    close(pb)
-    cat("\n")
-  }
-
-  dat_cf
+  dat$pi_p <- pi_p_new
+  dat
 }
 
 ############################################################
@@ -2337,7 +2974,9 @@ efficient_estimator_dml2 <- function(dat,
                                      max_restart = 10,
                                      progress    = FALSE,
                                      x_info      = TRUE,
-                                     N           = NULL) {
+                                     N           = NULL,
+                                     prob_only   = FALSE,
+                                     nonpara_method = "KRR") {
 
   had_frame_units <- df_dat_has_frame_units(dat)
 
@@ -2347,6 +2986,13 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   dat <- df_apply_x_info(dat, x_info)
+
+  nonpara_method <- df_match_nonpara_method(nonpara_method)
+
+  # nonpara_method is used for eta4*(X;phi) and h4*(X;phi) nuisances.
+  # pi_p(L) imputation is always done via KRR (continuous regression of 1/pi_p on L),
+  # regardless of the user-specified nonpara_method.
+  nonpara_method_pi <- "KRR"
 
   n <- nrow(dat)
   X <- df_get_X(dat)
@@ -2374,7 +3020,7 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   folds <- make_folds(n, K)
-  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress)
+  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress, nonpara_method = nonpara_method_pi)
 
   # Build fold caches (output-preserving): precompute X_test/l_test and train prep for eta4*/h4*
   make_fold_cache <- function(idx_test, idx_train) {
@@ -2391,7 +3037,8 @@ efficient_estimator_dml2 <- function(dat,
       y    = y_test,
       d_p  = as.numeric(dat_test$d_p),
       d_np = as.numeric(dat_test$d_np),
-      pi_p = as.numeric(dat_test$pi_p)  # allow NA for (0,0); handled in df_prepare_pi_p()
+      pi_p = as.numeric(dat_test$pi_p),  # allow NA for (0,0); handled in df_prepare_pi_p()
+      p_hat = NULL
     )
 
     if (!isTRUE(x_info)) {
@@ -2406,23 +3053,49 @@ efficient_estimator_dml2 <- function(dat,
 
     # train side for nuisances
     X_all_tr <- df_get_X(dat_train)
-    idx_obs  <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+    if (isTRUE(prob_only)) {
+      idx_obs <- which(as.numeric(dat_train$d_p) == 1)
+    } else {
+      idx_obs <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+    }
 
     X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
     y_obs    <- as.numeric(dat_train$y[idx_obs])
     pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
     l_obs    <- df_make_l_matrix(X_obs, y_obs)
 
-    prep_eta4 <- df_krr_mixed_prepare(
+    prep_eta4 <- df_np_prepare(
       X_train = X_obs,
       sigma   = NULL,
+      nonpara_method = nonpara_method,
       context = "eta4*(X;phi) nuisance regression"
     )
-    prep_h4 <- df_krr_mixed_prepare(
+    prep_h4 <- df_np_prepare(
       X_train = X_obs,
       sigma   = NULL,
+      nonpara_method = nonpara_method,
       context = "h4*(X;phi) nuisance regression"
     )
+
+    # For binomial nonpara methods (logistic KRR / glmnet_logistic / RF_binom),
+    # precompute p_hat(X) = P(Y=Y1|X) once per fold; this does not depend on phi.
+    use_binom_mixture <- (nonpara_method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+    if (isTRUE(use_binom_mixture)) {
+      prep_p <- df_np_prepare(
+        X_train = X_obs,
+        sigma   = NULL,
+        nonpara_method = nonpara_method,
+        context = "P(Y=1|X) nuisance regression"
+      )
+      test$p_hat <- df_np_predict_binomial(
+        X_train = X_obs,
+        y_train = y_obs,
+        X_test  = X_test,
+        prep    = prep_p,
+        nonpara_method = nonpara_method,
+        context = "P(Y=1|X) nuisance regression"
+      )
+    }
 
     train <- list(
       X_obs     = X_obs,
@@ -2465,7 +3138,11 @@ efficient_estimator_dml2 <- function(dat,
           X_obs    = fc$train$X_obs,
           l_obs    = fc$train$l_obs,
           pi_p_obs = fc$train$pi_p_obs,
-          prep     = fc$train$prep_eta4
+          prep     = fc$train$prep_eta4,
+          prob_only = prob_only,
+          nonpara_method = nonpara_method,
+          p_hat_new = fc$test$p_hat,
+          pi_p_new  = fc$test$pi_p
         )
       } else {
         matrix(0, nrow = nrow(fc$test$l), ncol = p_phi)
@@ -2584,10 +3261,12 @@ efficient_estimator_dml2 <- function(dat,
         max_restart      = max_restart,
         progress         = progress,
         x_info           = isTRUE(x_info),
+        prob_only          = isTRUE(prob_only),
+        aug_terms_method   = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
         aug_terms        = if (isTRUE(x_info)) "estimated" else "fixed_zero",
         convergence      = if (!is.null(best)) best$convergence else NA_integer_,
         phi_obj          = if (!is.null(best)) best$value else NA_real_,
-        theta_var_method = theta_var_method,
+        theta_var_method = NA_character_,
         sandwich_n_eff   = n,
         population_N     = N_total,
         n_obs            = n,
@@ -2617,7 +3296,11 @@ efficient_estimator_dml2 <- function(dat,
         X_obs    = fc$train$X_obs,
         l_obs    = fc$train$l_obs,
         pi_p_obs = fc$train$pi_p_obs,
-        prep     = fc$train$prep_eta4
+        prep     = fc$train$prep_eta4,
+        prob_only = prob_only,
+        nonpara_method = nonpara_method,
+        p_hat_new = fc$test$p_hat,
+        pi_p_new  = fc$test$pi_p
       )
       h4_k <- estimate_conditional_expectation_kernlab_theta_core(
         phi      = phi_hat,
@@ -2626,7 +3309,11 @@ efficient_estimator_dml2 <- function(dat,
         y_obs    = fc$train$y_obs,
         l_obs    = fc$train$l_obs,
         pi_p_obs = fc$train$pi_p_obs,
-        prep     = fc$train$prep_h4
+        prep     = fc$train$prep_h4,
+        prob_only = prob_only,
+        nonpara_method = nonpara_method,
+        p_hat_new = fc$test$p_hat,
+        pi_p_new  = fc$test$pi_p
       )
 
       eta4_all[idx_test, ] <- eta4_k
@@ -2728,6 +3415,11 @@ efficient_estimator_dml2 <- function(dat,
       max_restart = max_restart,
       progress    = progress,
       x_info      = isTRUE(x_info),
+      prob_only   = isTRUE(prob_only),
+      nonpara_method = nonpara_method,
+      nonpara_method_pi = nonpara_method_pi,
+      nonpara_method_cont = nonpara_method_pi,
+      aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       convergence = res$convergence,
       theta_var_method = theta_var_method,
@@ -2749,7 +3441,9 @@ efficient_estimator_dml1 <- function(dat,
                                      max_restart = 10,
                                      progress    = FALSE,
                                      x_info      = TRUE,
-                                     N           = NULL) {
+                                     N           = NULL,
+                                     prob_only   = FALSE,
+                                     nonpara_method = "KRR") {
 
   had_frame_units <- df_dat_has_frame_units(dat)
 
@@ -2759,6 +3453,14 @@ efficient_estimator_dml1 <- function(dat,
   }
 
   dat <- df_apply_x_info(dat, x_info)
+
+  nonpara_method <- df_match_nonpara_method(nonpara_method)
+
+  # nonpara_method is used for eta4*/h4* nuisances.
+  # pi_p(L) imputation is always done via KRR (continuous regression of 1/pi_p on L),
+  # regardless of the user-specified nonpara_method.
+  nonpara_method_pi <- "KRR"
+  nonpara_method_cont <- nonpara_method_pi
 
   n <- nrow(dat)
   X <- df_get_X(dat)
@@ -2786,7 +3488,7 @@ efficient_estimator_dml1 <- function(dat,
   }
 
   folds <- make_folds(n, K)
-  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = FALSE)
+  dat_cf <- impute_pi_p_crossfit(dat, folds, sigma = NULL, progress = progress, nonpara_method = nonpara_method_cont)
 
   phi_k_mat   <- matrix(NA_real_, nrow = K, ncol = p_phi)
   theta_k     <- rep(NA_real_, K)
@@ -2822,23 +3524,51 @@ efficient_estimator_dml1 <- function(dat,
     train_cache <- NULL
     if (isTRUE(x_info)) {
       X_all_tr <- df_get_X(dat_train)
-      idx_obs  <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+      if (isTRUE(prob_only)) {
+        idx_obs <- which(as.numeric(dat_train$d_p) == 1)
+      } else {
+        idx_obs <- which(as.numeric(dat_train$d_p) == 1 | as.numeric(dat_train$d_np) == 1)
+      }
 
       X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
       y_obs    <- as.numeric(dat_train$y[idx_obs])
       pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
       l_obs    <- df_make_l_matrix(X_obs, y_obs)
 
-      prep_eta4 <- df_krr_mixed_prepare(
+      prep_eta4 <- df_np_prepare(
         X_train = X_obs,
         sigma   = NULL,
+        nonpara_method = nonpara_method,
         context = "eta4*(X;phi) nuisance regression"
       )
-      prep_h4 <- df_krr_mixed_prepare(
+      prep_h4 <- df_np_prepare(
         X_train = X_obs,
         sigma   = NULL,
+        nonpara_method = nonpara_method,
         context = "h4*(X;phi) nuisance regression"
       )
+
+      # For binomial methods (logistic KRR / glmnet_logistic / RF_binom) when Y is binary,
+      # precompute p_hat_test = P(Y=Y1|X) on the test fold once.
+      p_hat_test <- NULL
+      use_binom_mixture <- (nonpara_method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) && df_is_binary_y(y_obs)
+      if (isTRUE(use_binom_mixture)) {
+        prep_p <- df_np_prepare(
+          X_train = X_obs,
+          sigma   = NULL,
+          nonpara_method = nonpara_method,
+          context = "P(Y=1|X) nuisance regression"
+        )
+        p_hat_test <- df_np_predict_binomial(
+          X_train = X_obs,
+          y_train = y_obs,
+          X_test  = X_test,
+          prep    = prep_p,
+          sigma   = NULL,
+          nonpara_method = nonpara_method,
+          context = "P(Y=1|X) nuisance regression"
+        )
+      }
 
       train_cache <- list(
         X_obs     = X_obs,
@@ -2846,7 +3576,8 @@ efficient_estimator_dml1 <- function(dat,
         pi_p_obs  = pi_p_obs,
         l_obs     = l_obs,
         prep_eta4 = prep_eta4,
-        prep_h4   = prep_h4
+        prep_h4   = prep_h4,
+        p_hat_test = p_hat_test
       )
     }
 
@@ -2858,7 +3589,11 @@ efficient_estimator_dml1 <- function(dat,
           X_obs    = train_cache$X_obs,
           l_obs    = train_cache$l_obs,
           pi_p_obs = train_cache$pi_p_obs,
-          prep     = train_cache$prep_eta4
+          prep     = train_cache$prep_eta4,
+          prob_only = prob_only,
+          nonpara_method = nonpara_method,
+          p_hat_new = train_cache$p_hat_test,
+          pi_p_new  = pi_p_test
         )
       } else {
         matrix(0, nrow = nrow(l_test), ncol = p_phi)
@@ -2960,7 +3695,11 @@ efficient_estimator_dml1 <- function(dat,
         X_obs    = train_cache$X_obs,
         l_obs    = train_cache$l_obs,
         pi_p_obs = train_cache$pi_p_obs,
-        prep     = train_cache$prep_eta4
+        prep     = train_cache$prep_eta4,
+        prob_only = prob_only,
+        nonpara_method = nonpara_method,
+        p_hat_new = train_cache$p_hat_test,
+        pi_p_new  = pi_p_test
       )
       h4_k <- estimate_conditional_expectation_kernlab_theta_core(
         phi      = phi_k,
@@ -2969,7 +3708,11 @@ efficient_estimator_dml1 <- function(dat,
         y_obs    = train_cache$y_obs,
         l_obs    = train_cache$l_obs,
         pi_p_obs = train_cache$pi_p_obs,
-        prep     = train_cache$prep_h4
+        prep     = train_cache$prep_h4,
+        prob_only = prob_only,
+        nonpara_method = nonpara_method,
+        p_hat_new = train_cache$p_hat_test,
+        pi_p_new  = pi_p_test
       )
     } else {
       eta4_k <- matrix(0, nrow = nrow(l_test), ncol = p_phi)
@@ -3020,6 +3763,8 @@ efficient_estimator_dml1 <- function(dat,
       ci = c(NA_real_, NA_real_),
       info = list(type = "Eff", dml_type = "DML1", K = K, progress = progress,
                   x_info = isTRUE(x_info),
+                  prob_only = isTRUE(prob_only),
+                  aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
                   population_N = N_total,
                   n_obs = n,
                   theta_scale = theta_scale)
@@ -3092,6 +3837,11 @@ efficient_estimator_dml1 <- function(dat,
       max_restart = max_restart,
       progress    = progress,
       x_info      = isTRUE(x_info),
+      prob_only   = isTRUE(prob_only),
+      nonpara_method = nonpara_method,
+      nonpara_method_pi = nonpara_method_pi,
+      nonpara_method_cont = nonpara_method_pi,
+      aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       theta_var_method = theta_var_method,
       n_contrib_eff = sum(is.finite(contrib_all)),
@@ -3128,33 +3878,30 @@ subefficient_contrib <- function(dat, mu_hat) {
     (1 - d_np) * (w_p * y + (1 - w_p) * mu)
 }
 
-
-
 # (Eq.11) adaptive estimator for the sub-efficient augmentation term.
-# When theta = E(Y), Eq.(11) implies:
-#   gtilde_eff^*(X;theta) = m_w(X) - theta,
-# where m_w(X) = E[ Y * (O_p/pi_p) | X, d_np=0,d_p=1 ] / E[ (O_p/pi_p) | X, d_np=0,d_p=1 ],
-# and O_p = (1 - pi_p) / pi_p.
+# For theta = E(Y), Eq.(11) implies gtilde_eff^*(X;theta) = m_w(X) - theta, where
+#   m_w(X) = E[ Y * (O_p/pi_p) | X, d_p=1,d_np=0 ] / E[ (O_p/pi_p) | X, d_p=1,d_np=0 ],
+# and O_p = (1 - pi_p)/pi_p.
 # We estimate m_w(X) by separately regressing the numerator and denominator on X
 # within the probability-only sample (d_p=1, d_np=0), then taking the ratio.
-regression_expectation_eq11 <- function(dat, new_X, sigma = NULL, clip01 = FALSE) {
-  X_all <- df_get_X(dat)
-  d_np  <- as.numeric(dat$d_np)
-  d_p   <- as.numeric(dat$d_p)
-  pi_p_raw <- as.numeric(dat$pi_p)
+df_effS_predict_eq11 <- function(dat_train,
+                                 new_X,
+                                 sigma = NULL,
+                                 nonpara_method = "KRR",
+                                 clip01 = FALSE) {
+  X_all <- df_get_X(dat_train)
+  d_np  <- as.numeric(dat_train$d_np)
+  d_p   <- as.numeric(dat_train$d_p)
+  pi_p_raw <- as.numeric(dat_train$pi_p)
 
   idx <- which(d_p == 1 & d_np == 0 & is.finite(pi_p_raw))
   if (length(idx) < 1L) return(rep(NA_real_, nrow(new_X)))
 
   X_obs <- X_all[idx, , drop = FALSE]
-  y_raw <- dat$y[idx]
+  y_raw <- dat_train$y[idx]
 
   # If y is binary, coerce to 0/1; otherwise treat as numeric.
-  y_obs <- if (df_is_binary_y(y_raw)) {
-    df_as_binary01(y_raw)$y01
-  } else {
-    as.numeric(y_raw)
-  }
+  y_obs <- if (df_is_binary_y(y_raw)) df_as_binary01(y_raw)$y01 else as.numeric(y_raw)
 
   pi_use <- df_clip_prob(pi_p_raw[idx])
   w      <- (1 - pi_use) / (pi_use^2)  # = O_p / pi_p
@@ -3175,65 +3922,108 @@ regression_expectation_eq11 <- function(dat, new_X, sigma = NULL, clip01 = FALSE
     return(rep(const, nrow(new_X)))
   }
 
-  prep <- df_krr_mixed_prepare(
+  # Eq.(11) ratio uses continuous numerator/denominator regressions.
+  method <- df_match_nonpara_method(nonpara_method)
+  if (method %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) {
+    df_warn_once(
+      "dfSEDI_EffS_eq11_binom_method_fallback",
+      "dfSEDI warning: MAR=FALSE (Eq.11) uses continuous numerator/denominator regressions; a binomial nonpara_method was requested, so we fall back to the corresponding continuous method."
+    )
+    method <- if (identical(method, "glmnet_logistic")) "glmnet_linear" else if (identical(method, "RF_binom")) "RF_cont" else "KRR"
+  }
+
+  num_pred <- df_np_predict_gaussian(
     X_train = X_obs,
+    y_train = as.numeric(num_train),
+    X_test  = as.matrix(new_X),
     sigma   = sigma,
-    context = "Eff_S Eq(11) ratio regression (numerator/denominator)"
+    nonpara_method = method,
+    context = "Eff_S Eq(11) ratio regression (numerator)"
   )
 
-  num_pred <- df_krr_mixed_predict(
-    X_train  = X_obs,
-    y_train  = as.numeric(num_train),
-    X_test   = as.matrix(new_X),
-    sigma    = prep$sigma,
-    cat_cols = prep$cat_cols,
-    cont_cols= prep$cont_cols
-  )
-
-  den_pred <- df_krr_mixed_predict(
-    X_train  = X_obs,
-    y_train  = as.numeric(den_train),
-    X_test   = as.matrix(new_X),
-    sigma    = prep$sigma,
-    cat_cols = prep$cat_cols,
-    cont_cols= prep$cont_cols
+  den_pred <- df_np_predict_gaussian(
+    X_train = X_obs,
+    y_train = as.numeric(den_train),
+    X_test  = as.matrix(new_X),
+    sigma   = sigma,
+    nonpara_method = method,
+    context = "Eff_S Eq(11) ratio regression (denominator)"
   )
 
   den_pred <- df_floor_pos(den_pred)
   out <- as.numeric(num_pred) / as.numeric(den_pred)
 
+  # If y is binary, the truth is in [0,1]; clip as a stability guard.
   if (isTRUE(clip01)) out <- df_clip_prob(out)
   out
 }
 
-subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, MAR = TRUE, progress = FALSE, x_info = TRUE) {
+
+subefficient_estimator_dml2 <- function(dat,
+                                        K = 2,
+                                        logit = NULL,
+                                        nonpara_method = "KRR",
+                                        MAR = TRUE,
+                                        progress = FALSE,
+                                        x_info = TRUE) {
   dat <- df_apply_x_info(dat, x_info)
 
   n <- nrow(dat)
   folds <- make_folds(n, K)
 
-  use_logit <- df_infer_logit_flag(logit, dat$y)
-  if (isTRUE(use_logit) && !df_is_binary_y(dat$y)) {
-    stop("Eff_S: logit=TRUE requires binary y (0/1 numeric, logical, or 2-level factor).", call. = FALSE)
+  # Determine nuisance regression method.
+  # - MAR=TRUE  : mu(X) regression (possibly binomial)
+  # - MAR=FALSE : Eq.(11) ratio regression (always continuous numerator/denominator)
+  if (missing(nonpara_method)) {
+    use_logit <- df_infer_logit_flag(logit, dat$y)
+    method <- if (isTRUE(use_logit)) "logistic KRR" else "KRR"
+  } else {
+    method <- df_match_nonpara_method(nonpara_method)
   }
+
+  # If MAR=FALSE, coerce any binomial-only method to its continuous counterpart.
+  method_eq11 <- method
+  if (!isTRUE(MAR) && method_eq11 %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) {
+    df_warn_once(
+      "dfSEDI_EffS_eq11_binom_method_fallback",
+      "dfSEDI warning: MAR=FALSE (Eq.11) uses continuous numerator/denominator regressions; a binomial nonpara_method was requested, so we fall back to the corresponding continuous method."
+    )
+    method_eq11 <- if (identical(method_eq11, "glmnet_logistic")) "glmnet_linear" else if (identical(method_eq11, "RF_binom")) "RF_cont" else "KRR"
+  }
+
+  # For MAR=TRUE only: if a binomial method is requested but y is not binary, fall back.
+  if (isTRUE(MAR) && method %in% c("logistic KRR", "glmnet_logistic", "RF_binom") && !df_is_binary_y(dat$y)) {
+    df_warn_once(
+      "dfSEDI_EffS_logistic_nonbinary_fallback",
+      "dfSEDI warning: a binomial nonpara_method was requested for Eff_S, but y is not binary; using the corresponding continuous method instead."
+    )
+    method <- if (identical(method, "glmnet_logistic")) "glmnet_linear" else if (identical(method, "RF_binom")) "RF_cont" else "KRR"
+  }
+
+  method_used <- if (isTRUE(MAR)) method else method_eq11
 
   X_all <- df_get_X(dat)
   idx_mu <- which(as.numeric(dat$d_p) == 1 & as.numeric(dat$d_np) == 0)
 
   sigma_mu <- NULL
-  if (length(idx_mu) >= 2L) {
-    cat_cols <- df_infer_categorical_cols(X_all)
-    cont_cols <- setdiff(seq_len(ncol(X_all)), cat_cols)
-    if (length(cont_cols) > 0L) {
-      sigma_mu <- df_estimate_rbf_sigma(X_all[idx_mu, cont_cols, drop = FALSE], max_n = 2000L)
+  if (method_used %in% c("KRR", "mixed KRR", "logistic KRR") && length(idx_mu) >= 2L) {
+    if (identical(method_used, "mixed KRR")) {
+      cat_cols  <- df_infer_categorical_cols(X_all)
+      cont_cols <- setdiff(seq_len(ncol(X_all)), cat_cols)
+      if (length(cont_cols) > 0L) {
+        sigma_mu <- df_estimate_rbf_sigma(X_all[idx_mu, cont_cols, drop = FALSE], max_n = 2000L)
+      }
+    } else {
+      # plain KRR / kernel logistic: treat all columns as continuous for sigma estimation
+      sigma_mu <- df_estimate_rbf_sigma(X_all[idx_mu, , drop = FALSE], max_n = 2000L)
     }
   }
 
   if (progress) {
     if (isTRUE(MAR)) {
-      cat("Cross-fitting mu(X)=E[Y|X] for Eff_S ...\\n")
+      cat("Cross-fitting mu(X) for Eff_S (nonpara_method =", method_used, ")...\n")
     } else {
-      cat("Cross-fitting m_w(X) for Eff_S (Eq.11) ...\\n")
+      cat("Cross-fitting m_w(X) for Eff_S (Eq.11; nonpara_method =", method_used, ")...\n")
     }
     pb <- utils::txtProgressBar(min = 0, max = length(folds), style = 3)
   }
@@ -3244,22 +4034,45 @@ subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, MAR = TRUE, pr
     idx_test  <- folds[[k]]
     idx_train <- setdiff(seq_len(n), idx_test)
 
-    dat_train <- dat[idx_train, ]
-    dat_test  <- dat[idx_test,  ]
+    dat_train <- dat[idx_train, , drop = FALSE]
+    dat_test  <- dat[idx_test,  , drop = FALSE]
     X_test    <- df_get_X(dat_test)
 
-    mu_k <- if (isTRUE(MAR)) {
-      if (isTRUE(use_logit)) {
-        regression_expectation_klogit(dat_train, new_X = X_test, sigma = sigma_mu)
+    if (isTRUE(MAR)) {
+      X_train <- df_get_X(dat_train)
+      y_train <- dat_train$y
+
+      mu_k <- if (method_used %in% c("logistic KRR", "glmnet_logistic", "RF_binom")) {
+        df_np_predict_binomial(
+          X_train = X_train,
+          y_train = y_train,
+          X_test  = X_test,
+          sigma   = sigma_mu,
+          nonpara_method = method_used,
+          context = "mu(X) regression (Eff_S)"
+        )
       } else {
-        regression_expectation_kernlab(dat_train, new_X = X_test, sigma = sigma_mu)
+        df_np_predict_gaussian(
+          X_train = X_train,
+          y_train = as.numeric(y_train),
+          X_test  = X_test,
+          sigma   = sigma_mu,
+          nonpara_method = method_used,
+          context = "mu(X) regression (Eff_S)"
+        )
       }
     } else {
-      regression_expectation_eq11(dat_train, new_X = X_test, sigma = sigma_mu,
-                                  clip01 = isTRUE(use_logit))
+      # Eq.(11) ratio estimate m_w(X). If y is binary, clip to [0,1] for stability.
+      mu_k <- df_effS_predict_eq11(
+        dat_train = dat_train,
+        new_X     = X_test,
+        sigma     = sigma_mu,
+        nonpara_method = method_used,
+        clip01    = df_is_binary_y(dat$y)
+      )
     }
 
-    mu_hat_all[idx_test] <- mu_k
+    mu_hat_all[idx_test] <- as.numeric(mu_k)
 
     if (progress) utils::setTxtProgressBar(pb, k)
   }
@@ -3272,20 +4085,25 @@ subefficient_estimator_dml2 <- function(dat, K = 2, logit = NULL, MAR = TRUE, pr
   contrib   <- subefficient_contrib(dat, mu_hat_all)
   theta_res <- df_sandwich_from_contrib(contrib)
 
+  mu_model <- if (isTRUE(MAR)) {
+    method_used
+  } else {
+    paste0("eq11_ratio_", gsub(" ", "_", method_used),
+           if (df_is_binary_y(dat$y)) "_clipped" else "")
+  }
+
   list(theta = theta_res$theta,
        var   = theta_res$var,
        se    = theta_res$se,
        ci    = theta_res$ci,
        info  = list(type = "Eff_S", K = K, progress = progress,
                     x_info = isTRUE(x_info),
-                    logit = use_logit,
+                    logit = isTRUE(MAR) && (method_used %in% c("logistic KRR", "glmnet_logistic", "RF_binom")),
                     MAR = isTRUE(MAR),
-                    mu_model = if (isTRUE(MAR)) {
-                      if (isTRUE(use_logit)) "kernel_logistic" else "kernel_ridge"
-                    } else {
-                      if (isTRUE(use_logit)) "eq11_ratio_krr_clipped" else "eq11_ratio_krr"
-                    }))
+                    nonpara_method = method_used,
+                    mu_model = mu_model))
 }
+
 
 ############################################################
 ## 11. Parametric efficient estimator Eff_P (now supports binary via logistic glm)
@@ -3442,7 +4260,9 @@ Eff <- function(dat,
                 dml_type    = 1,
                 progress    = interactive(),
                 x_info      = TRUE,
-                N           = NULL) {
+                prob_only   = FALSE,
+                N           = NULL,
+                nonpara_method = "KRR") {
 
   if (!is.null(type)) dml_type <- type
 
@@ -3452,16 +4272,35 @@ Eff <- function(dat,
 
   if (dml_type == "DML2") {
     efficient_estimator_dml2(dat, phi_start = phi_start, K = K, max_restart = max_restart,
-                             progress = progress, x_info = x_info, N = N)
+                             progress = progress, x_info = x_info, N = N, prob_only = prob_only, nonpara_method = nonpara_method)
   } else {
     efficient_estimator_dml1(dat, phi_start = phi_start, K = K, max_restart = max_restart,
-                             progress = progress, x_info = x_info, N = N)
+                             progress = progress, x_info = x_info, N = N, prob_only = prob_only, nonpara_method = nonpara_method)
   }
 }
 
-Eff_S <- function(dat, K = 2, logit = NULL, MAR = TRUE, progress = interactive(), x_info = TRUE) {
-  subefficient_estimator_dml2(dat, K = K, logit = logit, MAR = MAR, progress = progress, x_info = x_info)
+Eff_S <- function(dat,
+                  K = 2,
+                  logit = NULL,
+                  nonpara_method = "KRR",
+                  MAR = TRUE,
+                  progress = interactive(),
+                  x_info = TRUE) {
+
+  # Backward compatibility:
+  # - If `nonpara_method` is not supplied, use the legacy `logit`/auto-detect
+  #   behavior to choose KRR vs logistic KRR (for MAR=TRUE).
+  # - If `nonpara_method` is supplied, it controls the nuisance regression strategy.
+  if (missing(nonpara_method)) {
+    subefficient_estimator_dml2(dat, K = K, logit = logit, MAR = MAR,
+                                progress = progress, x_info = x_info)
+  } else {
+    subefficient_estimator_dml2(dat, K = K, logit = logit,
+                                nonpara_method = nonpara_method, MAR = MAR,
+                                progress = progress, x_info = x_info)
+  }
 }
+
 
 Eff_P <- function(dat,
                   phi_start = NULL,
