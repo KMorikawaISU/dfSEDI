@@ -54,6 +54,45 @@ All core functions assume a data frame `dat` that contains at least:
 - `pi_p`   : design inclusion probability for the probability sample
 - `pi_np`  : (optional; simulations only) true NP inclusion probability
 
+
+
+---
+
+## NEW: `pi_x_cols` (use only a subset of X in the NP response model)
+
+By default, dfSEDI uses **all** columns of `X` in the parametric non-probability inclusion (response-mechanism) model:
+
+\[
+\pi_{np}(X,Y) = \operatorname{expit}\left(\phi^\top (1, X, Y)\right).
+\]
+
+In some applications, you may want to estimate the response mechanism using **only a subset of** `X` (e.g., a small set of key design variables),
+while still using the **full** `X` for nuisance regressions such as \(\eta_4^*(X)\) and \(h_4^*(X)\).
+You can do this by passing `pi_x_cols` to `Eff()` (and also to `Eff_P()`, `df_estimate_NP()`, `df_estimate_NP_P()` if needed).
+
+- `pi_x_cols = NULL` (default): use **all** columns of `X` (same behavior as earlier versions).
+- `pi_x_cols` can be:
+  - an **integer** vector of column indices (1-based),
+  - a **logical** vector of length `ncol(df_get_X(dat))`,
+  - a **character** vector:
+    - exact column names of the internal design matrix `df_get_X(dat)`, **or**
+    - (when `dat$X` is a `data.frame`) original term/variable names like `"METRO"`; dfSEDI will include **all dummy columns** created for that term.
+
+Important:
+
+- `pi_x_cols` affects **only** the construction of \((1, X_{\pi}, Y)\) inside \(\pi_{np}\) and the score terms involving \(\phi\).
+- It does **not** restrict the covariates used in the later nuisance regressions; those still use the full `X` by default.
+
+Example:
+
+```r
+# Suppose dat$X is a data.frame that includes METRO, REGION9, and race variables:
+fit <- Eff(dat, K = 2, type = 2, pi_x_cols = c("METRO", "REGION9", "q10_1"))
+
+# You can inspect what columns were actually used for the pi_np model:
+fit$info$pi_x_cols_used
+```
+
 ### Important: handling the \((d_{np}, d_p) = (0,0)\) pattern (`x_info`)
 
 In the paper's notation, there are four response patterns \((\delta_{NP}, \delta_P)\in\{0,1\}^2\).

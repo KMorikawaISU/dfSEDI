@@ -29,30 +29,47 @@
 devtools::install_github("KMorikawaISU/dfSEDI")
 
 
-
 library(dfSEDI)
 library(parallel)
 library(pbapply)
 
-example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
-source(example_file)
-
-B <- 3
+# ------------------------
+# Settings
+# ------------------------
+B <- 500
 N <- 10000
 Scenario <- 1
 K <- 2
 
-set.seed(18)
-N <- 10000
-dat <- generate_dualframe_population(N = N)
-
-base_fun <- function(X) {
-  cbind(1, X, X[, 1]^2)
-}
-
 seeds <- seed_start <- 1 + seq_len(B) - 1
 
-n_workers <- max(1L, parallel::detectCores() - 1L)
+# Output directory
+sim_dir <- "mc_out"
+dir.create(sim_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Create a tag for filenames
+tag <- sprintf(
+  "S%s_N%s_B%s_K%s_%s",
+  Scenario, N, B, K,
+  format(Sys.time(), "%Y%m%d_%H%M%S")
+)
+
+rds_file <- file.path(sim_dir, paste0("res_par_", tag, ".rds"))
+csv_file <- file.path(sim_dir, paste0("res_par_", tag, ".csv"))
+txt_file <- file.path(sim_dir, paste0("summary_", tag, ".txt"))
+
+# ------------------------
+# Load bundled example functions
+# ------------------------
+example_file <- system.file("examples", "dualframe_simulation.R", package = "dfSEDI")
+source(example_file)
+
+# ------------------------
+# Parallel cluster
+# ------------------------
+
+#Note: When I set the number of workers to (#cores - 1L), my PC crashed.
+n_workers <- max(1L, parallel::detectCores() - 2L)
 cl <- parallel::makeCluster(n_workers)
 on.exit(parallel::stopCluster(cl), add = TRUE)
 
@@ -77,6 +94,9 @@ parallel::clusterExport(
   envir = environment()
 )
 
+# ------------------------
+# One replicate
+# ------------------------
 one_rep <- function(seed) {
   set.seed(seed)
   dat <- generate_dualframe_population(N = N, Scenario = Scenario)
@@ -95,64 +115,69 @@ one_rep <- function(seed) {
   )
 }
 
-out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
-res_par <- do.call(rbind, out_list)
-
-summarize_mc(res_par, theta_true = 0)
-
-
 # ------------------------
-# Boxplots (theta, phi)
+# Run MC
 # ------------------------
 
 library(dplyr)
-library(ggplot2)
+library(purrr)
 
-est_order <- c(
-  "P", "NP", "NP_P",
-  "Eff_S", "Eff_P",
-  "Eff1_union", "Eff2_union",
-  "Eff1", "Eff2"
-)
+B <- 500  # 例：MCの回数
 
-res_plot <- res_par %>%
-  mutate(
-    Scenario = toupper(as.character(Scenario)),
-    Scenario = ifelse(grepl("^S", Scenario), Scenario, paste0("S", Scenario)),
-    estimator = factor(as.character(estimator), levels = est_order),
-    Scenario  = factor(Scenario)
+results <- purrr::map_dfr(seq_len(B), function(b){
+
+  # 再現性が欲しければ（任意）
+  # set.seed(123 + b)
+
+  run_one_mc(
+    mc_id        = b,
+    frame        = frame,
+    prob         = prob,
+    nonprob      = nonprob,
+    y_var        = y_var,
+    x_cont_vars  = x_cont_vars,
+    x_cat_vars   = x_cat_vars,
+    np_groups    = np_groups,
+    K_eff        = K_eff,
+    Eff_dml_type = Eff_dml_type,
+    K_effS       = K_effS,
+    progress     = progress_each_fit,
+    run_full_dat = TRUE,
+    np_max_iter  = np_max_iter,
+    use_hajek    = use_hajek
   )
+})
 
-# Theta boxplot
-ggplot(res_plot, aes(x = estimator, y = theta)) +
-  geom_boxplot(na.rm = TRUE, outlier.alpha = 0.4) +
-  geom_jitter(width = 0.15, alpha = 0.25, na.rm = TRUE) +
-  facet_wrap(~ Scenario, ncol = 1) +
-  theme_minimal(base_size = 12) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  labs(x = NULL, y = expression(hat(theta)))
+# 保存
+dir.create(sim_dir, recursive = TRUE, showWarnings = FALSE)
+out_csv <- file.path(sim_dir, "dfSEDI_results_withEff_mc.csv")
+write.csv(results, out_csv, row.names = FALSE)
 
 
-# Phi (y-coefficient): S1/S2 -> phi_3, S3 -> phi_4
-res_phi <- res_plot %>%
-  mutate(
-    phi_target = case_when(
-      Scenario %in% c("S1", "S2") ~ phi_3,
-      Scenario %in% c("S3")       ~ phi_4,
-      TRUE                        ~ NA_real_
-    ),
-    phi_target_name = case_when(
-      Scenario %in% c("S1", "S2") ~ "phi_3",
-      Scenario %in% c("S3")       ~ "phi_4",
-      TRUE                        ~ NA_character_
-    )
-  ) %>%
-  filter(estimator %in% c("NP", "NP_P", "Eff1_union", "Eff2_union", "Eff1", "Eff2"))
+out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
+res_par <- do.call(rbind, out_list)
 
-ggplot(res_phi, aes(x = estimator, y = phi_target)) +
-  geom_boxplot(na.rm = TRUE, outlier.alpha = 0.4) +
-  geom_jitter(width = 0.15, alpha = 0.25, na.rm = TRUE) +
-  facet_wrap(~ Scenario, ncol = 1) +
-  theme_minimal(base_size = 12) +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-  labs(x = NULL, y = "phi (S1–S2: phi_3, S3: phi_4)")
+# ------------------------
+# Save results
+# ------------------------
+saveRDS(res_par, file = rds_file)
+utils::write.csv(res_par, file = csv_file, row.names = FALSE)
+
+# Also save text summary output (optional but handy)
+zz <- file(txt_file, open = "wt")
+sink(zz)
+cat("MC settings\n")
+cat(sprintf("B=%s, N=%s, Scenario=%s, K=%s\n\n", B, N, Scenario, K))
+cat("seed_start:\n")
+print(seed_start)
+cat("\nseeds:\n")
+print(seeds)
+cat("\nsummary_mc:\n")
+print(summarize_mc(res_par, theta_true = 0))
+sink()
+close(zz)
+
+message("Saved RDS: ", rds_file)
+message("Saved CSV: ", csv_file)
+message("Saved TXT: ", txt_file)
+
