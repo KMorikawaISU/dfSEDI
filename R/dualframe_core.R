@@ -120,8 +120,8 @@ df_multistart_optim <- function(obj_fun,
                                 method = "BFGS",
                                 control = NULL) {
   center <- as.numeric(center)
-  tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-4)
-  if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-4
+  tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-8)
+  if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
 
   if (!all(is.finite(center))) stop("df_multistart_optim(): 'center' must be finite.")
 
@@ -3435,9 +3435,9 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   # --- Multi-start phi estimation (100 candidates -> try up to 10) ---
-  tol_obj   <- getOption("dfSEDI.phi_obj_tol", 1e-4)
+  tol_obj   <- getOption("dfSEDI.phi_obj_tol", 1e-8)
   maxit_phi <- as.integer(getOption("dfSEDI.phi_maxit", 2000L))
-  if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-4
+  if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
   if (!is.finite(maxit_phi) || maxit_phi < 200L) maxit_phi <- 2000L
 
   n_cand <- 100L
@@ -3901,9 +3901,9 @@ efficient_estimator_dml1 <- function(dat,
     maxit_phi <- as.integer(maxit_phi)[1]
     if (!is.finite(maxit_phi) || maxit_phi < 1L) maxit_phi <- 500L
 
-    tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-4)
+    tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-8)
     tol_obj <- as.numeric(tol_obj)[1]
-    if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-4
+    if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
 
     control_phi <- getOption("dfSEDI.phi_optim_control", list(maxit = maxit_phi))
     if (!is.list(control_phi)) control_phi <- list(maxit = maxit_phi)
