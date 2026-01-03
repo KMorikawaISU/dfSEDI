@@ -120,8 +120,6 @@ df_multistart_optim <- function(obj_fun,
                                 method = "Nelder-Mead",
                                 control = NULL) {
   center <- as.numeric(center)
-  tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-8)
-  if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
 
   if (!all(is.finite(center))) stop("df_multistart_optim(): 'center' must be finite.")
 
@@ -163,7 +161,7 @@ df_multistart_optim <- function(obj_fun,
         is.list(res) &&
         is.finite(res$value) &&
         all(is.finite(res$par)) &&
-        (isTRUE(res$convergence == 0) || res$value <= tol_obj)) {
+        isTRUE(res$convergence == 0)) {
       return(list(ok = TRUE, res = res, start = start, start_rank = j, init_vals = vals, init_order = ord))
     }
   }
@@ -535,6 +533,12 @@ df_get_X <- function(dat) {
       cat_cols_mm <- which(assign_vec %in% cat_term_idx)
 
       attr(mm, "dfSEDI_categorical_cols") <- as.integer(cat_cols_mm)
+
+      # Keep minimal metadata so we can later select subsets of X specifically
+      # for the response-mechanism model pi_np without touching the X that will
+      # be used in downstream nuisance regressions.
+      attr(mm, "dfSEDI_term_labels") <- as.character(term_labels)
+      attr(mm, "dfSEDI_mm_assign")   <- as.integer(assign_vec)
       return(mm)
     }
 
@@ -583,6 +587,173 @@ df_make_l_matrix <- function(X, y) {
   l <- as.matrix(cbind(1, X, y))
   storage.mode(l) <- "numeric"
   l
+}
+
+############################################################
+## X subset helpers for pi_np (response mechanism)
+############################################################
+
+# Resolve which columns of the *full* design matrix X should be used inside
+# the response-mechanism model
+#   pi_np = expit( phi^T (1, X_pi, y) ).
+#
+# IMPORTANT: This only affects the *pi_np model*; all nuisance regressions for
+# eta4*/h4* still use the full X unless you explicitly change those elsewhere.
+#
+# pi_x_cols can be:
+#  - NULL        : use all columns of X (current/default behavior)
+#  - integer     : column indices of X
+#  - logical     : length ncol(X)
+#  - character   :
+#       * exact column names of df_get_X() output, OR
+#       * original variable/term names when df_get_X() was built from a data.frame
+#         (then all dummy columns for that term are selected), OR
+#       * fallback: prefix-match on column names
+df_resolve_pi_x_cols <- function(X_full, pi_x_cols = NULL, context = "pi_x_cols") {
+  X_full <- as.matrix(X_full)
+  p <- ncol(X_full)
+
+  if (is.null(pi_x_cols)) {
+    return(seq_len(p))
+  }
+
+  # Allow explicitly selecting no X columns (pi_np depends only on intercept + y)
+  if (is.logical(pi_x_cols) && length(pi_x_cols) == 1L && identical(pi_x_cols, FALSE)) {
+    return(integer(0))
+  }
+
+  if (is.numeric(pi_x_cols) || is.integer(pi_x_cols)) {
+    idx <- as.integer(pi_x_cols)
+    if (length(idx) == 0L) return(integer(0))
+    if (any(!is.finite(idx))) {
+      stop(context, ": pi_x_cols contains NA/Inf.", call. = FALSE)
+    }
+    if (any(idx < 1L)) {
+      stop(context, ": pi_x_cols must be positive 1-based indices (no negatives/zero).", call. = FALSE)
+    }
+    if (any(idx > p)) {
+      stop(context, ": pi_x_cols contains indices > ncol(X) (", p, ").", call. = FALSE)
+    }
+    return(sort(unique(idx)))
+  }
+
+  if (is.logical(pi_x_cols)) {
+    if (length(pi_x_cols) != p) {
+      stop(context, ": logical pi_x_cols must have length ncol(X) (", p, ").", call. = FALSE)
+    }
+    return(which(pi_x_cols))
+  }
+
+  if (is.character(pi_x_cols)) {
+    nm <- colnames(X_full)
+    if (is.null(nm)) {
+      stop(context, ": character pi_x_cols requires X to have column names.", call. = FALSE)
+    }
+
+    term_labels <- attr(X_full, "dfSEDI_term_labels")
+    assign_vec  <- attr(X_full, "dfSEDI_mm_assign")
+
+    idx <- integer(0)
+    req <- unique(as.character(pi_x_cols))
+
+    for (r in req) {
+      if (!is.na(r) && nzchar(r) && (r %in% nm)) {
+        idx <- c(idx, which(nm == r))
+        next
+      }
+
+      # If X came from a data.frame, allow selecting by original term/variable name
+      if (!is.null(term_labels) && !is.null(assign_vec) && (r %in% term_labels)) {
+        term_idx <- which(term_labels == r)
+        idx <- c(idx, which(assign_vec %in% term_idx))
+        next
+      }
+
+      # Fallback: prefix-match on column names (useful for dummy columns)
+      idx_pref <- which(startsWith(nm, r))
+      if (length(idx_pref) > 0L) {
+        idx <- c(idx, idx_pref)
+        next
+      }
+    }
+
+    idx <- sort(unique(idx))
+    if (length(idx) == 0L) {
+      stop(
+        context, ": could not resolve any columns from pi_x_cols = ",
+        paste(req, collapse = ", "),
+        ".\nAvailable X columns include: ",
+        paste(utils::head(nm, 25), collapse = ", "),
+        if (length(nm) > 25) " ..." else "",
+        call. = FALSE
+      )
+    }
+    return(idx)
+  }
+
+  stop(context, ": pi_x_cols must be NULL, integer, logical, or character.", call. = FALSE)
+}
+
+# Prepare a stable "pi design" object (columns used in pi_np). We compute the
+# column names on the *full* X once, and then we can extract/align the same
+# columns from fold-specific X matrices, filling missing columns with 0.
+df_prepare_pi_design <- function(X_full, pi_x_cols = NULL, context = "pi_x_cols") {
+  X_full <- as.matrix(X_full)
+  idx <- df_resolve_pi_x_cols(X_full, pi_x_cols = pi_x_cols, context = context)
+  nm_full <- colnames(X_full)
+  sel_names <- NULL
+  if (!is.null(nm_full) && length(idx) > 0L) sel_names <- nm_full[idx]
+  list(idx = as.integer(idx), names = sel_names, p = as.integer(length(idx)))
+}
+
+# Extract the columns specified by a pi_design object from an arbitrary X.
+# If names are available, we align by name and fill missing columns with `fill`.
+df_extract_X_by_design <- function(X, pi_design, fill = 0) {
+  X <- as.matrix(X)
+  if (is.null(pi_design) || !is.list(pi_design)) {
+    stop("df_extract_X_by_design(): pi_design must be a list created by df_prepare_pi_design().",
+         call. = FALSE)
+  }
+
+  p <- as.integer(pi_design$p)
+  if (!is.finite(p) || p < 0L) p <- 0L
+
+  if (p == 0L) {
+    out0 <- matrix(numeric(0), nrow = nrow(X), ncol = 0L)
+    storage.mode(out0) <- "numeric"
+    return(out0)
+  }
+
+  nm_target <- pi_design$names
+  nm_X      <- colnames(X)
+
+  # Prefer name-based alignment when possible
+  if (!is.null(nm_target) && !is.null(nm_X)) {
+    out <- matrix(as.numeric(fill), nrow = nrow(X), ncol = length(nm_target))
+    colnames(out) <- nm_target
+    m <- match(nm_target, nm_X, nomatch = 0L)
+    present <- m > 0L
+    if (any(present)) {
+      out[, present] <- X[, m[present], drop = FALSE]
+    }
+    storage.mode(out) <- "numeric"
+    return(out)
+  }
+
+  idx <- as.integer(pi_design$idx)
+  if (length(idx) != p) idx <- idx[seq_len(min(length(idx), p))]
+  if (any(idx < 1L) || any(idx > ncol(X))) {
+    stop(
+      "df_extract_X_by_design(): column indices are out of range for this X. ",
+      "(This can happen if fold-specific model.matrix() columns differ.)\n",
+      "Tip: ensure X columns have stable names/levels across folds, or pass pi_x_cols by names.",
+      call. = FALSE
+    )
+  }
+
+  out <- X[, idx, drop = FALSE]
+  storage.mode(out) <- "numeric"
+  out
 }
 
 # Evaluate and validate base_fun(X) for pi_np estimation (strict checks).
@@ -1811,7 +1982,7 @@ df_joint_sandwich <- function(score_mat, A_hat) {
 ## 2. Chang & Kott estimating eq.
 ############################################################
 
-pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
+pi_np.est_simple <- function(dat, base_fun, p.use = TRUE, pi_x_cols = NULL) {
 
   if (!is.data.frame(dat)) {
     stop("pi_np.est_simple(): `dat` must be a data.frame.", call. = FALSE)
@@ -1830,14 +2001,20 @@ pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
   }
 
   # Cache objects that do not depend on phi
-  X <- df_get_X(dat)
+  X_full <- df_get_X(dat)
 
-  # Enforce the convention: X is n x p  => base_fun(X) must be n x (p+2)
-  expected_k <- ncol(X) + 2L
+  # Only the response-mechanism pi_np uses the subset X_pi. All outcome-side
+  # nuisance regressions elsewhere still use the full X.
+  pi_design <- df_prepare_pi_design(X_full, pi_x_cols = pi_x_cols,
+                                    context = "pi_np.est_simple()/pi_x_cols")
+  X_pi <- df_extract_X_by_design(X_full, pi_design)
+
+  # Enforce the convention: X_pi is n x p_pi  => base_fun(X_pi) must be n x (p_pi+2)
+  expected_k <- ncol(X_pi) + 2L
 
   b_mat <- df_eval_base_fun(
     base_fun,
-    X,
+    X_pi,
     expected_ncol = expected_k,
     context = "pi_np.est_simple()/base_fun"
   )
@@ -1872,7 +2049,7 @@ pi_np.est_simple <- function(dat, base_fun, p.use = TRUE) {
   } else {
     if (any(!is.finite(y))) stop("y contains NA/Inf.")
   }
-  l_mat <- cbind(1, X, y)
+  l_mat <- df_make_l_matrix(X_pi, y)
   d_p <- NULL
   pi_p <- NULL
   if (isTRUE(p.use)) {
@@ -2026,9 +2203,14 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
                                                               prob_only = FALSE,
                                                               nonpara_method = "mixed KRR",
                                                               p_hat_new = NULL,
-                                                              pi_p_new = NULL) {
+                                                              pi_p_new = NULL,
+                                                              new_X_pi = NULL) {
   phi <- as.numeric(phi)
   new_X <- as.matrix(new_X)
+  new_X_pi <- if (is.null(new_X_pi)) new_X else as.matrix(new_X_pi)
+  if (nrow(new_X_pi) != nrow(new_X)) {
+    stop("eta4*(X;phi): nrow(new_X_pi) must match nrow(new_X).", call. = FALSE)
+  }
   X_obs <- as.matrix(X_obs)
   l_obs <- as.matrix(l_obs)
   pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
@@ -2085,8 +2267,8 @@ estimate_conditional_expectation_kernlab_phi_core <- function(phi,
     y0 <- y_vals[1]
     y1 <- y_vals[2]
 
-    l0 <- df_make_l_matrix(new_X, rep(y0, n_new))
-    l1 <- df_make_l_matrix(new_X, rep(y1, n_new))
+    l0 <- df_make_l_matrix(new_X_pi, rep(y0, n_new))
+    l1 <- df_make_l_matrix(new_X_pi, rep(y1, n_new))
 
     eta0 <- as.numeric(l0 %*% phi)
     eta1 <- as.numeric(l1 %*% phi)
@@ -2178,9 +2360,14 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
                                                                 prob_only = FALSE,
                                                                 nonpara_method = "mixed KRR",
                                                                 p_hat_new = NULL,
-                                                                pi_p_new = NULL) {
+                                                                pi_p_new = NULL,
+                                                                new_X_pi = NULL) {
   phi <- as.numeric(phi)
   new_X <- as.matrix(new_X)
+  new_X_pi <- if (is.null(new_X_pi)) new_X else as.matrix(new_X_pi)
+  if (nrow(new_X_pi) != nrow(new_X)) {
+    stop("h4*(X;phi): nrow(new_X_pi) must match nrow(new_X).", call. = FALSE)
+  }
   X_obs <- as.matrix(X_obs)
   l_obs <- as.matrix(l_obs)
   pi_p_obs <- df_clip_prob(as.numeric(pi_p_obs))
@@ -2229,8 +2416,8 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
     y0 <- y_vals[1]
     y1 <- y_vals[2]
 
-    l0 <- df_make_l_matrix(new_X, rep(y0, n_new))
-    l1 <- df_make_l_matrix(new_X, rep(y1, n_new))
+    l0 <- df_make_l_matrix(new_X_pi, rep(y0, n_new))
+    l1 <- df_make_l_matrix(new_X_pi, rep(y1, n_new))
 
     eta0 <- as.numeric(l0 %*% phi)
     eta1 <- as.numeric(l1 %*% phi)
@@ -2300,17 +2487,20 @@ estimate_conditional_expectation_kernlab_theta_core <- function(phi,
 }
 
 # Backward-compatible wrappers (same outputs as before)
-estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma = NULL, prep = NULL) {
+estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma = NULL, prep = NULL, pi_x_cols = NULL) {
   phi <- as.numeric(phi)
   X_all <- df_get_X(dat)
+  # pi_np uses only X_pi (subset), but the nuisance regressions still use full X.
+  pi_design <- df_prepare_pi_design(X_all, pi_x_cols = pi_x_cols,
+                                    context = "estimate_conditional_expectation_kernlab_phi()/pi_x_cols")
   idx   <- which(as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1)
 
   X_obs    <- X_all[idx, , drop = FALSE]
   y_obs    <- as.numeric(dat$y[idx])
   pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
 
-  l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
-  storage.mode(l_obs) <- "numeric"
+  X_obs_pi <- df_extract_X_by_design(X_obs, pi_design)
+  l_obs <- df_make_l_matrix(X_obs_pi, y_obs)
 
   if (is.null(prep)) {
     prep <- df_krr_mixed_prepare(
@@ -2323,27 +2513,34 @@ estimate_conditional_expectation_kernlab_phi <- function(dat, phi, new_X, sigma 
     if (!is.null(sigma)) prep$sigma <- sigma
   }
 
+  new_X_full <- as.matrix(new_X)
+  new_X_pi   <- df_extract_X_by_design(new_X_full, pi_design)
+
   estimate_conditional_expectation_kernlab_phi_core(
     phi     = phi,
-    new_X   = as.matrix(new_X),
+    new_X   = new_X_full,
     X_obs   = X_obs,
     l_obs   = l_obs,
     pi_p_obs= pi_p_obs,
-    prep    = prep
+    prep    = prep,
+    new_X_pi = new_X_pi
   )
 }
 
-estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigma = NULL, prep = NULL) {
+estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigma = NULL, prep = NULL, pi_x_cols = NULL) {
   phi <- as.numeric(phi)
   X_all <- df_get_X(dat)
+  # pi_np uses only X_pi (subset), but the nuisance regressions still use full X.
+  pi_design <- df_prepare_pi_design(X_all, pi_x_cols = pi_x_cols,
+                                    context = "estimate_conditional_expectation_kernlab_theta()/pi_x_cols")
   idx   <- which(as.numeric(dat$d_p) == 1 | as.numeric(dat$d_np) == 1)
 
   X_obs    <- X_all[idx, , drop = FALSE]
   y_obs    <- as.numeric(dat$y[idx])
   pi_p_obs <- df_clip_prob(as.numeric(dat$pi_p[idx]))
 
-  l_obs  <- as.matrix(cbind(1, X_obs, y_obs))
-  storage.mode(l_obs) <- "numeric"
+  X_obs_pi <- df_extract_X_by_design(X_obs, pi_design)
+  l_obs <- df_make_l_matrix(X_obs_pi, y_obs)
 
   if (is.null(prep)) {
     prep <- df_krr_mixed_prepare(
@@ -2355,14 +2552,18 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigm
     if (!is.null(sigma)) prep$sigma <- sigma
   }
 
+  new_X_full <- as.matrix(new_X)
+  new_X_pi   <- df_extract_X_by_design(new_X_full, pi_design)
+
   estimate_conditional_expectation_kernlab_theta_core(
     phi     = phi,
-    new_X   = as.matrix(new_X),
+    new_X   = new_X_full,
     X_obs   = X_obs,
     y_obs   = y_obs,
     l_obs   = l_obs,
     pi_p_obs= pi_p_obs,
-    prep    = prep
+    prep    = prep,
+    new_X_pi = new_X_pi
   )
 }
 
@@ -2371,10 +2572,16 @@ estimate_conditional_expectation_kernlab_theta <- function(dat, phi, new_X, sigm
 ############################################################
 
 # Original versions (kept for compatibility)
-df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
+df_score_phi_contrib <- function(dat1, phi, eta4_star_local, pi_x_cols = NULL) {
   phi <- as.numeric(phi)
 
-  X1    <- df_get_X(dat1)
+  X1_full <- df_get_X(dat1)
+  pi_design <- df_prepare_pi_design(
+    X1_full,
+    pi_x_cols = pi_x_cols,
+    context = "df_score_phi_contrib()/pi_x_cols"
+  )
+  X1_pi <- df_extract_X_by_design(X1_full, pi_design)
   y1    <- as.numeric(dat1$y)
   d_p1  <- as.numeric(dat1$d_p)
   d_np1 <- as.numeric(dat1$d_np)
@@ -2382,7 +2589,10 @@ df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
   # pi_p may be NA for (d_p,d_np)=(0,0); fill those. Union rows must be finite.
   pi_p1 <- df_prepare_pi_p(dat1$pi_p, d_p = d_p1, d_np = d_np1, context = "df_score_phi_contrib()")
 
-  l1 <- as.matrix(cbind(1, X1, y1))
+  l1 <- df_make_l_matrix(X1_pi, y1)
+  if (ncol(l1) != length(phi)) {
+    stop("df_score_phi_contrib(): phi length does not match (1, X_pi, y) built from pi_x_cols.", call. = FALSE)
+  }
 
   eta      <- as.numeric(l1 %*% phi)
   pi_np1   <- df_clip_prob(1 / (1 + exp(-eta)))
@@ -2408,10 +2618,16 @@ df_score_phi_contrib <- function(dat1, phi, eta4_star_local) {
   out
 }
 
-efficient_theta_contrib <- function(dat1, phi, h4_star_local) {
+efficient_theta_contrib <- function(dat1, phi, h4_star_local, pi_x_cols = NULL) {
   phi <- as.numeric(phi)
 
-  X1    <- df_get_X(dat1)
+  X1_full <- df_get_X(dat1)
+  pi_design <- df_prepare_pi_design(
+    X1_full,
+    pi_x_cols = pi_x_cols,
+    context = "efficient_theta_contrib()/pi_x_cols"
+  )
+  X1_pi <- df_extract_X_by_design(X1_full, pi_design)
   y1    <- as.numeric(dat1$y)
   d_p1  <- as.numeric(dat1$d_p)
   d_np1 <- as.numeric(dat1$d_np)
@@ -2419,7 +2635,10 @@ efficient_theta_contrib <- function(dat1, phi, h4_star_local) {
   # pi_p may be NA for (d_p,d_np)=(0,0); fill those. Union rows must be finite.
   pi_p1 <- df_prepare_pi_p(dat1$pi_p, d_p = d_p1, d_np = d_np1, context = "efficient_theta_contrib()")
 
-  l1 <- as.matrix(cbind(1, X1, y1))
+  l1 <- df_make_l_matrix(X1_pi, y1)
+  if (ncol(l1) != length(phi)) {
+    stop("efficient_theta_contrib(): phi length does not match (1, X_pi, y) built from pi_x_cols.", call. = FALSE)
+  }
 
   eta      <- as.numeric(l1 %*% phi)
   pi_np1   <- df_clip_prob(1 / (1 + exp(-eta)))
@@ -2750,25 +2969,33 @@ df_estimate_NP <- function(dat,
                            phi_start = NULL,
                            max_iter = 20,
                            N = NULL,
-                           hajek = FALSE) {
+                           hajek = FALSE,
+                           pi_x_cols = NULL) {
 
   # Validate base_fun
   if (!is.function(base_fun)) stop("df_estimate_NP(): base_fun must be a function.")
 
-  X <- df_get_X(dat)
-  expected_k <- ncol(X) + 2L
+  X_full <- df_get_X(dat)
+
+  # Only the response-mechanism pi_np uses the subset X_pi.
+  pi_design <- df_prepare_pi_design(X_full, pi_x_cols = pi_x_cols,
+                                    context = "df_estimate_NP()/pi_x_cols")
+  X_pi <- df_extract_X_by_design(X_full, pi_design)
+
+  expected_k <- ncol(X_pi) + 2L
 
   # Evaluate base_fun once (also validates dimensions)
-  b_mat <- df_eval_base_fun(base_fun, X, context = "df_estimate_NP")
-  if (ncol(b_mat) != expected_k) {
-    stop(sprintf("df_estimate_NP(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
-                 expected_k, ncol(b_mat)))
-  }
+  b_mat <- df_eval_base_fun(
+    base_fun,
+    X_pi,
+    expected_ncol = expected_k,
+    context = "df_estimate_NP"
+  )
   p_phi <- ncol(b_mat)
 
   d_np <- as.numeric(dat$d_np)
   y <- as.numeric(dat$y)
-  l_mat <- df_make_l_matrix(X, y)
+  l_mat <- df_make_l_matrix(X_pi, y)
 
   # Center for initial values
   if (is.null(phi_start)) {
@@ -2859,26 +3086,31 @@ df_estimate_NP_P <- function(dat,
                              phi_start = NULL,
                              max_iter = 20,
                              N = NULL,
-                             hajek = FALSE) {
+                             hajek = FALSE,
+                             pi_x_cols = NULL) {
 
   # Validate base_fun
   if (!is.function(base_fun)) stop("df_estimate_NP_P(): base_fun must be a function.")
 
-  X <- df_get_X(dat)
-  expected_k <- ncol(X) + 2L
+  X_full <- df_get_X(dat)
+
+  # Only the response-mechanism pi_np uses the subset X_pi.
+  pi_design <- df_prepare_pi_design(X_full, pi_x_cols = pi_x_cols,
+                                    context = "df_estimate_NP_P()/pi_x_cols")
+  X_pi <- df_extract_X_by_design(X_full, pi_design)
+
+  expected_k <- ncol(X_pi) + 2L
 
   # Evaluate base_fun once (also validates dimensions)
-  b_mat <- df_eval_base_fun(base_fun, X, context = "df_estimate_NP_P")
-  if (ncol(b_mat) != expected_k) {
-    stop(sprintf("df_estimate_NP_P(): base_fun(X) must return n x (p+2) matrix. Expected %d columns, got %d.",
-                 expected_k, ncol(b_mat)))
-  }
+  b_mat <- df_eval_base_fun(base_fun, X_pi,
+                            expected_ncol = expected_k,
+                            context = "df_estimate_NP_P")
   p_phi <- ncol(b_mat)
 
   d_np <- as.numeric(dat$d_np)
   d_p <- as.numeric(dat$d_p)
   y <- as.numeric(dat$y)
-  l_mat <- df_make_l_matrix(X, y)
+  l_mat <- df_make_l_matrix(X_pi, y)
   # If pi_p is missing for (d_np, d_p) = (1, 0), impute it via a parametric lm on 1/pi_p.
   dat <- df_impute_pi_p_lm(dat, context = "df_estimate_NP_P()")
 
@@ -2989,7 +3221,8 @@ efficient_estimator_dml2 <- function(dat,
                                      x_info      = TRUE,
                                      N           = NULL,
                                      prob_only   = FALSE,
-                                     nonpara_method = "KRR") {
+                                     nonpara_method = "KRR",
+                                     pi_x_cols = NULL) {
 
   had_frame_units <- df_dat_has_frame_units(dat)
 
@@ -3008,9 +3241,18 @@ efficient_estimator_dml2 <- function(dat,
   nonpara_method_pi <- "KRR"
 
   n <- nrow(dat)
-  X <- df_get_X(dat)
-  p_x <- ncol(X)
-  p_phi <- 1 + p_x + 1
+  X_full <- df_get_X(dat)
+  p_x_full <- ncol(X_full)
+
+  # The response-mechanism model pi_np may use only a subset of X.
+  # All nuisance regressions for eta4*/h4* continue to use the full X.
+  pi_design <- df_prepare_pi_design(
+    X_full,
+    pi_x_cols = pi_x_cols,
+    context = "Eff()/pi_x_cols"
+  )
+  p_x_pi <- pi_design$p
+  p_phi <- 1 + p_x_pi + 1
 
   theta_scale <- 1
   if (!isTRUE(x_info)) {
@@ -3029,7 +3271,7 @@ efficient_estimator_dml2 <- function(dat,
 
   if (is.null(phi_start)) {
     p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
-    phi_start <- c(stats::qlogis(p0), rep(0, p_x), 0)
+    phi_start <- c(stats::qlogis(p0), rep(0, p_x_pi), 0)
   }
 
   folds <- make_folds(n, K)
@@ -3041,9 +3283,10 @@ efficient_estimator_dml2 <- function(dat,
     dat_train <- dat_cf[idx_train, , drop = FALSE]
 
     # test side (for fast scores)
-    X_test <- df_get_X(dat_test)
+    X_test <- df_get_X(dat_test)  # full X (used for nuisance predictions)
+    X_test_pi <- df_extract_X_by_design(X_test, pi_design)  # subset used only in pi_np
     y_test <- as.numeric(dat_test$y)
-    l_test <- df_make_l_matrix(X_test, y_test)
+    l_test <- df_make_l_matrix(X_test_pi, y_test)
 
     test <- list(
       l    = l_test,
@@ -3059,6 +3302,7 @@ efficient_estimator_dml2 <- function(dat,
         idx_test = idx_test,
         w = length(idx_test) / n,
         X_test = X_test,
+        X_test_pi = X_test_pi,
         test = test,
         train = NULL
       ))
@@ -3075,7 +3319,8 @@ efficient_estimator_dml2 <- function(dat,
     X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
     y_obs    <- as.numeric(dat_train$y[idx_obs])
     pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
-    l_obs    <- df_make_l_matrix(X_obs, y_obs)
+    X_obs_pi <- df_extract_X_by_design(X_obs, pi_design)
+    l_obs    <- df_make_l_matrix(X_obs_pi, y_obs)
 
     prep_eta4 <- df_np_prepare(
       X_train = X_obs,
@@ -3123,6 +3368,7 @@ efficient_estimator_dml2 <- function(dat,
       idx_test = idx_test,
       w = length(idx_test) / n,
       X_test = X_test,
+      X_test_pi = X_test_pi,
       test = test,
       train = train
     )
@@ -3148,6 +3394,7 @@ efficient_estimator_dml2 <- function(dat,
         estimate_conditional_expectation_kernlab_phi_core(
           phi      = phi,
           new_X    = fc$X_test,
+          new_X_pi = fc$X_test_pi,
           X_obs    = fc$train$X_obs,
           l_obs    = fc$train$l_obs,
           pi_p_obs = fc$train$pi_p_obs,
@@ -3186,9 +3433,7 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   # --- Multi-start phi estimation (100 candidates -> try up to 10) ---
-  tol_obj   <- getOption("dfSEDI.phi_obj_tol", 1e-8)
   maxit_phi <- as.integer(getOption("dfSEDI.phi_maxit", 2000L))
-  if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
   if (!is.finite(maxit_phi) || maxit_phi < 200L) maxit_phi <- 2000L
 
   n_cand <- 100L
@@ -3233,23 +3478,18 @@ efficient_estimator_dml2 <- function(dat,
       best <- res_try
     }
 
-    if (isTRUE(res_try$convergence == 0) || res_try$value <= tol_obj) {
+    if (isTRUE(res_try$convergence == 0)) {
       res <- res_try
       success <- TRUE
       break
     }
   }
 
-  if (!isTRUE(success) && !is.null(best) && is.finite(best$value) && best$value <= tol_obj) {
-    res <- best
-    success <- TRUE
-  }
-
   if (!isTRUE(success) || is.null(res) || !is.finite(res$value) || res$value >= 0.99 * big_penalty) {
     if (progress) {
-      cat("  phi optimization did not reach the tolerance; returning NA.\n")
+      cat("  phi optimization did not converge; returning NA.\n")
     } else {
-      warning("Eff(): phi optimization did not reach the tolerance; returning NA.")
+      warning("Eff(): phi optimization did not converge; returning NA.")
     }
 
     return(list(
@@ -3275,6 +3515,8 @@ efficient_estimator_dml2 <- function(dat,
         progress         = progress,
         x_info           = isTRUE(x_info),
         prob_only          = isTRUE(prob_only),
+        pi_x_cols         = pi_x_cols,
+        pi_x_cols_used    = if (!is.null(pi_design$names)) pi_design$names else pi_design$idx,
         aug_terms_method   = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
         aug_terms        = if (isTRUE(x_info)) "estimated" else "fixed_zero",
         convergence      = if (!is.null(best)) best$convergence else NA_integer_,
@@ -3306,6 +3548,7 @@ efficient_estimator_dml2 <- function(dat,
       eta4_k <- estimate_conditional_expectation_kernlab_phi_core(
         phi      = phi_hat,
         new_X    = fc$X_test,
+        new_X_pi = fc$X_test_pi,
         X_obs    = fc$train$X_obs,
         l_obs    = fc$train$l_obs,
         pi_p_obs = fc$train$pi_p_obs,
@@ -3318,6 +3561,7 @@ efficient_estimator_dml2 <- function(dat,
       h4_k <- estimate_conditional_expectation_kernlab_theta_core(
         phi      = phi_hat,
         new_X    = fc$X_test,
+        new_X_pi = fc$X_test_pi,
         X_obs    = fc$train$X_obs,
         y_obs    = fc$train$y_obs,
         l_obs    = fc$train$l_obs,
@@ -3350,9 +3594,10 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   # Precompute l for full sample for score/jacobian (fast path; output-identical)
-  X_cf <- df_get_X(dat_cf)
+  X_cf_full <- df_get_X(dat_cf)
   y_cf <- as.numeric(dat_cf$y)
-  l_cf <- df_make_l_matrix(X_cf, y_cf)
+  X_cf_pi <- df_extract_X_by_design(X_cf_full, pi_design)
+  l_cf <- df_make_l_matrix(X_cf_pi, y_cf)
   d_p_cf  <- as.numeric(dat_cf$d_p)
   d_np_cf <- as.numeric(dat_cf$d_np)
   pi_p_cf <- as.numeric(dat_cf$pi_p)  # allow NA for (0,0); handled in df_prepare_pi_p()
@@ -3432,6 +3677,8 @@ efficient_estimator_dml2 <- function(dat,
       nonpara_method = nonpara_method,
       nonpara_method_pi = nonpara_method_pi,
       nonpara_method_cont = nonpara_method_pi,
+      pi_x_cols         = pi_x_cols,
+      pi_x_cols_used    = if (!is.null(pi_design$names)) pi_design$names else pi_design$idx,
       aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       convergence = res$convergence,
@@ -3456,7 +3703,8 @@ efficient_estimator_dml1 <- function(dat,
                                      x_info      = TRUE,
                                      N           = NULL,
                                      prob_only   = FALSE,
-                                     nonpara_method = "KRR") {
+                                     nonpara_method = "KRR",
+                                     pi_x_cols = NULL) {
 
   had_frame_units <- df_dat_has_frame_units(dat)
 
@@ -3476,9 +3724,18 @@ efficient_estimator_dml1 <- function(dat,
   nonpara_method_cont <- nonpara_method_pi
 
   n <- nrow(dat)
-  X <- df_get_X(dat)
-  p_x <- ncol(X)
-  p_phi <- 1 + p_x + 1
+  X_full <- df_get_X(dat)
+  p_x_full <- ncol(X_full)
+
+  # The response-mechanism model pi_np may use only a subset of X.
+  # All nuisance regressions for eta4*/h4* continue to use the full X.
+  pi_design <- df_prepare_pi_design(
+    X_full,
+    pi_x_cols = pi_x_cols,
+    context = "Eff()/pi_x_cols"
+  )
+  p_x_pi <- pi_design$p
+  p_phi <- 1 + p_x_pi + 1
 
   theta_scale <- 1
   if (!isTRUE(x_info)) {
@@ -3497,7 +3754,7 @@ efficient_estimator_dml1 <- function(dat,
 
   if (is.null(phi_start)) {
     p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
-    phi_start <- c(stats::qlogis(p0), rep(0, p_x), 0)
+    phi_start <- c(stats::qlogis(p0), rep(0, p_x_pi), 0)
   }
 
   folds <- make_folds(n, K)
@@ -3525,9 +3782,10 @@ efficient_estimator_dml1 <- function(dat,
     dat_test  <- dat_cf[idx_test,  , drop = FALSE]
     dat_train <- dat_cf[idx_train, , drop = FALSE]
 
-    X_test <- df_get_X(dat_test)
+    X_test <- df_get_X(dat_test)  # full X (used for nuisance predictions)
+    X_test_pi <- df_extract_X_by_design(X_test, pi_design)  # subset used only in pi_np
     y_test <- as.numeric(dat_test$y)
-    l_test <- df_make_l_matrix(X_test, y_test)
+    l_test <- df_make_l_matrix(X_test_pi, y_test)
 
     d_p_test  <- as.numeric(dat_test$d_p)
     d_np_test <- as.numeric(dat_test$d_np)
@@ -3546,7 +3804,8 @@ efficient_estimator_dml1 <- function(dat,
       X_obs    <- X_all_tr[idx_obs, , drop = FALSE]
       y_obs    <- as.numeric(dat_train$y[idx_obs])
       pi_p_obs <- df_clip_prob(as.numeric(dat_train$pi_p[idx_obs]))
-      l_obs    <- df_make_l_matrix(X_obs, y_obs)
+      X_obs_pi <- df_extract_X_by_design(X_obs, pi_design)
+      l_obs    <- df_make_l_matrix(X_obs_pi, y_obs)
 
       prep_eta4 <- df_np_prepare(
         X_train = X_obs,
@@ -3599,6 +3858,7 @@ efficient_estimator_dml1 <- function(dat,
         estimate_conditional_expectation_kernlab_phi_core(
           phi      = phi,
           new_X    = X_test,
+          new_X_pi = X_test_pi,
           X_obs    = train_cache$X_obs,
           l_obs    = train_cache$l_obs,
           pi_p_obs = train_cache$pi_p_obs,
@@ -3632,10 +3892,6 @@ efficient_estimator_dml1 <- function(dat,
     maxit_phi <- as.integer(maxit_phi)[1]
     if (!is.finite(maxit_phi) || maxit_phi < 1L) maxit_phi <- 500L
 
-    tol_obj <- getOption("dfSEDI.phi_obj_tol", 1e-8)
-    tol_obj <- as.numeric(tol_obj)[1]
-    if (!is.finite(tol_obj) || tol_obj <= 0) tol_obj <- 1e-8
-
     control_phi <- getOption("dfSEDI.phi_optim_control", list(maxit = maxit_phi))
     if (!is.list(control_phi)) control_phi <- list(maxit = maxit_phi)
     if (is.null(control_phi$maxit)) control_phi$maxit <- maxit_phi
@@ -3665,7 +3921,7 @@ efficient_estimator_dml1 <- function(dat,
                     k, K, a, max_try, res_try$convergence, res_try$value))
         flush.console()
       }
-      if (isTRUE(res_try$convergence == 0) || (is.finite(res_try$value) && res_try$value <= tol_obj)) {
+      if (isTRUE(res_try$convergence == 0)) {
         success <- TRUE
         best <- res_try
         break
@@ -3705,6 +3961,7 @@ efficient_estimator_dml1 <- function(dat,
       eta4_k <- estimate_conditional_expectation_kernlab_phi_core(
         phi      = phi_k,
         new_X    = X_test,
+        new_X_pi = X_test_pi,
         X_obs    = train_cache$X_obs,
         l_obs    = train_cache$l_obs,
         pi_p_obs = train_cache$pi_p_obs,
@@ -3717,6 +3974,7 @@ efficient_estimator_dml1 <- function(dat,
       h4_k <- estimate_conditional_expectation_kernlab_theta_core(
         phi      = phi_k,
         new_X    = X_test,
+        new_X_pi = X_test_pi,
         X_obs    = train_cache$X_obs,
         y_obs    = train_cache$y_obs,
         l_obs    = train_cache$l_obs,
@@ -3763,7 +4021,11 @@ efficient_estimator_dml1 <- function(dat,
   }
 
   valid <- which(is.finite(theta_k) & apply(is.finite(phi_k_mat), 1, all))
-  if (length(valid) == 0) {
+  if (length(valid) < K) {
+    if (progress) {
+      cat(sprintf(\"DML1: only %d/%d folds converged; returning NA.\n\", length(valid), K))
+      flush.console()
+    }
     return(list(
       phi = rep(NA_real_, p_phi),
       phi_var = matrix(NA_real_, p_phi, p_phi),
@@ -3777,6 +4039,8 @@ efficient_estimator_dml1 <- function(dat,
       info = list(type = "Eff", dml_type = "DML1", K = K, progress = progress,
                   x_info = isTRUE(x_info),
                   prob_only = isTRUE(prob_only),
+                  pi_x_cols = pi_x_cols,
+                  pi_x_cols_used = if (!is.null(pi_design$names)) pi_design$names else pi_design$idx,
                   aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
                   population_N = N_total,
                   n_obs = n,
@@ -3854,6 +4118,8 @@ efficient_estimator_dml1 <- function(dat,
       nonpara_method = nonpara_method,
       nonpara_method_pi = nonpara_method_pi,
       nonpara_method_cont = nonpara_method_pi,
+      pi_x_cols         = pi_x_cols,
+      pi_x_cols_used    = if (!is.null(pi_design$names)) pi_design$names else pi_design$idx,
       aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
       theta_var_method = theta_var_method,
@@ -4163,7 +4429,8 @@ efficient_parametric_estimator <- function(dat,
                                            max_iter  = 20,
                                            logit     = NULL,
                                            progress  = FALSE,
-                                           x_info    = TRUE) {
+                                           x_info    = TRUE,
+                                           pi_x_cols = NULL) {
   dat <- df_apply_x_info(dat, x_info)
 
   # If pi_p is missing for np-only union units, impute it (single fit, no cross-fitting).
@@ -4171,9 +4438,19 @@ efficient_parametric_estimator <- function(dat,
     dat <- impute_pi_p_simple(dat, sigma = NULL)
   }
 
-  X_all <- df_get_X(dat)
-  p_x <- ncol(X_all)
-  p_phi <- 1 + p_x + 1
+  X_all_full <- df_get_X(dat)
+
+  # The response-mechanism model pi_np may use only a subset of X.
+  # The working model for h4* (mu(X)) still uses the full X.
+  pi_design <- df_prepare_pi_design(
+    X_all_full,
+    pi_x_cols = pi_x_cols,
+    context = "Eff_P/pi_x_cols"
+  )
+  X_all_pi <- df_extract_X_by_design(X_all_full, pi_design)
+
+  p_x_pi <- pi_design$p
+  p_phi <- 1 + p_x_pi + 1
   n <- nrow(dat)
 
   use_logit <- df_infer_logit_flag(logit, dat$y)
@@ -4183,7 +4460,7 @@ efficient_parametric_estimator <- function(dat,
 
   if (is.null(phi_start)) {
     p0 <- df_clip_prob(mean(as.numeric(dat$d_np), na.rm = TRUE))
-    phi_start <- c(stats::qlogis(p0), rep(0, p_x), 0)
+    phi_start <- c(stats::qlogis(p0), rep(0, p_x_pi), 0)
   }
 
   # Prepare pi_p once (allows NA for (0,0) rows; union rows must be finite).
@@ -4192,9 +4469,11 @@ efficient_parametric_estimator <- function(dat,
   pi_p1 <- df_prepare_pi_p(dat$pi_p, d_p = d_p1, d_np = d_np1, context = "Eff_P")
 
   ee_para <- function(phi) {
-    X1    <- df_get_X(dat)
     y1    <- as.numeric(dat$y)
-    l1    <- as.matrix(cbind(1, X1, y1))
+    l1    <- df_make_l_matrix(X_all_pi, y1)
+    if (ncol(l1) != length(phi)) {
+      stop("Eff_P: phi length does not match (1, X_pi, y) built from pi_x_cols.", call. = FALSE)
+    }
 
     phi <- as.numeric(phi)
     eta      <- as.numeric(l1 %*% phi)
@@ -4272,7 +4551,7 @@ efficient_parametric_estimator <- function(dat,
       }
     }
 
-    contrib <- efficient_theta_contrib(dat, phi_hat, h4_star_local = mu_hat)
+    contrib <- efficient_theta_contrib(dat, phi_hat, h4_star_local = mu_hat, pi_x_cols = pi_x_cols)
     theta_res <- df_sandwich_from_contrib(contrib)
   }
 
@@ -4292,6 +4571,8 @@ efficient_parametric_estimator <- function(dat,
                   progress  = progress,
                   x_info    = isTRUE(x_info),
                   logit     = use_logit,
+                  pi_x_cols = pi_x_cols,
+                  pi_x_cols_used = if (!is.null(pi_design$names)) pi_design$names else pi_design$idx,
                   mu_model  = mu_model)
   )
 }
@@ -4310,7 +4591,8 @@ Eff <- function(dat,
                 x_info      = TRUE,
                 prob_only   = FALSE,
                 N           = NULL,
-                nonpara_method = "KRR") {
+                nonpara_method = "KRR",
+                pi_x_cols = NULL) {
 
   if (!is.null(type)) dml_type <- type
 
@@ -4320,10 +4602,12 @@ Eff <- function(dat,
 
   if (dml_type == "DML2") {
     efficient_estimator_dml2(dat, phi_start = phi_start, K = K, max_restart = max_restart,
-                             progress = progress, x_info = x_info, N = N, prob_only = prob_only, nonpara_method = nonpara_method)
+                             progress = progress, x_info = x_info, N = N, prob_only = prob_only, nonpara_method = nonpara_method,
+                             pi_x_cols = pi_x_cols)
   } else {
     efficient_estimator_dml1(dat, phi_start = phi_start, K = K, max_restart = max_restart,
-                             progress = progress, x_info = x_info, N = N, prob_only = prob_only, nonpara_method = nonpara_method)
+                             progress = progress, x_info = x_info, N = N, prob_only = prob_only, nonpara_method = nonpara_method,
+                             pi_x_cols = pi_x_cols)
   }
 }
 
@@ -4356,8 +4640,9 @@ Eff_P <- function(dat,
                   max_iter  = 20,
                   logit     = NULL,
                   progress  = interactive(),
-                  x_info    = TRUE) {
+                  x_info    = TRUE,
+                  pi_x_cols = NULL) {
   efficient_parametric_estimator(dat, phi_start = phi_start, eta4_star = eta4_star,
                                  max_iter = max_iter, logit = logit, progress = progress,
-                                 x_info = x_info)
+                                 x_info = x_info, pi_x_cols = pi_x_cols)
 }
