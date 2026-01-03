@@ -117,7 +117,7 @@ df_multistart_optim <- function(obj_fun,
                                 n_candidates = 100L,
                                 n_try = 10L,
                                 width = 0.5,
-                                method = "Nelder-Mead",
+                                method = "BFGS",
                                 control = NULL) {
   center <- as.numeric(center)
 
@@ -3030,7 +3030,7 @@ df_estimate_NP <- function(dat,
                             n_candidates = 100L,
                             n_try = n_try,
                             width = 0.5,
-                            method = "Nelder-Mead",
+                            method = "BFGS",
                             control = list(maxit = 500))
 
   if (!isTRUE(ms$ok)) {
@@ -3155,7 +3155,7 @@ df_estimate_NP_P <- function(dat,
                             n_candidates = 100L,
                             n_try = n_try,
                             width = 0.5,
-                            method = "Nelder-Mead",
+                            method = "BFGS",
                             control = list(maxit = 500))
 
   if (!isTRUE(ms$ok)) {
@@ -3428,7 +3428,7 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   if (progress) {
-    cat("Step 2/3: solving phi (Eff, DML2, Nelder-Mead) ...\n")
+    cat("Step 2/3: solving phi (Eff, DML2, BFGS) ...\n")
     flush.console()
   }
 
@@ -3456,8 +3456,8 @@ efficient_estimator_dml2 <- function(dat,
       stats::optim(
         par     = init,
         fn      = obj_phi,
-        method  = "Nelder-Mead",
-        control = list(maxit = maxit_phi)
+        method  = "BFGS",
+        control = list(maxit = maxit_phi, reltol = 1e-8)
       ),
       error = function(e) NULL
     )
@@ -3884,9 +3884,9 @@ efficient_estimator_dml1 <- function(dat,
       sum(eq^2)
     }
 
-    method_phi <- getOption("dfSEDI.phi_optim_method", "Nelder-Mead")
+    method_phi <- getOption("dfSEDI.phi_optim_method", "BFGS")
     method_phi <- as.character(method_phi)[1]
-    if (!method_phi %in% c("Nelder-Mead", "BFGS", "CG", "L-BFGS-B", "SANN")) method_phi <- "Nelder-Mead"
+    if (!method_phi %in% c("BFGS", "BFGS", "CG", "L-BFGS-B", "SANN")) method_phi <- "BFGS"
 
     maxit_phi <- getOption("dfSEDI.phi_optim_maxit", 500L)
     maxit_phi <- as.integer(maxit_phi)[1]
