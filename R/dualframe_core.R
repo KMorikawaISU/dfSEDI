@@ -4023,7 +4023,7 @@ efficient_estimator_dml1 <- function(dat,
   valid <- which(is.finite(theta_k) & apply(is.finite(phi_k_mat), 1, all))
   if (length(valid) < K) {
     if (progress) {
-      cat(sprintf(\"DML1: only %d/%d folds converged; returning NA.\n\", length(valid), K))
+      cat(sprintf("DML1: only %d/%d folds converged; returning NA.\n\", length(valid), K"))
       flush.console()
     }
     return(list(
