@@ -117,7 +117,8 @@ df_multistart_optim <- function(obj_fun,
                                 n_candidates = 100L,
                                 n_try = 10L,
                                 width = 0.5,
-                                method = "BFGS",
+                                tol_obj = getOption("dfSEDI.phi_obj_tol", 1e-4),
+                                method = "Nelder-Mead",
                                 control = NULL) {
   center <- as.numeric(center)
 
@@ -161,7 +162,7 @@ df_multistart_optim <- function(obj_fun,
         is.list(res) &&
         is.finite(res$value) &&
         all(is.finite(res$par)) &&
-        isTRUE(res$convergence == 0)) {
+        (isTRUE(res$convergence == 0))) {
       return(list(ok = TRUE, res = res, start = start, start_rank = j, init_vals = vals, init_order = ord))
     }
   }
@@ -3030,7 +3031,7 @@ df_estimate_NP <- function(dat,
                             n_candidates = 100L,
                             n_try = n_try,
                             width = 0.5,
-                            method = "BFGS",
+                            method = "Nelder-Mead",
                             control = list(maxit = 500))
 
   if (!isTRUE(ms$ok)) {
@@ -3155,7 +3156,7 @@ df_estimate_NP_P <- function(dat,
                             n_candidates = 100L,
                             n_try = n_try,
                             width = 0.5,
-                            method = "BFGS",
+                            method = "Nelder-Mead",
                             control = list(maxit = 500))
 
   if (!isTRUE(ms$ok)) {
@@ -3428,7 +3429,7 @@ efficient_estimator_dml2 <- function(dat,
   }
 
   if (progress) {
-    cat("Step 2/3: solving phi (Eff, DML2, BFGS) ...\n")
+    cat("Step 2/3: solving phi (Eff, DML2, Nelder-Mead) ...\n")
     flush.console()
   }
 
@@ -3456,8 +3457,8 @@ efficient_estimator_dml2 <- function(dat,
       stats::optim(
         par     = init,
         fn      = obj_phi,
-        method  = "BFGS",
-        control = list(maxit = maxit_phi, reltol = 1e-8)
+        method  = "Nelder-Mead",
+        control = list(maxit = maxit_phi)
       ),
       error = function(e) NULL
     )
@@ -3487,9 +3488,9 @@ efficient_estimator_dml2 <- function(dat,
 
   if (!isTRUE(success) || is.null(res) || !is.finite(res$value) || res$value >= 0.99 * big_penalty) {
     if (progress) {
-      cat("  phi optimization did not converge; returning NA.\n")
+      cat("  phi optimization did not converge (convergence != 0); returning NA.\n")
     } else {
-      warning("Eff(): phi optimization did not converge; returning NA.")
+      warning("Eff(): phi optimization did not converge (convergence != 0); returning NA.")
     }
 
     return(list(
@@ -3764,6 +3765,9 @@ efficient_estimator_dml1 <- function(dat,
   theta_k     <- rep(NA_real_, K)
   var_k_list  <- vector("list", K)
   w_k         <- rep(NA_real_, K)
+  phi_conv_k  <- rep(NA_integer_, K)
+  phi_obj_k   <- rep(NA_real_,   K)
+  phi_try_k   <- rep(NA_integer_, K)
 
   contrib_all <- rep(NA_real_, n)
 
@@ -3884,13 +3888,14 @@ efficient_estimator_dml1 <- function(dat,
       sum(eq^2)
     }
 
-    method_phi <- getOption("dfSEDI.phi_optim_method", "BFGS")
+    method_phi <- getOption("dfSEDI.phi_optim_method", "Nelder-Mead")
     method_phi <- as.character(method_phi)[1]
-    if (!method_phi %in% c("BFGS", "BFGS", "CG", "L-BFGS-B", "SANN")) method_phi <- "BFGS"
+    if (!method_phi %in% c("Nelder-Mead", "BFGS", "CG", "L-BFGS-B", "SANN")) method_phi <- "Nelder-Mead"
 
     maxit_phi <- getOption("dfSEDI.phi_optim_maxit", 500L)
     maxit_phi <- as.integer(maxit_phi)[1]
     if (!is.finite(maxit_phi) || maxit_phi < 1L) maxit_phi <- 500L
+
 
     control_phi <- getOption("dfSEDI.phi_optim_control", list(maxit = maxit_phi))
     if (!is.list(control_phi)) control_phi <- list(maxit = maxit_phi)
@@ -3907,6 +3912,7 @@ efficient_estimator_dml1 <- function(dat,
     max_try <- min(max_try, 10L)
 
     best <- NULL
+    best_attempt <- NA_integer_
     success <- FALSE
     for (a in seq_len(max_try)) {
       init <- cand_mat[ord[a], ]
@@ -3915,7 +3921,10 @@ efficient_estimator_dml1 <- function(dat,
       if (inherits(res_try, "try-error") || !is.finite(res_try$value)) {
         next
       }
-      if (is.null(best) || res_try$value < best$value) best <- res_try
+      if (is.null(best) || res_try$value < best$value) {
+        best <- res_try
+        best_attempt <- a
+      }
       if (progress) {
         cat(sprintf("  fold %d/%d: attempt %d/%d (conv=%d, obj=%.3g)\n",
                     k, K, a, max_try, res_try$convergence, res_try$value))
@@ -3924,8 +3933,15 @@ efficient_estimator_dml1 <- function(dat,
       if (isTRUE(res_try$convergence == 0)) {
         success <- TRUE
         best <- res_try
+        best_attempt <- a
         break
       }
+    }
+
+    if (!is.null(best)) {
+      phi_conv_k[k] <- as.integer(best$convergence)
+      phi_obj_k[k]  <- as.numeric(best$value)
+      phi_try_k[k]  <- as.integer(best_attempt)
     }
 
     if (!isTRUE(success) || is.null(best)) {
@@ -4021,11 +4037,7 @@ efficient_estimator_dml1 <- function(dat,
   }
 
   valid <- which(is.finite(theta_k) & apply(is.finite(phi_k_mat), 1, all))
-  if (length(valid) < K) {
-    if (progress) {
-      cat(sprintf("DML1: only %d/%d folds converged; returning NA.\n\", length(valid), K"))
-      flush.console()
-    }
+  if (length(valid) == 0) {
     return(list(
       phi = rep(NA_real_, p_phi),
       phi_var = matrix(NA_real_, p_phi, p_phi),
@@ -4037,6 +4049,8 @@ efficient_estimator_dml1 <- function(dat,
       se = NA_real_,
       ci = c(NA_real_, NA_real_),
       info = list(type = "Eff", dml_type = "DML1", K = K, progress = progress,
+                  convergence = if (all(is.na(phi_conv_k))) NA_integer_ else max(phi_conv_k, na.rm = TRUE),
+                  convergence_fold = phi_conv_k,
                   x_info = isTRUE(x_info),
                   prob_only = isTRUE(prob_only),
                   pi_x_cols = pi_x_cols,
@@ -4122,6 +4136,8 @@ efficient_estimator_dml1 <- function(dat,
       pi_x_cols_used    = if (!is.null(pi_design$names)) pi_design$names else pi_design$idx,
       aug_terms_method = if (isTRUE(prob_only)) "probability_only" else "combined_sample",
       aug_terms   = if (isTRUE(x_info)) "estimated" else "fixed_zero",
+      convergence      = if (length(valid) == K && all(phi_conv_k[valid] == 0L)) 0L else 1L,
+      convergence_fold = phi_conv_k,
       theta_var_method = theta_var_method,
       n_contrib_eff = sum(is.finite(contrib_all)),
       population_N = N_total,
