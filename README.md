@@ -69,7 +69,7 @@ By default, dfSEDI uses **all** columns of `X` in the parametric
 non-probability inclusion (response-mechanism) model:
 
 $$
-\pi_{np}(X,Y) = \operatorname{expit}\left(\phi^\top (1, X, Y)\right).
+\pi_{np}(X,Y) = \text{expit}\left(\phi^\top (1, X, Y)\right).
 $$
 
 In some applications, you may want to estimate the response mechanism
