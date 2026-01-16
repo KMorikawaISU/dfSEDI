@@ -75,7 +75,7 @@ $$
 In some applications, you may want to estimate the response mechanism
 using **only a subset of** `X` (e.g., a small set of key design
 variables), while still using the **full** `X` for nuisance regressions
-such as $\eta_4^*(X)$ and $h_4^*(X)$. You can do this by passing
+such as $\kappa(X)$ and $\eta(X)$. You can do this by passing
 `pi_x_cols` to `Eff()` (and also to `Eff_P()`, `df_estimate_NP()`,
 `df_estimate_NP_P()` if needed).
 
@@ -119,13 +119,13 @@ there are **no rows** with $(d_{np}, d_p)=(0,0)$.
 
 The paper also notes that the theory covers the case where $X$ is
 unavailable when $(\delta_{NP},\delta_P)=(0,0)$; in that case, it
-suffices to set the augmentation functions $h_4^*(X)$ and $\eta_4^*(X)$
-to zero.
+suffices to set the augmentation functions $\eta(X)$ and $\kappa(X)$ to
+zero.
 
 dfSEDI exposes this choice via the flag `x_info`:
 
 - `x_info = FALSE` (**recommended for most real-data use cases**):  
-  Use the simplified formulation with $h_4^*(X)=\eta_4^*(X)=0$.  
+  Use the simplified formulation with $\eta(X)=\kappa(X)=0$.  
   This mode is intended for the common situation where you only have the
   union sample, or you do not have covariates $X$ for $(0,0)$ units. It
   also avoids computations involving the $(0,0)$ pattern and can be
@@ -148,7 +148,7 @@ dfSEDI exposes this choice via the flag `x_info`:
 >
 > If you omit `N`, `Eff(..., x_info = FALSE)` returns the *un-rescaled*
 > average over the observed union sample. In that case, you can recover
-> the population-mean scale by multiplying `theta`, `se`, and `ci` by
+> the population-mean scale by multiplying `th\eta`, `se`, and `ci` by
 > `nrow(dat_union) / N`.
 
 > Practical tip: If your input data include only sampled units (union
@@ -163,7 +163,7 @@ dfSEDI exposes this choice via the flag `x_info`:
 ## `prob_only` in `Eff()` (estimating the augmentation terms)
 
 When `x_info = TRUE`, `Eff()` estimates the optimal augmentation
-functions $h_4^*(X)$ and $\eta_4^*(X)$ via cross-fitted nonparametric
+functions $\eta(X)$ and $\kappa(X)$ via cross-fitted nonparametric
 regression (DML).
 
 In the paper these nuisance functions admit two equivalent
@@ -186,9 +186,8 @@ dfSEDI exposes this choice via `prob_only`:
 
 Notes:
 
-- `prob_only` only affects the estimation of $h_4^*(X)$ and
-  $\eta_4^*(X)$. The target parameter and the main estimating equations
-  are unchanged.
+- `prob_only` only affects the estimation of $\eta(X)$ and $\kappa(X)$.
+  The target parameter and the main estimating equations are unchanged.
 - If `x_info = FALSE`, the augmentation terms are fixed to zero and
   `prob_only` is ignored.
 - Trade-off: `prob_only = TRUE` uses fewer training points (only the
@@ -202,7 +201,7 @@ Notes:
 
 dfSEDI estimates several nuisance functions by regression (e.g.,
 $\mu(X)=E[Y\mid X]$, $\bar\pi_P(L)$ imputation, and the DML nuisance
-terms $h_4^*(X)$ / $\eta_4^*(X)$). You can now choose the regression
+terms $\eta(X)$ / $\kappa(X)$). You can now choose the regression
 back-end via `nonpara_method`:
 
 - `nonpara_method = "KRR"` (**default**): kernel ridge regression with
@@ -269,7 +268,7 @@ fit_eff_rfL     <- Eff(dat, K = 2, x_info = TRUE, prob_only = FALSE, nonpara_met
 > `"RF_*"`, dfSEDI will not use the delta kernel.
 
 dfSEDI estimates nuisance functions (e.g., $\mu(X)=E[Y\mid X]$, $\pi_P$,
-$\eta_4^*(X)$, $h_4^*(X)$) using kernel methods.
+$\kappa(X)$, $\eta(X)$) using kernel methods.
 
 - If `X` is continuous-only, dfSEDI uses Gaussian/RBF kernels (via
   `kernlab::gausspr`).
@@ -402,7 +401,7 @@ fit_eff_union <- Eff(
   progress    = TRUE
 )
 
-fit_eff_union$theta
+fit_eff_union$th\eta
 fit_eff_union$se
 fit_eff_union$ci
 fit_eff_union$info
@@ -422,7 +421,7 @@ fit_eff_full <- Eff(
   progress    = TRUE
 )
 
-fit_eff_full$theta
+fit_eff_full$th\eta
 fit_eff_full$se
 fit_eff_full$ci
 fit_eff_full$info
@@ -435,7 +434,7 @@ fit_eff_full$info
 The example script `inst/examples/dualframe_simulation.R` also defines:
 
 - `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, ...)`
-- `summarize_mc(res, theta_true = 0)`
+- `summarize_mc(res, th\eta_true = 0)`
 
 `run_mc()` returns a long-format data frame (one row per replication ×
 estimator). With the current example script, the `estimator` column
@@ -454,7 +453,7 @@ takes values:
 The typical columns are:
 
 - `Scenario`, `rep`, `estimator`
-- `theta`, `se`, `ci_l`, `ci_u`
+- `th\eta`, `se`, `ci_l`, `ci_u`
 - `n_np`, `n_p`, `n_union`
 - `error`
 
@@ -476,7 +475,7 @@ res <- run_mc(
   progress_each_fit = FALSE
 )
 
-summarize_mc(res, theta_true = 0)
+summarize_mc(res, th\eta_true = 0)
 ```
 
 ### Parallel MC with a progress bar (Windows)
@@ -548,7 +547,7 @@ one_rep <- function(seed) {
 out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
 res_par <- do.call(rbind, out_list)
 
-summarize_mc(res_par, theta_true = 0)
+summarize_mc(res_par, th\eta_true = 0)
 ```
 
 ### Parallel MC with a progress bar (macOS / Linux)
@@ -620,7 +619,7 @@ one_rep <- function(seed) {
 out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
 res_par <- do.call(rbind, out_list)
 
-summarize_mc(res_par, theta_true = 0)
+summarize_mc(res_par, th\eta_true = 0)
 ```
 
 Notes: - In the parallel examples above, we run one replication per
