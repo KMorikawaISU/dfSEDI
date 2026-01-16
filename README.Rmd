@@ -285,7 +285,7 @@ source(example_file)
 
 set.seed(18)
 N <- 10000
-dat <- generate_dualframe_population(N = N)
+dat <- generate_dualframe_population(N = N, Scenario = 1)
 
 str(dat)
 ```
