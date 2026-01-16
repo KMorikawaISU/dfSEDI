@@ -623,9 +623,9 @@ summarize_mc <- function(res, theta_true = 0) {
 
 
 ############################################################
-## 8) Eff1_union / Eff2_union だけ実行する版（ダミーなし）
-##    - 出力: 2推定量 × B 行
-##    - 列: extract_row() を使うので run_mc() と同じ列構成
+## 8) Union-only runner for Eff1_union / Eff2_union (no dummy estimators)
+##    - Output: (2 estimators) x B rows
+##    - Columns: same layout as run_mc(), because it uses extract_row()
 ############################################################
 
 fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALSE, prob_only = FALSE, nonpara_method = "KRR") {
@@ -635,7 +635,7 @@ fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALS
   n_p     <- sum(dat$d_p  == 1L)
   n_union <- sum(dat$d_np == 1L | dat$d_p == 1L)
 
-  # phi_start（元コードのルールと同じ）
+  # phi_start (same rule as the original script)
   if (sc %in% c(1, 2, 4)) {
     phi_start_true <- c(-2.15, -0.5, -0.75)
   } else {
@@ -652,7 +652,7 @@ fit_union_estimators_once <- function(dat, Scenario, K = 2, progress_each = FALS
     phi_start = phi_start_true
   )
 
-  # Eff() が N 引数を持つ場合だけ渡す（full N = nrow(dat)）
+  # Pass N only if Eff() supports it (full N = nrow(dat))
   if ("N" %in% names(formals(Eff))) {
     eff_union_args$N <- nrow(dat)
   }
@@ -681,8 +681,8 @@ mc_one_rep_long_union_only <- function(seed,
                                        N,
                                        Scenario,
                                        K = 2,
-                                       Eff_type = 2,      # 互換のため残す（未使用）
-                                       x_info = TRUE,     # 互換のため残す（未使用）
+                                       Eff_type = 2,      # Kept for backward compatibility (unused)
+                                       x_info = TRUE,     # Kept for backward compatibility (unused)
                                        pi_p_offset = 0.005,
                                        prob_only = FALSE,
                                        nonpara_method = "KRR",
@@ -726,8 +726,8 @@ run_mc_union <- function(B,
                          N = 10000,
                          Scenario = 1,
                          K = 2,
-                         Eff_type = 2,              # 互換のため残す（未使用）
-                         x_info = TRUE,             # 互換のため残す（未使用）
+                         Eff_type = 2,              # Kept for backward compatibility (unused)
+                         x_info = TRUE,             # Kept for backward compatibility (unused)
                          prob_only = FALSE,
                          nonpara_method = "KRR",
                          seed_start = 1,

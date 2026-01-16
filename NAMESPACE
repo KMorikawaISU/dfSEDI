@@ -1,1 +1,14 @@
-exportPattern("^[[:alpha:]]+")
+# Generated manually for a clean public release.
+
+export(Eff)
+export(Eff_S)
+export(Eff_P)
+
+export(df_estimate_P)
+export(df_estimate_NP)
+export(df_estimate_NP_P)
+
+export(df_get_X)
+
+export(impute_pi_p_simple)
+export(impute_pi_p_crossfit)
