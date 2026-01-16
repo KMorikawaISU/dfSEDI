@@ -148,7 +148,7 @@ dfSEDI exposes this choice via the flag `x_info`:
 >
 > If you omit `N`, `Eff(..., x_info = FALSE)` returns the *un-rescaled*
 > average over the observed union sample. In that case, you can recover
-> the population-mean scale by multiplying `th\eta`, `se`, and `ci` by
+> the population-mean scale by multiplying `theta`, `se`, and `ci` by
 > `nrow(dat_union) / N`.
 
 > Practical tip: If your input data include only sampled units (union
@@ -401,7 +401,7 @@ fit_eff_union <- Eff(
   progress    = TRUE
 )
 
-fit_eff_union$th\eta
+fit_eff_union$theta
 fit_eff_union$se
 fit_eff_union$ci
 fit_eff_union$info
@@ -421,7 +421,7 @@ fit_eff_full <- Eff(
   progress    = TRUE
 )
 
-fit_eff_full$th\eta
+fit_eff_full$theta
 fit_eff_full$se
 fit_eff_full$ci
 fit_eff_full$info
@@ -434,7 +434,7 @@ fit_eff_full$info
 The example script `inst/examples/dualframe_simulation.R` also defines:
 
 - `run_mc(B, N, Scenario, K, seed_start, show_progress, progress_each_fit, pi_p_offset, ...)`
-- `summarize_mc(res, th\eta_true = 0)`
+- `summarize_mc(res, theta_true = 0)`
 
 `run_mc()` returns a long-format data frame (one row per replication ×
 estimator). With the current example script, the `estimator` column
@@ -453,7 +453,7 @@ takes values:
 The typical columns are:
 
 - `Scenario`, `rep`, `estimator`
-- `th\eta`, `se`, `ci_l`, `ci_u`
+- `theta`, `se`, `ci_l`, `ci_u`
 - `n_np`, `n_p`, `n_union`
 - `error`
 
@@ -475,7 +475,7 @@ res <- run_mc(
   progress_each_fit = FALSE
 )
 
-summarize_mc(res, th\eta_true = 0)
+summarize_mc(res, theta_true = 0)
 ```
 
 ### Parallel MC with a progress bar (Windows)
@@ -547,7 +547,7 @@ one_rep <- function(seed) {
 out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
 res_par <- do.call(rbind, out_list)
 
-summarize_mc(res_par, th\eta_true = 0)
+summarize_mc(res_par, theta_true = 0)
 ```
 
 ### Parallel MC with a progress bar (macOS / Linux)
@@ -619,7 +619,7 @@ one_rep <- function(seed) {
 out_list <- pbapply::pblapply(seeds, one_rep, cl = cl)
 res_par <- do.call(rbind, out_list)
 
-summarize_mc(res_par, th\eta_true = 0)
+summarize_mc(res_par, theta_true = 0)
 ```
 
 Notes: - In the parallel examples above, we run one replication per
