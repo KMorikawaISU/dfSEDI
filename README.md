@@ -63,7 +63,7 @@ All core functions assume a data frame `dat` that contains at least:
 
 ------------------------------------------------------------------------
 
-## NEW: `pi_x_cols` (use only a subset of X in the NP response model)
+## `pi_x_cols` (use only a subset of X in the NP response model)
 
 By default, dfSEDI uses **all** columns of `X` in the parametric
 non-probability inclusion (response-mechanism) model:
@@ -160,7 +160,7 @@ dfSEDI exposes this choice via the flag `x_info`:
 
 ------------------------------------------------------------------------
 
-## NEW: `prob_only` in `Eff()` (estimating the augmentation terms)
+## `prob_only` in `Eff()` (estimating the augmentation terms)
 
 When `x_info = TRUE`, `Eff()` estimates the optimal augmentation
 functions $h_4^*(X)$ and $\eta_4^*(X)$ via cross-fitted nonparametric
@@ -198,7 +198,7 @@ Notes:
 
 ------------------------------------------------------------------------
 
-## NEW: `nonpara_method` (nuisance regression back-end)
+## `nonpara_method` (nuisance regression back-end)
 
 dfSEDI estimates several nuisance functions by regression (e.g.,
 $\mu(X)=E[Y\mid X]$, $\bar\pi_P(L)$ imputation, and the DML nuisance
@@ -312,7 +312,7 @@ options(dfSEDI.allow_small_cells = FALSE)          # bypass flag
 
 ------------------------------------------------------------------------
 
-## Chang & Kott-type NP estimators: specifying `base_fun` (NEW)
+## Chang & Kott-type NP estimators: specifying `base_fun`
 
 `df_estimate_NP()` and `df_estimate_NP_P()` solve a Chang & Kott-type
 estimating equation for the NP propensity parameter $\phi$ using a
